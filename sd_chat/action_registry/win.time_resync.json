@@ -1,0 +1,14 @@
+{
+  "id": "win.time_resync",
+  "title": "Stop and Restart Windows Time Service (W32Time) and Force Resync time",
+  "description": "Stop the Windows Time Service (W32Time), force time resynchronization, then start the service again on the target Windows host.",
+  "inputs": ["target_host"],
+  "outputs": ["exec.status", "exec.message"],
+  "preconditions": ["host_is_authorized", "endpoint_reachable", "endpoint_is_windows"],
+  "effects": ["time_synchronized(${target_host})"],
+  "tool": "win_tool",
+  "action": "time_resync",
+  "args_template": { "target_host": "${target_host}" }
+}
+
+

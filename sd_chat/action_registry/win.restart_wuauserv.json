@@ -1,0 +1,15 @@
+{
+  "id": "win.restart_wuauserv",
+  "title": "Stop and Restart Windows Update Service (Admin rights)",
+  "description": "Safely stop and restart the Windows Update Service (wuauserv) on a Windows host with Admin rights.",
+  "inputs": ["target_host"],
+  "outputs": ["exec.status", "exec.message"],
+  "preconditions": ["host_is_authorized", "endpoint_reachable", "endpoint_is_windows"],
+  "effects": ["windows_update_service_restarted(${target_host})"],
+  "tool": "win_tool",
+  "action": "service_restart",
+  "args_template": {
+    "target_host": "${target_host}",
+    "service_name": "wuauserv"
+  }
+}

@@ -1,0 +1,12 @@
+{
+  "id": "win.install_software",
+  "title": "Install a software application on a user's device (approved catalog only)",
+  "description": "Installs an approved application using winget in silent mode and verifies installation.",
+  "inputs": ["target_host", "package_id"],
+  "outputs": ["exec.status", "exec.message"],
+  "preconditions": ["host_is_authorized", "endpoint_reachable", "endpoint_is_windows", "software_is_approved"],
+  "effects": ["software_installed(${package_id}) on ${target_host}"],
+  "tool": "win_tool",
+  "action": "install_software",
+  "args_template": { "target_host": "${target_host}", "package_id": "${package_id}" }
+}

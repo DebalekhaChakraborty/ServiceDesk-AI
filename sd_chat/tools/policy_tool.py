@@ -1,0 +1,370 @@
+from typing import List, Dict, Tuple, Optional
+import os, socket
+
+try:
+    import winrm  # type: ignore
+except Exception:
+    winrm = None
+
+# ====== Config via environment ======
+WINRM_USER = os.getenv("WINRM_USERNAME")
+WINRM_PASS = os.getenv("WINRM_PASSWORD")
+WINRM_PORT = int(os.getenv("WINRM_PORT", "5986"))  # sensible default
+WINRM_TRANSPORT = os.getenv("WINRM_TRANSPORT", "ntlm")
+WINRM_CERT_VALIDATE = os.getenv("WINRM_CERT_VALIDATE", "false")
+
+
+def _endpoint(host: str) -> str:
+    if host.startswith(("http://", "https://")):
+        return host
+    return f"https://{host}:{WINRM_PORT}/wsman"
+
+
+def _reachable(host: str) -> bool:
+    try:
+        with socket.create_connection(
+            (host.split("://")[-1].split(":")[0], WINRM_PORT), timeout=3.0
+        ):
+            return True
+    except Exception:
+        return False
+
+
+def _is_windows_via_winrm(host: str) -> Tuple[bool, str]:
+    if not winrm or not (WINRM_USER and WINRM_PASS):
+        return False, "WinRM probe unavailable (missing module or creds)"
+    try:
+        session = winrm.Session(
+            _endpoint(host),
+            auth=(WINRM_USER, WINRM_PASS),
+            transport=WINRM_TRANSPORT,
+            server_cert_validation="validate"
+            if WINRM_CERT_VALIDATE.lower() == "true"
+            else "ignore",
+        )
+        ps = r'''
+        try {
+          $os = (Get-CimInstance Win32_OperatingSystem -ErrorAction Stop).Caption
+        } catch {
+          try { $os = (Get-WmiObject Win32_OperatingSystem -ErrorAction Stop).Caption } catch {}
+        }
+        if (-not $os) { Write-Output "UNKNOWN"; exit 1 }
+        Write-Output $os
+        exit 0
+        '''
+        result = session.run_ps(ps)
+        caption = (result.std_out or b"").decode(errors="ignore").strip()
+        if result.status_code == 0 and "windows" in caption.lower():
+            return True, caption or "Windows"
+        return False, caption or "Unknown"
+    except Exception as e:
+        return False, f"WinRM probe failed: {e}"
+
+
+def _norm_upn(value: Optional[str]) -> str:
+    """
+    Normalize a UPN/email for comparison:
+    - handle None
+    - strip whitespace
+    - lower-case
+    """
+    return (value or "").strip().lower()
+
+
+def _norm_host(value: Optional[str]) -> str:
+    """
+    Normalize host for comparison:
+    - handle None
+    - strip whitespace
+    - lower-case
+    - strip protocol if present
+    - strip trailing dot
+    - strip port/path if present
+    """
+    s = (value or "").strip().lower()
+    if not s:
+        return ""
+
+    if s.startswith(("http://", "https://")):
+        s = s.split("://", 1)[-1]
+
+    # Drop any path
+    s = s.split("/", 1)[0]
+    # Drop any port
+    s = s.split(":", 1)[0]
+    # Drop trailing dot (fqdn may end with ".")
+    if s.endswith("."):
+        s = s[:-1]
+
+    return s
+
+
+def _short_host(host: str) -> str:
+    """
+    Convert a host to "short name" (left-most label).
+    Example:
+      ws-123.corp.local -> ws-123
+    """
+    h = _norm_host(host)
+    if not h:
+        return ""
+    return h.split(".", 1)[0]
+
+
+def _parse_allowed_hosts_csv(allowed_hosts_csv: Optional[str]) -> List[str]:
+    """
+    Parse allowed hosts from a comma-separated string.
+    Accepts blanks gracefully.
+    """
+    raw = (allowed_hosts_csv or "").strip()
+    if not raw:
+        return []
+    parts = [p.strip() for p in raw.split(",")]
+    return [p for p in parts if p]
+
+
+def software_is_approved(
+    software_name: str,
+    approved_software_names_csv: str
+) -> bool:
+    if not software_name or not approved_software_names_csv:
+        return False
+
+    requested = software_name.strip().lower()
+    approved = [
+        s.strip().lower()
+        for s in approved_software_names_csv.split(",")
+        if s.strip()
+    ]
+
+    return requested in approved
+
+
+def check_list(
+    preconditions: List[str], ## TODO: preconditions coming out wrong need to check
+    target_host: Optional[str] = "",
+    caller_role: Optional[str] = "",
+    caller_upn: Optional[str] = "",
+    target_upn: Optional[str] = "",
+    # manager_upn: Optional[str] = "",
+    ## TODO: hardcoding manager_upn for testing only, remove later
+    manager_upn: Optional[str] = "ashok.giri@debalekhachakrabortyoutlook.onmicrosoft.com",
+    endpoint_os: Optional[str] = "",
+    endpoint_reachable: Optional[bool] = None,
+    allowed_hosts_csv: Optional[str] = "",  # for host authorization enforcement
+    software_name: Optional[str] = "",
+    # raw_sop_text: Optional[str] = "" ## TODO: for software approval check, need to configure properly, passing raw full text from sop_retriever or planner causing major malfunction issue
+) -> Dict[str, object]:
+    """
+    Policy / safety gate.
+
+    This version is compatible with Google ADK automatic function calling:
+    - Only simple fields (no nested dicts).
+    - Returns: { "status": "ok" | "error", "message": str, "details": {...} }
+
+    NEW:
+    - Supports "host_is_authorized" precondition using allowed_hosts_csv.
+      The orchestrator (or identity tool) should provide allowed_hosts as a
+      comma-separated string when calling this tool.
+    """
+    details: Dict[str, object] = {}
+    host = target_host or ""
+
+    # High-level debug of each call
+    try:
+        print("[policy.check_list] called with preconditions:", preconditions)
+        print("[policy.check_list] caller_role:", caller_role)
+        print("[policy.check_list] caller_upn:", caller_upn)
+        print("[policy.check_list] target_upn:", target_upn)
+        print("[policy.check_list] manager_upn:", manager_upn)
+        print("[policy.check_list] target_host:", host)
+        # Avoid dumping long lists in logs; just show count
+        ah = _parse_allowed_hosts_csv(allowed_hosts_csv)
+        print("[policy.check_list] allowed_hosts_csv count:", len(ah))
+    except Exception:
+        pass
+
+    for cond in preconditions or []:
+
+        # ------------------------------------------------------------------
+        # Role-based check: caller must be at least L1
+        # ------------------------------------------------------------------
+        if cond == "caller_is_l1_or_above":
+            ok = (caller_role or "").lower() in ("l1", "l2", "l3", "admin")
+            details["caller_is_l1_or_above"] = ok
+            if not ok:
+                return {
+                    "status": "error",
+                    "message": "Insufficient role privilege",
+                    "details": details,
+                }
+
+        # ------------------------------------------------------------------
+        # Identity-based check: self or manager
+        # ------------------------------------------------------------------
+        elif cond == "caller_is_self_or_manager":
+            cu_raw = caller_upn
+            tu_raw = target_upn
+            mu_raw = manager_upn
+
+            cu = _norm_upn(cu_raw)
+            tu = _norm_upn(tu_raw)
+            mu = _norm_upn(mu_raw)
+
+            ok = bool(cu and (cu == tu or (mu and cu == mu)))
+
+            # Add rich debug info so we can see what was compared
+            details["caller_is_self_or_manager"] = {
+                "ok": ok,
+                "caller_upn": cu_raw,
+                "target_upn": tu_raw,
+                "manager_upn": mu_raw,
+                "normalized": {
+                    "caller": cu,
+                    "target": tu,
+                    "manager": mu,
+                },
+            }
+
+            # Console debug so you can see actual AD values in logs
+            # try:
+            print("[policy.check_list] caller_is_self_or_manager inputs:")
+            print("  caller_upn (raw):   ", cu_raw)
+            print("  target_upn (raw):   ", tu_raw)
+            print("  manager_upn (raw):  ", mu_raw)
+            print("  normalized caller:  ", cu)
+            print("  normalized target:  ", tu)
+            print("  normalized manager: ", mu)
+            print("  authorized?         ", ok)
+            # except Exception:
+            #     pass
+
+            if not ok:
+                return {
+                    "status": "error",
+                    "message": "User not authorized to act on this account",
+                    "details": details,
+                }
+
+        # ------------------------------------------------------------------
+        # Host authorization (NEW): target_host must be in allowed hosts list
+        # ------------------------------------------------------------------
+        elif cond == "host_is_authorized":
+            allowed_hosts = _parse_allowed_hosts_csv(allowed_hosts_csv)
+
+            # Normalize for comparison (support short-name vs FQDN match)
+            target_norm = _norm_host(host)
+            target_short = _short_host(host)
+
+            allowed_norm = [_norm_host(h) for h in allowed_hosts]
+            allowed_short = [_short_host(h) for h in allowed_hosts]
+
+            ok = False
+            if target_norm:
+                # Exact match on normalized host OR shortname match
+                ok = (target_norm in allowed_norm) or (target_short and target_short in allowed_short)
+
+            details["host_is_authorized"] = {
+                "ok": ok,
+                "target_host": host,
+                "normalized": {
+                    "target": target_norm,
+                    "target_short": target_short,
+                },
+                "allowed_hosts_count": len(allowed_hosts),
+            }
+
+            # Helpful debug line (but not dumping full list)
+            try:
+                print("[policy.check_list] host_is_authorized:")
+                print("  target_host:", host)
+                print("  target_norm:", target_norm)
+                print("  target_short:", target_short)
+                print("  allowed_hosts_count:", len(allowed_hosts))
+                print("  authorized? ", ok)
+            except Exception:
+                pass
+
+            if not ok:
+                return {
+                    "status": "error",
+                    "message": (
+                        "Target host is not authorized for this user. "
+                        "Please choose a device from your allowed device list."
+                    ),
+                    "details": details,
+                }
+
+        # ------------------------------------------------------------------
+        # Endpoint reachability
+        # ------------------------------------------------------------------
+        elif cond == "endpoint_reachable":
+            if endpoint_reachable is None:
+                details["endpoint_reachable"] = _reachable(host)
+            else:
+                details["endpoint_reachable"] = bool(endpoint_reachable)
+
+            if not details["endpoint_reachable"]:
+                return {
+                    "status": "error",
+                    "message": f"Target not reachable on port {WINRM_PORT}: {host}",
+                    "details": details,
+                }
+
+        # ------------------------------------------------------------------
+        # Endpoint OS check
+        # ------------------------------------------------------------------
+        elif cond == "endpoint_is_windows":
+            if endpoint_os:
+                ok = endpoint_os.lower() == "windows"
+                details["endpoint_is_windows"] = ok
+                details["endpoint_os_caption"] = endpoint_os
+            else:
+                ok, caption = _is_windows_via_winrm(host)
+                details["endpoint_is_windows"] = ok
+                details["endpoint_os_caption"] = caption
+
+            if not details.get("endpoint_is_windows"):
+                return {
+                    "status": "error",
+                    "message": f"{host} is not a Windows system",
+                    "details": details,
+                }
+
+        # ------------------------------------------------------------------
+        # Sofware approval check
+        # ------------------------------------------------------------------
+        elif cond == "software_is_approved":
+            ## TODO: for software approval check, need to configure properly, 
+            # passing raw full text from sop_retriever or planner causing major malfunction issue
+            approved_software_names_csv = "7-Zip,Google Chrome,Notepad++,7-zip,7zip" 
+            
+            name = (software_name or "").strip()
+            approved_csv = approved_software_names_csv or ""
+
+            details["software_is_approved"] = {
+                "requested_software": name,
+                "approved_list": approved_csv,
+            }
+
+            if not software_is_approved(name, approved_csv):
+                return {
+                    "status": "error",
+                    "message": (
+                        f"Requested software '{name}' is not approved "
+                        "for automated installation."
+                    ),
+                    "details": {
+                        **details,
+                        "policy": "software_is_approved",
+                    },
+                }
+
+
+        # ------------------------------------------------------------------
+        # Unknown / generic preconditions – mark as passed
+        # ------------------------------------------------------------------
+        else:
+            details[cond] = True
+
+    return {"status": "ok", "details": details}
