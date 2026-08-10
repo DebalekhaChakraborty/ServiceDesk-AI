@@ -11,6 +11,8 @@ from typing import Any, Dict, Set
 
 from google.adk.tools import FunctionTool, ToolContext
 
+from .policy_tool import ACCOUNT_ACCESS_AUTHORIZATION_STATE_KEY
+
 
 DEMO_BACKEND = "demo_ad_ds"
 
@@ -99,6 +101,42 @@ def _invalid_target(operation: str) -> Dict[str, Any]:
     return result
 
 
+def _authorization_error(operation: str, target_upn: str) -> Dict[str, Any]:
+    message = (
+        "A successful caller_is_self_or_manager policy check for this exact "
+        "target is required before accessing Active Directory account lock state."
+    )
+    result: Dict[str, Any] = {
+        "status": "error",
+        "code": "ACCOUNT_ACCESS_AUTHORIZATION_REQUIRED",
+        "message": message,
+        "stdout": "",
+        "stderr": message,
+    }
+    detail_key = "account" if operation == "check" else "unlock"
+    result[detail_key] = {
+        "status": "error",
+        "target_upn": target_upn,
+        "backend": DEMO_BACKEND,
+        "message": message,
+        "error": "ACCOUNT_ACCESS_AUTHORIZATION_REQUIRED",
+    }
+    return result
+
+
+def _is_authorized_target(tool_context: ToolContext, target_upn: str) -> bool:
+    state = tool_context.state if tool_context is not None else None
+    if state is None:
+        return False
+    grant = state.get(ACCOUNT_ACCESS_AUTHORIZATION_STATE_KEY)
+    return bool(
+        isinstance(grant, dict)
+        and grant.get("authorized") is True
+        and grant.get("policy") == "caller_is_self_or_manager"
+        and _normalize_upn(str(grant.get("target_upn") or "")) == target_upn
+    )
+
+
 def ad_check_account_lock_status(
     tool_context: ToolContext,
     target_upn: str,
@@ -113,6 +151,8 @@ def ad_check_account_lock_status(
         return _invalid_target("check")
     if AD_UNLOCK_MODE != "demo":
         return _backend_error("check", normalized_upn)
+    if not _is_authorized_target(tool_context, normalized_upn):
+        return _authorization_error("check", normalized_upn)
 
     with _demo_state_lock:
         locked = normalized_upn in _demo_locked_upns
@@ -138,7 +178,10 @@ def ad_check_account_lock_status(
     }
 
 
-def ad_unlock_account(target_upn: str) -> Dict[str, Any]:
+def ad_unlock_account(
+    target_upn: str,
+    tool_context: ToolContext,
+) -> Dict[str, Any]:
     """Unlock a resolved Active Directory account.
 
     This tool never enables an account or resets a password. The existing
@@ -150,6 +193,8 @@ def ad_unlock_account(target_upn: str) -> Dict[str, Any]:
         return _invalid_target("unlock")
     if AD_UNLOCK_MODE != "demo":
         return _backend_error("unlock", normalized_upn)
+    if not _is_authorized_target(tool_context, normalized_upn):
+        return _authorization_error("unlock", normalized_upn)
 
     with _demo_state_lock:
         was_locked = normalized_upn in _demo_locked_upns

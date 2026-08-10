@@ -10,9 +10,13 @@ os.environ.setdefault("WINRM_PORT", "5986")
 
 from sd_chat.planner import reasoning_composer
 from sd_chat.agent import sd_chat
-from sd_chat.tools import ad_account_tool
+from sd_chat.tools import aad_tool, ad_account_tool
 from sd_chat.tools.aad_tool import aad_reset_password
-from sd_chat.tools.policy_tool import check_list
+from sd_chat.tools.policy_tool import (
+    AAD_MANAGER_LOOKUP_STATE_KEY,
+    ACCOUNT_ACCESS_AUTHORIZATION_STATE_KEY,
+    check_list,
+)
 
 
 CALLER_UPN = "caller@example.com"
@@ -33,12 +37,21 @@ def _check_status(tool_context, target_upn):
     return ad_account_tool.ad_check_account_lock_status.func(tool_context, target_upn)
 
 
-def _unlock(target_upn):
-    return ad_account_tool.ad_unlock_account.func(target_upn)
+def _unlock(tool_context, target_upn):
+    return ad_account_tool.ad_unlock_account.func(target_upn, tool_context)
+
+
+def _record_manager_lookup(tool_context, target_upn, manager_upn):
+    tool_context.state[AAD_MANAGER_LOOKUP_STATE_KEY] = {
+        "target_upn": target_upn.lower(),
+        "manager_upn": manager_upn.lower(),
+        "source": "microsoft_graph",
+    }
 
 
 def test_explicit_self_unlock_runs_directly_without_lock_diagnosis():
     ad_account_tool._demo_locked_upns.add(CALLER_UPN)
+    tool_context = _tool_context()
     policy_gate = Mock(wraps=check_list)
     lock_status = Mock(wraps=ad_account_tool.ad_check_account_lock_status.func)
 
@@ -47,8 +60,9 @@ def test_explicit_self_unlock_runs_directly_without_lock_diagnosis():
         caller_upn=CALLER_UPN,
         target_upn=CALLER_UPN,
         manager_upn="",
+        tool_context=tool_context,
     )
-    result = _unlock(CALLER_UPN) if policy["status"] == "ok" else None
+    result = _unlock(tool_context, CALLER_UPN) if policy["status"] == "ok" else None
 
     assert policy["status"] == "ok"
     assert result["unlock"]["was_locked"] is True
@@ -58,8 +72,16 @@ def test_explicit_self_unlock_runs_directly_without_lock_diagnosis():
 
 
 def test_self_account_already_unlocked_is_clean_noop():
-    result = _unlock(CALLER_UPN)
+    tool_context = _tool_context()
+    policy = check_list(
+        preconditions=["caller_is_self_or_manager"],
+        caller_upn=CALLER_UPN,
+        target_upn=CALLER_UPN,
+        tool_context=tool_context,
+    )
+    result = _unlock(tool_context, CALLER_UPN)
 
+    assert policy["status"] == "ok"
     assert result["status"] == "ok"
     assert result["unlock"]["was_locked"] is False
     assert result["unlock"]["is_locked"] is False
@@ -68,6 +90,7 @@ def test_self_account_already_unlocked_is_clean_noop():
 
 def test_explicit_manager_unlock_uses_resolved_manager_for_policy():
     ad_account_tool._demo_locked_upns.add(TARGET_UPN)
+    tool_context = _tool_context()
     manager_lookup = Mock(
         return_value={
             "ok": True,
@@ -78,13 +101,15 @@ def test_explicit_manager_unlock_uses_resolved_manager_for_policy():
     )
 
     manager_result = manager_lookup(TARGET_UPN)
+    _record_manager_lookup(tool_context, TARGET_UPN, CALLER_UPN)
     policy = check_list(
         preconditions=["caller_is_self_or_manager"],
         caller_upn=CALLER_UPN,
         target_upn=TARGET_UPN,
         manager_upn=manager_result["manager"]["upn"],
+        tool_context=tool_context,
     )
-    result = _unlock(TARGET_UPN) if policy["status"] == "ok" else None
+    result = _unlock(tool_context, TARGET_UPN) if policy["status"] == "ok" else None
 
     manager_lookup.assert_called_once_with(TARGET_UPN)
     assert policy["status"] == "ok"
@@ -93,6 +118,7 @@ def test_explicit_manager_unlock_uses_resolved_manager_for_policy():
 
 def test_unauthorized_other_user_is_blocked_before_unlock():
     ad_account_tool._demo_locked_upns.add(TARGET_UPN)
+    tool_context = _tool_context()
     unlock_backend = Mock(wraps=ad_account_tool.ad_unlock_account.func)
 
     policy = check_list(
@@ -100,9 +126,10 @@ def test_unauthorized_other_user_is_blocked_before_unlock():
         caller_upn=CALLER_UPN,
         target_upn=TARGET_UPN,
         manager_upn="different.manager@example.com",
+        tool_context=tool_context,
     )
     if policy["status"] == "ok":
-        unlock_backend(TARGET_UPN)
+        unlock_backend(TARGET_UPN, tool_context)
 
     assert policy["status"] == "error"
     assert "not authorized" in policy["message"]
@@ -132,7 +159,7 @@ def test_unknown_target_stops_before_unlock():
 def test_backend_failure_matches_existing_failure_fallback_shape(monkeypatch):
     monkeypatch.setattr(ad_account_tool, "AD_UNLOCK_MODE", "ad_ds")
 
-    result = _unlock(TARGET_UPN)
+    result = _unlock(_tool_context(), TARGET_UPN)
 
     assert result["status"] == "error"
     assert result["code"] == "AD_DS_BACKEND_NOT_CONFIGURED"
@@ -152,7 +179,7 @@ def test_disabled_backend_cannot_claim_success_or_change_demo_state(monkeypatch)
     ad_account_tool._demo_locked_upns.add(TARGET_UPN)
     monkeypatch.setattr(ad_account_tool, "AD_UNLOCK_MODE", "disabled")
 
-    result = _unlock(TARGET_UPN)
+    result = _unlock(_tool_context(), TARGET_UPN)
 
     assert result["status"] == "error"
     assert result["code"] == "AD_UNLOCK_DISABLED"
@@ -290,6 +317,7 @@ def test_ambiguous_locked_account_offers_unlock_without_executing_it():
         caller_upn=CALLER_UPN,
         target_upn=CALLER_UPN,
         manager_upn="",
+        tool_context=tool_context,
     )
     status = _check_status(tool_context, CALLER_UPN) if policy["status"] == "ok" else None
 
@@ -309,6 +337,7 @@ def test_ambiguous_unlocked_account_offers_password_reset_without_executing_it()
         caller_upn=CALLER_UPN,
         target_upn=CALLER_UPN,
         manager_upn="",
+        tool_context=tool_context,
     )
     status = _check_status(tool_context, CALLER_UPN) if policy["status"] == "ok" else None
 
@@ -323,11 +352,13 @@ def test_manager_can_run_ambiguous_access_diagnosis():
     manager_lookup = Mock(return_value={"ok": True, "manager": {"upn": CALLER_UPN}})
 
     manager = manager_lookup(TARGET_UPN)
+    _record_manager_lookup(tool_context, TARGET_UPN, CALLER_UPN)
     policy = check_list(
         preconditions=["caller_is_self_or_manager"],
         caller_upn=CALLER_UPN,
         target_upn=TARGET_UPN,
         manager_upn=manager["manager"]["upn"],
+        tool_context=tool_context,
     )
     status = _check_status(tool_context, TARGET_UPN) if policy["status"] == "ok" else None
 
@@ -345,35 +376,191 @@ def test_unauthorized_caller_cannot_run_ambiguous_access_diagnosis():
         caller_upn=CALLER_UPN,
         target_upn=TARGET_UPN,
         manager_upn="different.manager@example.com",
+        tool_context=tool_context,
     )
     if policy["status"] == "ok":
         lock_status(tool_context, TARGET_UPN)
 
     assert policy["status"] == "error"
     lock_status.assert_not_called()
-    assert tool_context.state == {}
+    assert tool_context.state[ACCOUNT_ACCESS_AUTHORIZATION_STATE_KEY] is None
 
 
 def test_confirmation_after_unlock_offer_uses_retained_target():
     ad_account_tool._demo_locked_upns.add(TARGET_UPN)
     tool_context = _tool_context()
+    _record_manager_lookup(tool_context, TARGET_UPN, CALLER_UPN)
+    check_list(
+        preconditions=["caller_is_self_or_manager"],
+        caller_upn=CALLER_UPN,
+        target_upn=TARGET_UPN,
+        manager_upn=CALLER_UPN,
+        tool_context=tool_context,
+    )
     _check_status(tool_context, TARGET_UPN)
     unlock_backend = Mock(wraps=ad_account_tool.ad_unlock_account.func)
 
-    unlock_backend(tool_context.state["account_access_diagnosis"]["target_upn"])
+    check_list(
+        preconditions=["caller_is_self_or_manager"],
+        caller_upn=CALLER_UPN,
+        target_upn=TARGET_UPN,
+        manager_upn=CALLER_UPN,
+        tool_context=tool_context,
+    )
+    unlock_backend(
+        tool_context.state["account_access_diagnosis"]["target_upn"],
+        tool_context,
+    )
 
-    unlock_backend.assert_called_once_with(TARGET_UPN)
+    unlock_backend.assert_called_once_with(TARGET_UPN, tool_context)
     assert TARGET_UPN not in ad_account_tool._demo_locked_upns
 
 
 def test_confirmation_after_password_reset_offer_uses_retained_target():
     tool_context = _tool_context()
+    _record_manager_lookup(tool_context, TARGET_UPN, CALLER_UPN)
+    check_list(
+        preconditions=["caller_is_self_or_manager"],
+        caller_upn=CALLER_UPN,
+        target_upn=TARGET_UPN,
+        manager_upn=CALLER_UPN,
+        tool_context=tool_context,
+    )
     _check_status(tool_context, TARGET_UPN)
     password_reset = Mock(return_value={"reset": {"status": "ok"}})
 
     password_reset(tool_context.state["account_access_diagnosis"]["target_upn"])
 
     password_reset.assert_called_once_with(TARGET_UPN)
+
+
+def test_generated_account_authorization_precondition_fails_closed():
+    tool_context = _tool_context()
+
+    policy = check_list(
+        preconditions=["ad_account_lock_status_authorized"],
+        caller_upn=CALLER_UPN,
+        target_upn=TARGET_UPN,
+        manager_upn=CALLER_UPN,
+        tool_context=tool_context,
+    )
+    status = _check_status(tool_context, TARGET_UPN)
+
+    assert policy["status"] == "error"
+    assert policy["code"] == "UNKNOWN_PRECONDITION"
+    assert policy["details"]["ad_account_lock_status_authorized"]["ok"] is False
+    assert status["status"] == "error"
+    assert status["code"] == "ACCOUNT_ACCESS_AUTHORIZATION_REQUIRED"
+    assert "account_access_diagnosis" not in tool_context.state
+
+
+def test_non_manager_cannot_read_ashok_lock_status():
+    tool_context = _tool_context()
+    caller_upn = "debalekha.chakraborty@example.com"
+    ashok_upn = "ashok.giri@example.com"
+    actual_manager_upn = "admin.debalekha.chakraborty@example.com"
+
+    policy = check_list(
+        preconditions=["caller_is_self_or_manager"],
+        caller_upn=caller_upn,
+        target_upn=ashok_upn,
+        manager_upn=actual_manager_upn,
+        tool_context=tool_context,
+    )
+    status = _check_status(tool_context, ashok_upn)
+
+    assert policy["status"] == "error"
+    assert policy["details"]["caller_is_self_or_manager"]["ok"] is False
+    assert status["status"] == "error"
+    assert status["code"] == "ACCOUNT_ACCESS_AUTHORIZATION_REQUIRED"
+    assert "account_access_diagnosis" not in tool_context.state
+
+
+def test_missing_manager_does_not_use_a_default_identity():
+    tool_context = _tool_context()
+
+    policy = check_list(
+        preconditions=["caller_is_self_or_manager"],
+        caller_upn=CALLER_UPN,
+        target_upn=TARGET_UPN,
+        tool_context=tool_context,
+    )
+
+    assert policy["status"] == "error"
+    detail = policy["details"]["caller_is_self_or_manager"]
+    assert detail["manager_upn"] == ""
+    assert detail["ok"] is False
+
+
+def test_manager_argument_without_graph_evidence_is_rejected():
+    tool_context = _tool_context()
+
+    policy = check_list(
+        preconditions=["caller_is_self_or_manager"],
+        caller_upn=CALLER_UPN,
+        target_upn=TARGET_UPN,
+        manager_upn=CALLER_UPN,
+        tool_context=tool_context,
+    )
+
+    assert policy["status"] == "error"
+    detail = policy["details"]["caller_is_self_or_manager"]
+    assert detail["manager_lookup_verified"] is False
+    assert detail["ok"] is False
+
+
+def test_graph_manager_lookup_records_target_bound_evidence(monkeypatch):
+    tool_context = _tool_context()
+    graph_response = SimpleNamespace(
+        status_code=200,
+        text="",
+        json=lambda: {
+            "displayName": "Caller",
+            "userPrincipalName": CALLER_UPN,
+            "id": "manager-object-id",
+        },
+    )
+    monkeypatch.setattr(aad_tool, "_graph_is_configured", lambda: True)
+    monkeypatch.setattr(aad_tool, "_graph_get", lambda *args, **kwargs: graph_response)
+
+    manager = aad_tool.aad_get_manager.func(tool_context, TARGET_UPN)
+    policy = check_list(
+        preconditions=["caller_is_self_or_manager"],
+        caller_upn=CALLER_UPN,
+        target_upn=TARGET_UPN,
+        manager_upn=manager["manager"]["upn"],
+        tool_context=tool_context,
+    )
+
+    assert manager["ok"] is True
+    assert tool_context.state[AAD_MANAGER_LOOKUP_STATE_KEY] == {
+        "target_upn": TARGET_UPN,
+        "manager_upn": CALLER_UPN,
+        "source": "microsoft_graph",
+    }
+    assert policy["status"] == "ok"
+    assert policy["details"]["caller_is_self_or_manager"][
+        "manager_lookup_verified"
+    ] is True
+
+
+def test_ad_tools_require_authorization_for_the_exact_target():
+    ad_account_tool._demo_locked_upns.add(TARGET_UPN)
+    tool_context = _tool_context()
+    policy = check_list(
+        preconditions=["caller_is_self_or_manager"],
+        caller_upn=CALLER_UPN,
+        target_upn=CALLER_UPN,
+        tool_context=tool_context,
+    )
+
+    status = _check_status(tool_context, TARGET_UPN)
+    unlock = _unlock(tool_context, TARGET_UPN)
+
+    assert policy["status"] == "ok"
+    assert status["code"] == "ACCOUNT_ACCESS_AUTHORIZATION_REQUIRED"
+    assert unlock["code"] == "ACCOUNT_ACCESS_AUTHORIZATION_REQUIRED"
+    assert TARGET_UPN in ad_account_tool._demo_locked_upns
 
 
 def test_agent_instructions_narrow_ad_diagnosis_and_guard_explicit_actions():
@@ -389,6 +576,11 @@ def test_agent_instructions_narrow_ad_diagnosis_and_guard_explicit_actions():
     assert "plan.can_execute_fully == true" in instruction
     assert "plan.low_confidence == false" in instruction
     assert "selects an unexpected action, stop and clarify" in instruction
+    assert "preconditions exactly equal to" in instruction
+    assert '["caller_is_self_or_manager"]' in instruction
+    assert "Never rename, paraphrase, generalize" in instruction
+    assert "check_list.details.caller_is_self_or_manager.ok == true" in instruction
+    assert "If manager lookup fails or returns no manager UPN, stop" in instruction
 
 
 def test_account_access_instruction_requires_diagnosis_before_remediation():

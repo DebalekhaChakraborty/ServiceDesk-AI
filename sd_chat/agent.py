@@ -238,9 +238,14 @@ For an explicit unlock or password-reset request:
   step to propose_plan so these non-action items do not become unmapped planner steps.
 
 For an ambiguous enterprise/domain/AD account-access problem:
-- Resolve the same target, then authorize caller_is_self_or_manager with check_list
-  before calling ad_check_account_lock_status or revealing its result. For another
-  user, obtain and pass the actual manager.upn from aad_get_manager.
+- Resolve the same target, then call check_list with preconditions exactly equal to
+  ["caller_is_self_or_manager"] before calling ad_check_account_lock_status or
+  revealing its result. Never rename, paraphrase, generalize, or add a substitute
+  authorization precondition. Continue only when check_list.status == "ok" and
+  check_list.details.caller_is_self_or_manager.ok == true.
+- For another user, obtain and pass the actual manager.upn from aad_get_manager.
+  If manager lookup fails or returns no manager UPN, stop; never use caller identity,
+  session identity.manager, a guessed value, or a default as the target's manager.
 - If the account is locked, explain that finding and offer account unlock.
 - If the account is not locked, explain only that account lockout has been ruled
   out; do not claim that another cause has been found. If the exact sign-in surface

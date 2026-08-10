@@ -1,6 +1,8 @@
 from typing import List, Dict, Tuple, Optional
 import os, socket
 
+from google.adk.tools import ToolContext
+
 try:
     import winrm  # type: ignore
 except Exception:
@@ -12,6 +14,9 @@ WINRM_PASS = os.getenv("WINRM_PASSWORD")
 WINRM_PORT = int(os.getenv("WINRM_PORT", "5986"))  # sensible default
 WINRM_TRANSPORT = os.getenv("WINRM_TRANSPORT", "ntlm")
 WINRM_CERT_VALIDATE = os.getenv("WINRM_CERT_VALIDATE", "false")
+
+ACCOUNT_ACCESS_AUTHORIZATION_STATE_KEY = "temp:account_access_authorization"
+AAD_MANAGER_LOOKUP_STATE_KEY = "temp:aad_manager_lookup"
 
 
 def _endpoint(host: str) -> str:
@@ -141,18 +146,17 @@ def software_is_approved(
 
 
 def check_list(
-    preconditions: List[str], ## TODO: preconditions coming out wrong need to check
+    preconditions: List[str],
     target_host: Optional[str] = "",
     caller_role: Optional[str] = "",
     caller_upn: Optional[str] = "",
     target_upn: Optional[str] = "",
-    # manager_upn: Optional[str] = "",
-    ## TODO: hardcoding manager_upn for testing only, remove later
-    manager_upn: Optional[str] = "ashok.giri@debalekhachakrabortyoutlook.onmicrosoft.com",
+    manager_upn: Optional[str] = "",
     endpoint_os: Optional[str] = "",
     endpoint_reachable: Optional[bool] = None,
     allowed_hosts_csv: Optional[str] = "",  # for host authorization enforcement
     software_name: Optional[str] = "",
+    tool_context: Optional[ToolContext] = None,
     # raw_sop_text: Optional[str] = "" ## TODO: for software approval check, need to configure properly, passing raw full text from sop_retriever or planner causing major malfunction issue
 ) -> Dict[str, object]:
     """
@@ -162,13 +166,20 @@ def check_list(
     - Only simple fields (no nested dicts).
     - Returns: { "status": "ok" | "error", "message": str, "details": {...} }
 
-    NEW:
-    - Supports "host_is_authorized" precondition using allowed_hosts_csv.
-      The orchestrator (or identity tool) should provide allowed_hosts as a
-      comma-separated string when calling this tool.
+    Preconditions are fail-closed: an unrecognized condition returns an error.
+    A successful ``caller_is_self_or_manager`` evaluation records a target-bound
+    authorization grant for protected AD account tools in the current session.
     """
     details: Dict[str, object] = {}
     host = target_host or ""
+    account_authorization: Optional[Dict[str, object]] = None
+
+    state = tool_context.state if tool_context is not None else None
+    if state is not None:
+        # A grant is valid only when this invocation successfully re-establishes
+        # the canonical account authorization condition. ADK's State supports
+        # assignment but not deletion, so an explicit null revokes old grants.
+        state[ACCOUNT_ACCESS_AUTHORIZATION_STATE_KEY] = None
 
     # High-level debug of each call
     try:
@@ -211,7 +222,19 @@ def check_list(
             tu = _norm_upn(tu_raw)
             mu = _norm_upn(mu_raw)
 
-            ok = bool(cu and (cu == tu or (mu and cu == mu)))
+            manager_lookup = (
+                state.get(AAD_MANAGER_LOOKUP_STATE_KEY) if state is not None else None
+            )
+            manager_lookup_verified = bool(
+                isinstance(manager_lookup, dict)
+                and _norm_upn(str(manager_lookup.get("target_upn") or "")) == tu
+                and _norm_upn(str(manager_lookup.get("manager_upn") or "")) == mu
+            )
+            caller_is_self = bool(cu and cu == tu)
+            caller_is_verified_manager = bool(
+                cu and mu and cu == mu and manager_lookup_verified
+            )
+            ok = caller_is_self or caller_is_verified_manager
 
             # Add rich debug info so we can see what was compared
             details["caller_is_self_or_manager"] = {
@@ -219,6 +242,7 @@ def check_list(
                 "caller_upn": cu_raw,
                 "target_upn": tu_raw,
                 "manager_upn": mu_raw,
+                "manager_lookup_verified": manager_lookup_verified,
                 "normalized": {
                     "caller": cu,
                     "target": tu,
@@ -235,6 +259,7 @@ def check_list(
             print("  normalized caller:  ", cu)
             print("  normalized target:  ", tu)
             print("  normalized manager: ", mu)
+            print("  manager lookup verified:", manager_lookup_verified)
             print("  authorized?         ", ok)
             # except Exception:
             #     pass
@@ -245,6 +270,14 @@ def check_list(
                     "message": "User not authorized to act on this account",
                     "details": details,
                 }
+
+            account_authorization = {
+                "authorized": True,
+                "caller_upn": cu,
+                "target_upn": tu,
+                "manager_upn": mu,
+                "policy": "caller_is_self_or_manager",
+            }
 
         # ------------------------------------------------------------------
         # Host authorization (NEW): target_host must be in allowed hosts list
@@ -362,9 +395,22 @@ def check_list(
 
 
         # ------------------------------------------------------------------
-        # Unknown / generic preconditions – mark as passed
+        # Unknown preconditions must fail closed. A generated or paraphrased
+        # policy name must never bypass a real authorization check.
         # ------------------------------------------------------------------
         else:
-            details[cond] = True
+            details[cond] = {
+                "ok": False,
+                "error": "unknown_precondition",
+            }
+            return {
+                "status": "error",
+                "code": "UNKNOWN_PRECONDITION",
+                "message": f"Unsupported policy precondition: {cond}",
+                "details": details,
+            }
+
+    if state is not None and account_authorization is not None:
+        state[ACCOUNT_ACCESS_AUTHORIZATION_STATE_KEY] = account_authorization
 
     return {"status": "ok", "details": details}
