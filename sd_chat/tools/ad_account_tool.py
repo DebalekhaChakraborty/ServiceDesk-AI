@@ -12,8 +12,14 @@ from typing import Any, Dict, Set
 from google.adk.tools import FunctionTool, ToolContext
 
 
-AD_UNLOCK_MODE = (os.getenv("AD_UNLOCK_MODE", "demo") or "demo").strip().lower()
 DEMO_BACKEND = "demo_ad_ds"
+
+
+def _configured_unlock_mode() -> str:
+    return (os.getenv("AD_UNLOCK_MODE") or "disabled").strip().lower()
+
+
+AD_UNLOCK_MODE = _configured_unlock_mode()
 
 
 def _normalize_upn(value: str) -> str:
@@ -41,6 +47,12 @@ def _backend_error(operation: str, target_upn: str) -> Dict[str, Any]:
         code = "AD_DS_BACKEND_NOT_CONFIGURED"
         message = (
             "The Active Directory Domain Services unlock backend is not configured."
+        )
+    elif backend == "disabled":
+        code = "AD_UNLOCK_DISABLED"
+        message = (
+            "Active Directory account unlock is disabled. "
+            "Configure AD_UNLOCK_MODE=demo explicitly to use the demo backend."
         )
     else:
         code = "AD_UNLOCK_MODE_INVALID"

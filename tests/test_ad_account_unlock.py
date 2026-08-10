@@ -142,6 +142,24 @@ def test_backend_failure_matches_existing_failure_fallback_shape(monkeypatch):
     assert result["unlock"]["target_upn"] == TARGET_UPN
 
 
+def test_missing_mode_configuration_defaults_to_disabled(monkeypatch):
+    monkeypatch.delenv("AD_UNLOCK_MODE", raising=False)
+
+    assert ad_account_tool._configured_unlock_mode() == "disabled"
+
+
+def test_disabled_backend_cannot_claim_success_or_change_demo_state(monkeypatch):
+    ad_account_tool._demo_locked_upns.add(TARGET_UPN)
+    monkeypatch.setattr(ad_account_tool, "AD_UNLOCK_MODE", "disabled")
+
+    result = _unlock(TARGET_UPN)
+
+    assert result["status"] == "error"
+    assert result["code"] == "AD_UNLOCK_DISABLED"
+    assert result["unlock"]["status"] == "error"
+    assert TARGET_UPN in ad_account_tool._demo_locked_upns
+
+
 def test_password_reset_action_remains_registered_and_callable():
     registry = reasoning_composer._load_registry()
 
@@ -183,6 +201,65 @@ def test_account_unlock_sop_step_maps_to_registered_action(monkeypatch):
     ]
     assert result["plan"]["preconditions"] == ["caller_is_self_or_manager"]
     assert result["plan"]["required_inputs"] == []
+    assert result["plan"]["can_execute_fully"] is True
+    assert result["plan"]["low_confidence"] is False
+    assert result["plan"]["unmapped"] == []
+
+
+def test_realistic_account_unlock_sop_produces_one_atomic_action(monkeypatch):
+    monkeypatch.setattr(reasoning_composer, "GENAI_AVAILABLE", False)
+    realistic_sop = {
+        "prerequisites": [
+            "Identify the requesting user and target account",
+            "Validate that the requester is the account owner or the target user's manager",
+        ],
+        "atomic_remediation": [
+            "Unlock the target Active Directory account if necessary",
+        ],
+        "tool_behavior_and_postconditions": [
+            "Check whether the target account is locked",
+            "Verify the account is unlocked",
+        ],
+    }
+
+    result = reasoning_composer.propose_plan(
+        user_text="Unlock my Active Directory account.",
+        ctx_vars=["target_upn"],
+        sop_texts=realistic_sop["atomic_remediation"],
+    )
+    unlock_action = next(
+        action
+        for action in reasoning_composer._load_registry()
+        if action["id"] == "ad.unlock_account"
+    )
+
+    assert len(realistic_sop["prerequisites"]) == 2
+    assert len(realistic_sop["tool_behavior_and_postconditions"]) == 2
+    assert "Checks the current lock state" in unlock_action["description"]
+    assert "verifies the final lock state" in unlock_action["description"]
+    assert result["plan"]["can_execute_fully"] is True
+    assert result["plan"]["low_confidence"] is False
+    assert result["plan"]["unmapped"] == []
+    assert [step["action_id"] for step in result["plan"]["tool_sequence"]] == [
+        "ad.unlock_account"
+    ]
+
+
+def test_explicit_password_reset_maps_to_existing_atomic_action(monkeypatch):
+    monkeypatch.setattr(reasoning_composer, "GENAI_AVAILABLE", False)
+
+    result = reasoning_composer.propose_plan(
+        user_text="Reset my password.",
+        ctx_vars=["target_upn"],
+        sop_texts=["Reset Azure AD password for a user"],
+    )
+
+    assert result["plan"]["can_execute_fully"] is True
+    assert result["plan"]["low_confidence"] is False
+    assert result["plan"]["unmapped"] == []
+    assert [step["action_id"] for step in result["plan"]["tool_sequence"]] == [
+        "aad.reset_password"
+    ]
 
 
 def test_explicit_password_reset_does_not_require_lock_diagnosis():
@@ -299,10 +376,16 @@ def test_confirmation_after_password_reset_offer_uses_retained_target():
     password_reset.assert_called_once_with(TARGET_UPN)
 
 
-def test_agent_instructions_describe_direct_and_ambiguous_account_access_paths():
+def test_agent_instructions_narrow_ad_diagnosis_and_guard_explicit_actions():
     instruction = sd_chat.instruction
 
     assert "explicit account unlock" in instruction
-    assert "ambiguous account-access/login problem" in instruction
+    assert "ambiguous enterprise/domain/AD account-access problem" in instruction
+    assert "AWS WorkSpaces, HOST, Teams, ServiceNow, or VPN" in instruction
+    assert "do not automatically classify it as AD account access" in instruction
     assert "do not diagnose lock status before it" in instruction
     assert "Do not execute either remediation until the user confirms." in instruction
+    assert "maps exactly one expected action" in instruction
+    assert "plan.can_execute_fully == true" in instruction
+    assert "plan.low_confidence == false" in instruction
+    assert "selects an unexpected action, stop and clarify" in instruction

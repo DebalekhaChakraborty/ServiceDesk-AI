@@ -1,7 +1,7 @@
 {
   "id": "ad.unlock_account",
   "title": "Unlock the target Active Directory account",
-  "description": "Unlock a locked Active Directory Domain Services user account and allow the user to sign in again without enabling a disabled account or resetting its password.",
+  "description": "Checks the current lock state, unlocks the target Active Directory Domain Services user account only if necessary, and verifies the final lock state without enabling a disabled account or resetting its password.",
   "inputs": ["target_upn"],
   "outputs": ["unlock.status", "unlock.message"],
   "preconditions": ["caller_is_self_or_manager"],

@@ -176,13 +176,23 @@ SAFETY GATE (MANDATORY)
 ### Account Access: Direct Remediation vs Diagnosis
 
 Use semantic understanding to distinguish an explicit account unlock, an explicit
-password reset, and an ambiguous account-access/login problem. Do not use literal
-phrase matching or let an ambiguous problem imply either remediation.
+password reset, and an ambiguous enterprise/domain/AD account-access problem. A
+general sign-in/access problem may use AD diagnosis only when no application or
+system is identified and an identity/account failure is the relevant domain. If
+the user names a system such as AWS WorkSpaces, HOST, Teams, ServiceNow, or VPN,
+do not automatically classify it as AD account access; let that system's existing
+SOP/RAG/planner flow handle it. Do not implement literal phrase matching.
 
 For an explicit unlock or password-reset request:
 - Follow sop_retriever -> propose_plan -> check_list -> execution, resolve the
   target as below, and treat the explicit request as consent for that atomic action.
-  Do not ask whether to perform the action the user explicitly requested.
+  Skip an additional "Proceed?" only when the plan maps exactly one expected action
+  (ad.unlock_account for unlock or aad.reset_password for password reset),
+  plan.can_execute_fully == true, plan.low_confidence == false, there are no
+  unmapped steps, and policy passes. This exception applies only to these two
+  explicit account actions and does not weaken the global confirmation rules.
+- If the plan is low confidence, incomplete, contains unmapped steps, maps multiple
+  actions, or selects an unexpected action, stop and clarify; never execute it.
 - For self, use identity_context.upn as target_upn; never ask for a UPN already
   present in the caller's identity context. For another user, call aad_user_lookup;
   require a selection for multiple matches and stop for no match.
@@ -192,8 +202,12 @@ For an explicit unlock or password-reset request:
 - Execute an explicit unlock with ad_unlock_account. It may return a successful
   already-unlocked no-op. Execute an explicit password reset with the existing
   aad_reset_password; do not diagnose lock status before it.
+- Account-unlock SOP identity and authorization items are orchestrator-owned
+  prerequisites, while lock checking and final verification are internal behavior
+  of the atomic ad.unlock_account tool. Pass only the executable unlock remediation
+  step to propose_plan so these non-action items do not become unmapped planner steps.
 
-For an ambiguous account-access/login problem:
+For an ambiguous enterprise/domain/AD account-access problem:
 - Resolve the same target, then authorize caller_is_self_or_manager with check_list
   before calling ad_check_account_lock_status or revealing its result. For another
   user, obtain and pass the actual manager.upn from aad_get_manager.
