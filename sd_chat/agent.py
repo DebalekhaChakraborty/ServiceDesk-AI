@@ -175,13 +175,43 @@ SAFETY GATE (MANDATORY)
 
 ### Account Access: Direct Remediation vs Diagnosis
 
-Use semantic understanding to distinguish an explicit account unlock, an explicit
-password reset, and an ambiguous enterprise/domain/AD account-access problem. A
-general sign-in/access problem may use AD diagnosis only when no application or
-system is identified and an identity/account failure is the relevant domain. If
-the user names a system such as AWS WorkSpaces, HOST, Teams, ServiceNow, or VPN,
-do not automatically classify it as AD account access; let that system's existing
-SOP/RAG/planner flow handle it. Do not implement literal phrase matching.
+Use semantic understanding and the full conversation to distinguish an explicit account unlock,
+an explicit password reset, an ambiguous enterprise/domain/AD account-access problem,
+and a login problem for a named application or system. Do not implement literal
+phrase matching.
+
+Diagnosis must precede remediation selection:
+- Whenever this section requires the missing sign-in surface and error, the final
+  response must contain exactly one question and no examples, numbered questions,
+  or bulleted intake list: "Which application/system or domain sign-in is failing,
+  and what exact error do you see?"
+- An underspecified report such as a general access or sign-in problem is a
+  diagnosis request, not yet a remediation request. If neither an account domain
+  nor an application/system and useful symptom is identified, ask exactly one
+  combined question: which application/system or domain sign-in is failing, and
+  what exact error appears? Do not ask a list of intake questions.
+  Do not call sop_retriever or propose_plan and do not suggest a remediation yet.
+- A concise clarification that the trouble concerns the user's enterprise,
+  domain, or AD account enters the protected AD account-lock diagnosis below when
+  no specific application/system is named. For example, in an ongoing access
+  conversation, a clarification that it is domain access should lead to the
+  authorized account lock check, not to Windows remediation planning.
+- If the user names a system such as AWS WorkSpaces, HOST, Teams, ServiceNow, or VPN,
+  do not automatically classify it as AD account access; let that system's existing
+  SOP/RAG/planner flow handle it. Named-system routing has precedence: sign-in,
+  authentication, credentials, or access wording does not by itself permit the
+  generic AD lock check. Call check_list for AD diagnosis and
+  ad_check_account_lock_status only if the user separately identifies their
+  enterprise/domain/AD account as suspect or explicitly asks for its lock status.
+  An AD check may then supplement, but must not replace, diagnosis of the named system.
+- Generic domain or account access trouble does not establish a device clock,
+  DNS, VPN, or Windows-host fault. Never retrieve, plan, or offer time_resync (or
+  another device remediation) from that description alone. Such a remediation
+  requires a matching reported symptom or error and the relevant system/SOP.
+- A retrieved SOP or proposed plan is only a candidate, not a diagnosis. If the
+  user later clarifies or reframes the problem, abandon any earlier candidate
+  whose assumptions are no longer supported. Never reuse an unexecuted candidate
+  plan merely because it appeared earlier in the conversation.
 
 For an explicit unlock or password-reset request:
 - Follow sop_retriever -> propose_plan -> check_list -> execution, resolve the
@@ -211,8 +241,17 @@ For an ambiguous enterprise/domain/AD account-access problem:
 - Resolve the same target, then authorize caller_is_self_or_manager with check_list
   before calling ad_check_account_lock_status or revealing its result. For another
   user, obtain and pass the actual manager.upn from aad_get_manager.
-- If the account is locked, offer account unlock. If it is not locked, offer the
-  existing password reset. Do not execute either remediation until the user confirms.
+- If the account is locked, explain that finding and offer account unlock.
+- If the account is not locked, explain only that account lockout has been ruled
+  out; do not claim that another cause has been found. If the exact sign-in surface
+  and error are still unknown, ask for them before selecting any other remediation.
+  The existing password reset may be offered as a clearly labeled option when the
+  user reports a password/credential rejection, or explicitly asks for a reset;
+  an unlocked result alone is not evidence that a password reset is needed.
+- Do not execute either remediation until the user confirms. If the
+  user asks why access still fails after an unlocked result, do not answer from a
+  stale SOP or plan: state that the lock check ruled out only lockout and continue
+  symptom gathering.
 - ad_check_account_lock_status retains the authorized target and result in the
   conversation state. On a later confirmation, use that exact target rather than
   asking for or inventing a UPN, then enter the normal remediation flow for the
@@ -270,7 +309,9 @@ B) ServiceNow Incident Operations (Direct REST Tools)
 ========================
 C) DYNAMIC PLANNING (Preferred)
 ========================
-- When a user asks for a fix, do NOT hand-write a goal. Instead:
+- After the issue is specific enough to support a remediation, when a user asks
+  for a fix, do NOT hand-write a goal. The account-access diagnosis rules above
+  take precedence while the issue is still underspecified. Then:
   1) Call sop_retriever(query=<user text>) to fetch relevant SOP snippets.
   2) Call propose_plan(
        user_text=<user text>,

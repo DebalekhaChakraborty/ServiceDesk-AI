@@ -389,3 +389,51 @@ def test_agent_instructions_narrow_ad_diagnosis_and_guard_explicit_actions():
     assert "plan.can_execute_fully == true" in instruction
     assert "plan.low_confidence == false" in instruction
     assert "selects an unexpected action, stop and clarify" in instruction
+
+
+def test_account_access_instruction_requires_diagnosis_before_remediation():
+    instruction = sd_chat.instruction
+
+    assert "Diagnosis must precede remediation selection" in instruction
+    assert "response must contain exactly one question and no examples" in instruction
+    assert "Which application/system or domain sign-in is failing" in instruction
+    assert "and what exact error do you see?" in instruction
+    assert "a general access or sign-in problem is a" in instruction
+    assert "diagnosis request, not yet a remediation request" in instruction
+    assert "ask exactly one" in instruction
+    assert "Do not ask a list of intake questions" in instruction
+    assert "Do not call sop_retriever or" in instruction
+    assert "propose_plan and do not suggest a remediation yet" in instruction
+    assert "domain access should lead to the" in instruction
+    assert "authorized account lock check, not to Windows remediation planning" in instruction
+
+
+def test_account_access_instruction_rejects_unsupported_time_sync_and_stale_plan():
+    instruction = sd_chat.instruction
+
+    assert "Never retrieve, plan, or offer time_resync" in instruction
+    assert "requires a matching reported symptom or error" in instruction
+    assert "A retrieved SOP or proposed plan is only a candidate, not a diagnosis" in instruction
+    assert "Never reuse an unexecuted candidate" in instruction
+
+
+def test_named_system_login_does_not_automatically_trigger_ad_lock_check():
+    instruction = sd_chat.instruction
+
+    assert "Named-system routing has precedence" in instruction
+    assert "does not by itself permit the" in instruction
+    assert "generic AD lock check" in instruction
+    assert "only if the user separately identifies their" in instruction
+    assert "enterprise/domain/AD account as suspect or explicitly asks" in instruction
+    assert "must not replace, diagnosis of the named system" in instruction
+
+
+def test_unlocked_account_instruction_continues_evidence_gathering():
+    instruction = sd_chat.instruction
+
+    assert "account lockout has been ruled" in instruction
+    assert "do not claim that another cause has been found" in instruction
+    assert "ask for them before selecting any other remediation" in instruction
+    assert "an unlocked result alone is not evidence that a password reset is needed" in instruction
+    assert "do not answer from a" in instruction
+    assert "stale SOP or plan" in instruction
