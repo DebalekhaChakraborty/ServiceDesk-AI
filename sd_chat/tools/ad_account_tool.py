@@ -9,7 +9,7 @@ import os
 import threading
 from typing import Any, Dict, Set
 
-from google.adk.tools import FunctionTool
+from google.adk.tools import FunctionTool, ToolContext
 
 
 AD_UNLOCK_MODE = (os.getenv("AD_UNLOCK_MODE", "demo") or "demo").strip().lower()
@@ -87,7 +87,10 @@ def _invalid_target(operation: str) -> Dict[str, Any]:
     return result
 
 
-def ad_check_account_lock_status(target_upn: str) -> Dict[str, Any]:
+def ad_check_account_lock_status(
+    tool_context: ToolContext,
+    target_upn: str,
+) -> Dict[str, Any]:
     """Check whether a resolved Active Directory account is locked.
 
     Authorization must be completed by ``check_list`` before this tool is called.
@@ -102,13 +105,24 @@ def ad_check_account_lock_status(target_upn: str) -> Dict[str, Any]:
     with _demo_state_lock:
         locked = normalized_upn in _demo_locked_upns
 
+    account = {
+        "target_upn": normalized_upn,
+        "locked": locked,
+        "backend": DEMO_BACKEND,
+    }
+
+    # The root orchestrator uses this only after authorizing a diagnostic. It
+    # lets a later confirmation refer to the same resolved account rather than
+    # asking the user to repeat a UPN or attempting a fresh lookup.
+    state = tool_context.state
+    if state is None:
+        state = {}
+        tool_context.state = state
+    state["account_access_diagnosis"] = dict(account)
+
     return {
         "status": "ok",
-        "account": {
-            "target_upn": normalized_upn,
-            "locked": locked,
-            "backend": DEMO_BACKEND,
-        },
+        "account": account,
     }
 
 
