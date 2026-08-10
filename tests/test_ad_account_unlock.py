@@ -478,20 +478,20 @@ def test_generated_account_authorization_precondition_fails_closed():
     assert "account_access_diagnosis" not in tool_context.state
 
 
-def test_non_manager_cannot_read_ashok_lock_status():
+def test_non_manager_cannot_read_another_users_account_status():
     tool_context = _tool_context()
-    caller_upn = "debalekha.chakraborty@example.com"
-    ashok_upn = "ashok.giri@example.com"
-    actual_manager_upn = "admin.debalekha.chakraborty@example.com"
+    caller_upn = "requester@example.com"
+    other_user_upn = "unauthorized.employee@example.com"
+    actual_manager_upn = "actual.manager@example.com"
 
     policy = check_list(
         preconditions=["caller_is_self_or_manager"],
         caller_upn=caller_upn,
-        target_upn=ashok_upn,
+        target_upn=other_user_upn,
         manager_upn=actual_manager_upn,
         tool_context=tool_context,
     )
-    status = _check_status(tool_context, ashok_upn)
+    status = _check_status(tool_context, other_user_upn)
 
     assert policy["status"] == "error"
     assert policy["details"]["caller_is_self_or_manager"]["ok"] is False
