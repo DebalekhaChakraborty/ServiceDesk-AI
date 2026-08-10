@@ -17,6 +17,12 @@ WINRM_CERT_VALIDATE = os.getenv("WINRM_CERT_VALIDATE", "false")
 
 ACCOUNT_ACCESS_AUTHORIZATION_STATE_KEY = "temp:account_access_authorization"
 AAD_MANAGER_LOOKUP_STATE_KEY = "temp:aad_manager_lookup"
+ACCOUNT_DIAGNOSIS_ACTION_ID = "ad.get_account_status"
+ACCOUNT_REMEDIATION_ACTION_IDS = {
+    "ad.unlock_account",
+    "ad.enable_account",
+    "aad.reset_password",
+}
 
 
 def _endpoint(host: str) -> str:
@@ -156,6 +162,11 @@ def check_list(
     endpoint_reachable: Optional[bool] = None,
     allowed_hosts_csv: Optional[str] = "",  # for host authorization enforcement
     software_name: Optional[str] = "",
+    account_action_id: Optional[str] = "",
+    plan_can_execute_fully: Optional[bool] = None,
+    plan_low_confidence: Optional[bool] = None,
+    plan_unmapped_count: Optional[int] = None,
+    plan_action_count: Optional[int] = None,
     tool_context: Optional[ToolContext] = None,
     # raw_sop_text: Optional[str] = "" ## TODO: for software approval check, need to configure properly, passing raw full text from sop_retriever or planner causing major malfunction issue
 ) -> Dict[str, object]:
@@ -167,8 +178,10 @@ def check_list(
     - Returns: { "status": "ok" | "error", "message": str, "details": {...} }
 
     Preconditions are fail-closed: an unrecognized condition returns an error.
-    A successful ``caller_is_self_or_manager`` evaluation records a target-bound
-    authorization grant for protected AD account tools in the current session.
+    A successful ``caller_is_self_or_manager`` evaluation records a target-bound,
+    action-bound authorization grant for protected AD account tools. Omitting
+    ``account_action_id`` grants diagnosis-only access. A remediation grant also
+    requires an executable, high-confidence, single-action planner result.
     """
     details: Dict[str, object] = {}
     host = target_host or ""
@@ -277,7 +290,37 @@ def check_list(
                 "target_upn": tu,
                 "manager_upn": mu,
                 "policy": "caller_is_self_or_manager",
+                "action_id": ACCOUNT_DIAGNOSIS_ACTION_ID,
             }
+
+            requested_action_id = (account_action_id or "").strip()
+            if requested_action_id:
+                plan_safe = bool(
+                    requested_action_id in ACCOUNT_REMEDIATION_ACTION_IDS
+                    and plan_can_execute_fully is True
+                    and plan_low_confidence is False
+                    and plan_unmapped_count == 0
+                    and plan_action_count == 1
+                )
+                details["account_remediation_plan"] = {
+                    "ok": plan_safe,
+                    "action_id": requested_action_id,
+                    "can_execute_fully": plan_can_execute_fully,
+                    "low_confidence": plan_low_confidence,
+                    "unmapped_count": plan_unmapped_count,
+                    "action_count": plan_action_count,
+                }
+                if not plan_safe:
+                    return {
+                        "status": "error",
+                        "code": "ACCOUNT_PLAN_NOT_EXECUTABLE",
+                        "message": (
+                            "Account remediation requires one fully mapped, "
+                            "high-confidence expected action."
+                        ),
+                        "details": details,
+                    }
+                account_authorization["action_id"] = requested_action_id
 
         # ------------------------------------------------------------------
         # Host authorization (NEW): target_host must be in allowed hosts list

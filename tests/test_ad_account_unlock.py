@@ -25,8 +25,9 @@ TARGET_UPN = "target@example.com"
 
 @pytest.fixture(autouse=True)
 def isolated_demo_backend(monkeypatch):
-    monkeypatch.setattr(ad_account_tool, "AD_UNLOCK_MODE", "demo")
+    monkeypatch.setattr(ad_account_tool, "AD_ACCOUNT_MODE", "demo")
     monkeypatch.setattr(ad_account_tool, "_demo_locked_upns", set())
+    monkeypatch.setattr(ad_account_tool, "_demo_disabled_upns", set())
 
 
 def _tool_context():
@@ -35,6 +36,10 @@ def _tool_context():
 
 def _check_status(tool_context, target_upn):
     return ad_account_tool.ad_check_account_lock_status.func(tool_context, target_upn)
+
+
+def _account_status(tool_context, target_upn):
+    return ad_account_tool.ad_get_account_status.func(tool_context, target_upn)
 
 
 def _unlock(tool_context, target_upn):
@@ -49,11 +54,22 @@ def _record_manager_lookup(tool_context, target_upn, manager_upn):
     }
 
 
+def _account_action_plan_kwargs(action_id):
+    return {
+        "account_action_id": action_id,
+        "plan_can_execute_fully": True,
+        "plan_low_confidence": False,
+        "plan_unmapped_count": 0,
+        "plan_action_count": 1,
+    }
+
+
 def test_explicit_self_unlock_runs_directly_without_lock_diagnosis():
     ad_account_tool._demo_locked_upns.add(CALLER_UPN)
     tool_context = _tool_context()
     policy_gate = Mock(wraps=check_list)
-    lock_status = Mock(wraps=ad_account_tool.ad_check_account_lock_status.func)
+    account_status = Mock(wraps=ad_account_tool.ad_get_account_status.func)
+    password_reset = Mock()
 
     policy = policy_gate(
         preconditions=["caller_is_self_or_manager"],
@@ -61,6 +77,7 @@ def test_explicit_self_unlock_runs_directly_without_lock_diagnosis():
         target_upn=CALLER_UPN,
         manager_upn="",
         tool_context=tool_context,
+        **_account_action_plan_kwargs("ad.unlock_account"),
     )
     result = _unlock(tool_context, CALLER_UPN) if policy["status"] == "ok" else None
 
@@ -68,7 +85,8 @@ def test_explicit_self_unlock_runs_directly_without_lock_diagnosis():
     assert result["unlock"]["was_locked"] is True
     assert result["unlock"]["is_locked"] is False
     policy_gate.assert_called_once()
-    lock_status.assert_not_called()
+    account_status.assert_not_called()
+    password_reset.assert_not_called()
 
 
 def test_self_account_already_unlocked_is_clean_noop():
@@ -78,6 +96,7 @@ def test_self_account_already_unlocked_is_clean_noop():
         caller_upn=CALLER_UPN,
         target_upn=CALLER_UPN,
         tool_context=tool_context,
+        **_account_action_plan_kwargs("ad.unlock_account"),
     )
     result = _unlock(tool_context, CALLER_UPN)
 
@@ -108,6 +127,7 @@ def test_explicit_manager_unlock_uses_resolved_manager_for_policy():
         target_upn=TARGET_UPN,
         manager_upn=manager_result["manager"]["upn"],
         tool_context=tool_context,
+        **_account_action_plan_kwargs("ad.unlock_account"),
     )
     result = _unlock(tool_context, TARGET_UPN) if policy["status"] == "ok" else None
 
@@ -127,6 +147,7 @@ def test_unauthorized_other_user_is_blocked_before_unlock():
         target_upn=TARGET_UPN,
         manager_upn="different.manager@example.com",
         tool_context=tool_context,
+        **_account_action_plan_kwargs("ad.unlock_account"),
     )
     if policy["status"] == "ok":
         unlock_backend(TARGET_UPN, tool_context)
@@ -157,7 +178,7 @@ def test_unknown_target_stops_before_unlock():
 
 
 def test_backend_failure_matches_existing_failure_fallback_shape(monkeypatch):
-    monkeypatch.setattr(ad_account_tool, "AD_UNLOCK_MODE", "ad_ds")
+    monkeypatch.setattr(ad_account_tool, "AD_ACCOUNT_MODE", "ad_ds")
 
     result = _unlock(_tool_context(), TARGET_UPN)
 
@@ -170,21 +191,23 @@ def test_backend_failure_matches_existing_failure_fallback_shape(monkeypatch):
 
 
 def test_missing_mode_configuration_defaults_to_disabled(monkeypatch):
-    monkeypatch.delenv("AD_UNLOCK_MODE", raising=False)
+    monkeypatch.delenv("AD_ACCOUNT_MODE", raising=False)
 
-    assert ad_account_tool._configured_unlock_mode() == "disabled"
+    assert ad_account_tool._configured_account_mode() == "off"
 
 
 def test_disabled_backend_cannot_claim_success_or_change_demo_state(monkeypatch):
     ad_account_tool._demo_locked_upns.add(TARGET_UPN)
-    monkeypatch.setattr(ad_account_tool, "AD_UNLOCK_MODE", "disabled")
+    ad_account_tool._demo_disabled_upns.add(TARGET_UPN)
+    monkeypatch.setattr(ad_account_tool, "AD_ACCOUNT_MODE", "off")
 
     result = _unlock(_tool_context(), TARGET_UPN)
 
     assert result["status"] == "error"
-    assert result["code"] == "AD_UNLOCK_DISABLED"
+    assert result["code"] == "AD_ACCOUNT_BACKEND_OFF"
     assert result["unlock"]["status"] == "error"
     assert TARGET_UPN in ad_account_tool._demo_locked_upns
+    assert TARGET_UPN in ad_account_tool._demo_disabled_upns
 
 
 def test_password_reset_action_remains_registered_and_callable():
@@ -290,7 +313,7 @@ def test_explicit_password_reset_maps_to_existing_atomic_action(monkeypatch):
 
 
 def test_explicit_password_reset_does_not_require_lock_diagnosis():
-    lock_status = Mock(wraps=ad_account_tool.ad_check_account_lock_status.func)
+    account_status = Mock(wraps=ad_account_tool.ad_get_account_status.func)
     password_reset = Mock(return_value={"reset": {"status": "ok"}})
 
     policy = check_list(
@@ -304,7 +327,7 @@ def test_explicit_password_reset_does_not_require_lock_diagnosis():
 
     assert policy["status"] == "ok"
     password_reset.assert_called_once_with(CALLER_UPN)
-    lock_status.assert_not_called()
+    account_status.assert_not_called()
 
 
 def test_ambiguous_locked_account_offers_unlock_without_executing_it():
@@ -406,6 +429,7 @@ def test_confirmation_after_unlock_offer_uses_retained_target():
         target_upn=TARGET_UPN,
         manager_upn=CALLER_UPN,
         tool_context=tool_context,
+        **_account_action_plan_kwargs("ad.unlock_account"),
     )
     unlock_backend(
         tool_context.state["account_access_diagnosis"]["target_upn"],
@@ -567,20 +591,35 @@ def test_agent_instructions_narrow_ad_diagnosis_and_guard_explicit_actions():
     instruction = sd_chat.instruction
 
     assert "explicit account unlock" in instruction
+    assert "explicit account enable" in instruction
     assert "ambiguous enterprise/domain/AD account-access problem" in instruction
     assert "AWS WorkSpaces, HOST, Teams, ServiceNow, or VPN" in instruction
     assert "do not automatically classify it as AD account access" in instruction
-    assert "do not diagnose lock status before it" in instruction
-    assert "Do not execute either remediation until the user confirms." in instruction
+    assert "Do not run account-status" in instruction
+    assert "diagnosis before any explicit action" in instruction
     assert "maps exactly one expected action" in instruction
+    assert "ad.enable_account for enable" in instruction
     assert "plan.can_execute_fully == true" in instruction
     assert "plan.low_confidence == false" in instruction
-    assert "selects an unexpected action, stop and clarify" in instruction
+    assert "unexpected plans must stop without execution" in instruction
     assert "preconditions exactly equal to" in instruction
     assert '["caller_is_self_or_manager"]' in instruction
     assert "Never rename, paraphrase, generalize" in instruction
     assert "check_list.details.caller_is_self_or_manager.ok == true" in instruction
     assert "If manager lookup fails or returns no manager UPN, stop" in instruction
+
+
+def test_broad_access_instruction_checks_enabled_and_locked_state_together():
+    instruction = sd_chat.instruction
+
+    assert "Call ad_get_account_status once after authorization" in instruction
+    assert "enabled and locked as" in instruction
+    assert "independent booleans" in instruction
+    assert "If enabled == false and locked == true" in instruction
+    assert "offer only enable first" in instruction
+    assert "If enabled == true and locked == false" in instruction
+    assert "offer the existing password reset" in instruction
+    assert "re-run authorization and ad_get_account_status" in instruction
 
 
 def test_account_access_instruction_requires_diagnosis_before_remediation():
@@ -590,14 +629,14 @@ def test_account_access_instruction_requires_diagnosis_before_remediation():
     assert "response must contain exactly one question and no examples" in instruction
     assert "Which application/system or domain sign-in is failing" in instruction
     assert "and what exact error do you see?" in instruction
-    assert "a general access or sign-in problem is a" in instruction
+    assert "a general sign-in problem is" in instruction
     assert "diagnosis request, not yet a remediation request" in instruction
     assert "ask exactly one" in instruction
     assert "Do not ask a list of intake questions" in instruction
     assert "Do not call sop_retriever or" in instruction
     assert "propose_plan and do not suggest a remediation yet" in instruction
-    assert "domain access should lead to the" in instruction
-    assert "authorized account lock check, not to Windows remediation planning" in instruction
+    assert "I can't access my account" in instruction
+    assert "enters the protected Account Access diagnosis" in instruction
 
 
 def test_account_access_instruction_rejects_unsupported_time_sync_and_stale_plan():
@@ -614,18 +653,17 @@ def test_named_system_login_does_not_automatically_trigger_ad_lock_check():
 
     assert "Named-system routing has precedence" in instruction
     assert "does not by itself permit the" in instruction
-    assert "generic AD lock check" in instruction
-    assert "only if the user separately identifies their" in instruction
-    assert "enterprise/domain/AD account as suspect or explicitly asks" in instruction
+    assert "generic Account Access status check" in instruction
+    assert "only if the user separately identifies their enterprise/domain/AD account" in instruction
+    assert "suspect or explicitly asks for its status" in instruction
     assert "must not replace, diagnosis of the named system" in instruction
 
 
-def test_unlocked_account_instruction_continues_evidence_gathering():
+def test_healthy_account_instruction_offers_existing_password_recovery_only():
     instruction = sd_chat.instruction
 
-    assert "account lockout has been ruled" in instruction
-    assert "do not claim that another cause has been found" in instruction
-    assert "ask for them before selecting any other remediation" in instruction
-    assert "an unlocked result alone is not evidence that a password reset is needed" in instruction
-    assert "do not answer from a" in instruction
-    assert "stale SOP or plan" in instruction
+    assert "If enabled == true and locked == false" in instruction
+    assert "neither disabled state nor lockout" in instruction
+    assert "offer the existing password reset" in instruction
+    assert "Do not reset until the user confirms" in instruction
+    assert "Never let stale consent" in instruction

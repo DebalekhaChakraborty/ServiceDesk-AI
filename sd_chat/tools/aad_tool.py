@@ -6,7 +6,10 @@ from google.adk.tools import FunctionTool, ToolContext
 import secrets
 import string
 from .email_tool import send_email_via_gmail
-from .policy_tool import AAD_MANAGER_LOOKUP_STATE_KEY
+from .policy_tool import (
+    AAD_MANAGER_LOOKUP_STATE_KEY,
+    ACCOUNT_ACCESS_AUTHORIZATION_STATE_KEY,
+)
 
 
 # ==============================================================================
@@ -208,8 +211,11 @@ def aad_user_lookup(tool_context: ToolContext, query: str) -> Dict[str, Any]:
         state = {}
         tool_context.state = state
     # Starting a new target lookup invalidates manager evidence for any
-    # previously resolved target.
+    # previously resolved target, as well as a diagnosis/authorization that a
+    # later bare confirmation might otherwise reuse.
     state[AAD_MANAGER_LOOKUP_STATE_KEY] = None
+    state[ACCOUNT_ACCESS_AUTHORIZATION_STATE_KEY] = None
+    state["account_access_diagnosis"] = None
 
     if not _graph_is_configured():
         return {
