@@ -10,6 +10,7 @@ from .tools.snow_connector_tool import snow_incident_tools
 from .tools.catalog_tool import catalog_tool
 from .tools.win_tool import time_resync, restart_service, clear_dns_cache, cleanup_temp_files, install_software
 from .tools.aad_tool import aad_account_tools
+from .tools.ad_account_tool import ad_account_tools
 from .tools.policy_tool import check_list
 from .planner.reasoning_composer import propose_plan
 from .tools.sop_retriever import sop_retriever
@@ -170,6 +171,22 @@ SAFETY GATE (MANDATORY)
   • In that case, explain what the plan would do and ask the user whether to continue,
     or fall back to SOP guidance and/or ticket creation.
 
+### Active Directory Account Unlock
+
+- Follow the normal sop_retriever -> propose_plan -> check_list -> execution flow.
+- For "my account", use identity_context.upn as target_upn; never ask for a UPN
+  already present in the caller's identity context.
+- For another person, call aad_user_lookup. If there are multiple matches, ask the
+  user to select one; if there is no match, stop. Never invent a target UPN.
+- For another person's resolved target_upn, call aad_get_manager(target_upn) and
+  pass that returned manager.upn, plus caller_upn and target_upn, explicitly to
+  check_list for the caller_is_self_or_manager precondition.
+- Call check_list exactly once. Only when it returns status == "ok", call
+  ad_check_account_lock_status. If locked, call ad_unlock_account and then call
+  ad_check_account_lock_status again to verify. If already unlocked, return a
+  concise no-change result.
+- Never use accountEnabled, reset a password, or bypass authorization for demo mode.
+
 ========================
 A) Knowledge / Catalog queries
 ========================
@@ -325,6 +342,9 @@ OUTPUT STYLE
 
         # Azure AD tools
         *aad_account_tools,
+
+        # Active Directory account lock tools
+        *ad_account_tools,
 
         # Gmail email tool
         gmail_send_email,
