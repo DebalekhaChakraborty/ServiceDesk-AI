@@ -1,5 +1,5 @@
 from typing import List, Dict, Tuple, Optional
-import os, socket
+import os, socket, time
 
 from google.adk.tools import ToolContext
 
@@ -17,12 +17,92 @@ WINRM_CERT_VALIDATE = os.getenv("WINRM_CERT_VALIDATE", "false")
 
 ACCOUNT_ACCESS_AUTHORIZATION_STATE_KEY = "temp:account_access_authorization"
 AAD_MANAGER_LOOKUP_STATE_KEY = "temp:aad_manager_lookup"
+ACCOUNT_ACCESS_IDENTITY_VERIFICATION_STATE_KEY = "account_access_identity_verification"
 ACCOUNT_DIAGNOSIS_ACTION_ID = "ad.get_account_status"
 ACCOUNT_REMEDIATION_ACTION_IDS = {
     "ad.unlock_account",
     "ad.enable_account",
     "aad.reset_password",
 }
+
+
+def consume_account_access_authorization(
+    tool_context: Optional[ToolContext],
+    target_upn: str,
+    action_id: str,
+    require_identity_verification: bool = False,
+) -> bool:
+    """Consume one exact target/action-bound account authorization grant.
+
+    Account grants are deliberately single-use.  Reading or changing directory
+    state therefore requires a fresh policy decision for every protected tool
+    invocation; a successful grant cannot be replayed later in the conversation.
+    """
+    state = tool_context.state if tool_context is not None else None
+    if state is None:
+        return False
+
+    grant = state.get(ACCOUNT_ACCESS_AUTHORIZATION_STATE_KEY)
+    authorized = bool(
+        isinstance(grant, dict)
+        and grant.get("authorized") is True
+        and grant.get("policy") == "caller_is_self_or_manager"
+        and _norm_upn(str(grant.get("target_upn") or ""))
+        == _norm_upn(target_upn)
+        and grant.get("action_id") == action_id
+    )
+    if authorized and require_identity_verification:
+        verification = state.get(ACCOUNT_ACCESS_IDENTITY_VERIFICATION_STATE_KEY)
+        requester = verification.get("requester") if isinstance(verification, dict) else None
+        target = verification.get("target") if isinstance(verification, dict) else None
+        manager = verification.get("manager") if isinstance(verification, dict) else None
+        verified_at = verification.get("verified_at") if isinstance(verification, dict) else None
+        try:
+            evidence_age = time.time() - float(verified_at)
+        except (TypeError, ValueError):
+            evidence_age = 10_000.0
+        basis = verification.get("authorization_basis") if isinstance(verification, dict) else None
+        caller_matches = bool(
+            isinstance(requester, dict)
+            and _norm_upn(str(requester.get("upn") or ""))
+            == _norm_upn(str(grant.get("caller_upn") or ""))
+        )
+        target_matches = bool(
+            isinstance(target, dict)
+            and _norm_upn(str(target.get("upn") or "")) == _norm_upn(target_upn)
+        )
+        relationship_matches = bool(
+            (
+                basis == "self"
+                and _norm_upn(str(grant.get("caller_upn") or ""))
+                == _norm_upn(target_upn)
+            )
+            or (
+                basis == "current_graph_manager"
+                and isinstance(manager, dict)
+                and _norm_upn(str(manager.get("upn") or ""))
+                == _norm_upn(str(grant.get("caller_upn") or ""))
+            )
+        )
+        authorized = bool(
+            isinstance(verification, dict)
+            and verification.get("verification_id")
+            and verification.get("verification_id")
+            == grant.get("identity_verification_id")
+            and verification.get("policy_action_id") == action_id
+            and -30.0 <= evidence_age <= 300.0
+            and caller_matches
+            and target_matches
+            and relationship_matches
+            and isinstance(verification.get("requester_devices"), list)
+            and isinstance(verification.get("target_devices"), list)
+        )
+
+    # An unrelated/mismatched tool cannot use this grant, but must not consume
+    # the exact action's authorization before that action gets its one attempt.
+    if authorized:
+        state[ACCOUNT_ACCESS_AUTHORIZATION_STATE_KEY] = None
+    return authorized
 
 
 def _endpoint(host: str) -> str:

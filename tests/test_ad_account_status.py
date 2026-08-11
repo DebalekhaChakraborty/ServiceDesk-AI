@@ -1,5 +1,6 @@
 import os
 import inspect
+import time
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -16,6 +17,7 @@ from sd_chat.tools.identity_context_tool import ensure_identity_context_in_state
 from sd_chat.tools.policy_tool import (
     AAD_MANAGER_LOOKUP_STATE_KEY,
     ACCOUNT_ACCESS_AUTHORIZATION_STATE_KEY,
+    ACCOUNT_ACCESS_IDENTITY_VERIFICATION_STATE_KEY,
     check_list,
 )
 
@@ -36,16 +38,18 @@ def _tool_context():
 
 
 def _authorize_self(tool_context, target_upn=TARGET_UPN):
-    return check_list(
+    result = check_list(
         preconditions=["caller_is_self_or_manager"],
         caller_upn=target_upn,
         target_upn=target_upn,
         tool_context=tool_context,
     )
+    _bind_controller_evidence(tool_context, target_upn, "ad.get_account_status")
+    return result
 
 
 def _authorize_action(tool_context, action_id, target_upn=TARGET_UPN):
-    return check_list(
+    result = check_list(
         preconditions=["caller_is_self_or_manager"],
         caller_upn=target_upn,
         target_upn=target_upn,
@@ -56,6 +60,28 @@ def _authorize_action(tool_context, action_id, target_upn=TARGET_UPN):
         plan_action_count=1,
         tool_context=tool_context,
     )
+    _bind_controller_evidence(tool_context, target_upn, action_id)
+    return result
+
+
+def _bind_controller_evidence(tool_context, target_upn, action_id):
+    """Synthetic controller evidence for low-level backend unit tests."""
+    verification_id = f"test-verification-{target_upn}-{action_id}"
+    tool_context.state[ACCOUNT_ACCESS_IDENTITY_VERIFICATION_STATE_KEY] = {
+        "verification_id": verification_id,
+        "verified_at": time.time(),
+        "requester": {"upn": target_upn},
+        "target": {"upn": target_upn},
+        "manager": None,
+        "authorization_basis": "self",
+        "requester_devices": [],
+        "target_devices": [],
+        "policy_action_id": action_id,
+    }
+    grant = tool_context.state.get(ACCOUNT_ACCESS_AUTHORIZATION_STATE_KEY)
+    if isinstance(grant, dict):
+        grant["identity_verification_id"] = verification_id
+        tool_context.state[ACCOUNT_ACCESS_AUTHORIZATION_STATE_KEY] = grant
 
 
 def _record_manager_lookup(tool_context, target_upn, manager_upn):
@@ -459,12 +485,15 @@ def test_new_target_lookup_invalidates_stale_diagnosis_and_authorization(monkeyp
         "enabled": False,
         "recommended_action": "enable",
     }
+    tool_context.state["account_access_offer"] = {"phase": "offered"}
     monkeypatch.setattr(aad_tool, "_graph_is_configured", lambda: False)
 
     aad_tool.aad_user_lookup.func(tool_context, "Another User")
 
     assert tool_context.state[ACCOUNT_ACCESS_AUTHORIZATION_STATE_KEY] is None
+    assert tool_context.state[ACCOUNT_ACCESS_IDENTITY_VERIFICATION_STATE_KEY] is None
     assert tool_context.state["account_access_diagnosis"] is None
+    assert tool_context.state["account_access_offer"] is None
 
 
 def test_graph_status_reads_real_account_enabled_and_profile(monkeypatch):

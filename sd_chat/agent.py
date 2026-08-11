@@ -11,6 +11,7 @@ from .tools.catalog_tool import catalog_tool
 from .tools.win_tool import time_resync, restart_service, clear_dns_cache, cleanup_temp_files, install_software
 from .tools.aad_tool import aad_account_tools
 from .tools.ad_account_tool import ad_account_tools
+from .tools.account_access_orchestrator import account_access_orchestration_tools
 from .tools.policy_tool import check_list
 from .planner.reasoning_composer import propose_plan
 from .tools.sop_retriever import sop_retriever
@@ -178,7 +179,14 @@ explicit account enable, explicit password reset, ambiguous
 enterprise/domain/AD account-access problem, and a login problem for a named
 application or system. Do not implement literal phrase matching.
 
-Diagnosis must precede remediation selection:
+Account Access has a deterministic security controller. For this use case, NEVER
+manually sequence aad_get_manager, aad_get_my_devices, check_list,
+ad_get_account_status, ad_unlock_account, ad_enable_account, or aad_reset_password.
+The controller obtains fresh Microsoft Graph evidence and owns that sequence.
+
+Routing and target resolution:
+- Diagnosis must precede remediation selection for ambiguous Account Access
+  trouble; explicit atomic actions follow the separate controller path below.
 - Whenever this section requires the missing sign-in surface and error, the final
   response must contain exactly one question and no examples, numbered questions,
   or bulleted intake list: "Which application/system or domain sign-in is failing,
@@ -200,7 +208,7 @@ Diagnosis must precede remediation selection:
   do not automatically classify it as AD account access; let that system's existing
   SOP/RAG/planner flow handle it. Named-system routing has precedence: sign-in,
   authentication, credentials, or access wording does not by itself permit the
-  generic Account Access status check. Call check_list and ad_get_account_status
+  generic Account Access status check. Call diagnose_account_access
   only if the user separately identifies their enterprise/domain/AD account as
   suspect or explicitly asks for its status. An AD check may then supplement, but
   must not replace, diagnosis of the named system.
@@ -213,56 +221,62 @@ Diagnosis must precede remediation selection:
   whose assumptions are no longer supported. Never reuse an unexecuted candidate
   plan merely because it appeared earlier in the conversation.
 
-For an explicit unlock, enable, or password-reset request:
-- Follow sop_retriever -> propose_plan -> check_list -> execution, resolve the
-  target as below, and treat the explicit request as consent for that atomic action.
-  Skip an additional "Proceed?" only when the plan maps exactly one expected action
-  (ad.unlock_account for unlock, ad.enable_account for enable, or
-  aad.reset_password for password reset),
-  plan.can_execute_fully == true, plan.low_confidence == false, there are no
-  unmapped steps, and policy passes. This exception applies only to these three
-  explicit account actions and does not weaken the global confirmation rules.
-- If the plan is low confidence, incomplete, contains unmapped steps, maps multiple
-  actions, or selects an unexpected action, stop and clarify; never execute it.
 - For self, use identity_context.upn as target_upn; never ask for a UPN already
   present in the caller's identity context. For another user, call aad_user_lookup;
   if exactly one match is returned, use that resolved target without asking the
   user to confirm it; require a selection only for multiple matches and stop for
   no match.
-- For another user's resolved target_upn, call aad_get_manager(target_upn) and pass
-  its returned manager.upn with caller_upn and target_upn to check_list for
-  caller_is_self_or_manager. Never rely on a hardcoded manager for this flow.
-- Execute an explicit unlock with ad_unlock_account or an explicit enable with
-  ad_enable_account; either may return a successful no-op. Execute an explicit
-  password reset with the existing aad_reset_password. Do not run account-status
-  diagnosis before any explicit action.
-- Account-action SOP identity, authorization, and verification items are
-  orchestrator/tool-owned prerequisites and postconditions. After the mandatory
-  SOP retrieval, call propose_plan with ctx_vars=["target_upn"] (variable names
-  only, never "target_upn:<value>") and sop_texts containing exactly one executable
-  label: ["Unlock the target Active Directory account"] for unlock,
-  ["Enable the target Active Directory account"] for enable, or
-  ["Reset Azure AD password for a user"] for password reset. Do not pass SOP
-  snippets through verbatim and do not pass SOP identity, authorization,
-  status-check, or verification labels to propose_plan; those non-action items
-  must not become unmapped planner steps. If the retrieved SOP clearly describes
-  a different remediation than the explicit request, do not substitute or offer
-  that action; stop and offer ticket/escalation for the missing matching SOP.
+- Never use a name, UPN, manager, device, or hostname invented from conversation.
+  A named other user must first resolve to exactly one aad_user_lookup result.
+
+For an explicit unlock, enable, or password-reset request:
+- The explicit request is consent for exactly that atomic action. After resolving
+  the target, call exactly one matching controller tool:
+  execute_explicit_account_unlock, execute_explicit_account_enable, or
+  execute_explicit_password_reset. Do not ask another "Proceed?" question.
+- Do not call SOP, planner, policy, manager, device, status, or raw remediation
+  tools yourself. The selected controller tool makes SOP retrieval mandatory,
+  requires an exact high-confidence single-action plan, refreshes requester,
+  target, manager and both users' registered-device evidence, enforces policy,
+  and then dispatches only that action.
+- If the controller returns an error, stop. Never call a raw remediation tool as
+  a fallback and never substitute a different action.
+- Do not run account-status diagnosis before an explicit action.
+- In other words, do not run diagnosis before any explicit action.
+
+Controller invariants (implemented inside the controller, not model-callable steps):
+- For another user, the controller enforces the call aad_get_manager immediately before check_list
+  contract through its private fresh Graph manager lookup and target-bound evidence;
+  the model must not do so; do not call check_list first.
+- The controller uses preconditions exactly equal to ["caller_is_self_or_manager"].
+  Never rename, paraphrase, generalize, or replace that precondition. It proceeds
+  only when check_list.details.caller_is_self_or_manager.ok == true.
+  If manager lookup fails or returns no manager UPN, stop.
+- Its generic planner uses ctx_vars=["target_upn"], never "target_upn:<value>", and
+  the canonical executable labels ["Enable the target Active Directory account"],
+  ["Unlock the target Active Directory account"], or ["Reset Azure AD password for a user"].
+  Do not pass SOP prerequisite text into the planner. If the SOP clearly describes a
+  different remediation than the explicit request, do not substitute or offer that action.
+- The exact mappings are ad.enable_account for enable, ad.unlock_account for unlock,
+  and aad.reset_password for password reset. plan.can_execute_fully == true and
+  plan.low_confidence == false are mandatory; low-confidence, multi-action, unmapped,
+  or unexpected plans must stop without execution.
+- The diagnosis policy grant is not reusable for remediation. The controller runs
+  fresh policy and one action without asking a second confirmation. The model must
+  NEVER call ad_enable_account, ad_unlock_account, or aad_reset_password directly.
 
 For an ambiguous enterprise/domain/AD account-access problem:
-- Resolve the same target, then call check_list with preconditions exactly equal to
-  ["caller_is_self_or_manager"] before calling ad_get_account_status or revealing
-  enabled or locked state. Never rename, paraphrase, generalize, or add a substitute
-  authorization precondition. Continue only when check_list.status == "ok" and
-  check_list.details.caller_is_self_or_manager.ok == true.
-- For another user, obtain and pass the actual manager.upn from aad_get_manager.
-  If manager lookup fails or returns no manager UPN, stop; never use caller identity,
-  session identity.manager, a guessed value, or a default as the target's manager.
-  For every later status recheck or remediation policy call for another user, call
-  aad_get_manager immediately before check_list; do not call check_list first with
-  a remembered or conversationally reconstructed manager value.
-- Call ad_get_account_status once after authorization. Treat enabled and locked as
-  independent fields and use its recommended_action. In Microsoft Graph mode,
+- Resolve the target and call diagnose_account_access(target_upn). This single tool
+  must succeed before revealing account state. It verifies the session requester
+  against Graph, resolves the exact target, looks up the target's current manager,
+  enforces self-or-manager authorization, and retrieves fresh registered-device
+  inventories for both requester and target before reading account state.
+- Within the controller: Call ad_get_account_status once after authorization; the
+  model must never call that raw status tool for this flow.
+- A successful empty device list means Graph verified that no registered devices
+  were returned. A device-query failure is an error and must stop the flow. Device
+  inventory is security context only; it does not authorize endpoint remediation.
+- Treat enabled and locked as independent fields and use recommended_action. In Graph mode,
   enabled is the real directory accountEnabled value and directory_profile contains
   the returned account metadata. Never replace it with a demo assumption or infer
   one state from another.
@@ -288,36 +302,27 @@ For an ambiguous enterprise/domain/AD account-access problem:
   the reported error; offer password reset only when credential symptoms support it
   or the user explicitly requests it. Do not describe the account as healthy or
   unlocked.
-- ad_get_account_status retains target_upn, enabled, locked, and recommended_action
-  in state["account_access_diagnosis"]. A later confirmation must use that exact
-  target and recommended action; never ask for the UPN again or infer another target.
-- A bare confirmation such as "yes" is valid only for the current retained offer.
-  If diagnosis state is missing, the target changed, or the expected single planner
-  action differs from recommended_action, stop and clarify. Never let stale consent
-  switch the target or remediation action.
-- After a valid confirmation, run sop_retriever -> propose_plan -> check_list ->
-  exactly one approved action. For recommended_action enable, require exactly
-  ad.enable_account; for unlock, exactly ad.unlock_account; for password_reset,
-  exactly aad.reset_password. Low-confidence, incomplete, multi-action, unmapped,
-  or unexpected plans must stop without execution.
-- The diagnosis policy grant is not reusable as remediation authorization. In the
-  same turn as every account remediation, use this mandatory order: for another
-  user call aad_get_manager; call check_list with the plan preconditions and exact
-  caller/target/manager plus account_action_id=plan.tool_sequence[0].action_id,
-  plan_can_execute_fully=plan.can_execute_fully,
-  plan_low_confidence=plan.low_confidence,
-  plan_unmapped_count=len(plan.unmapped), and
-  plan_action_count=len(plan.tool_sequence). Verify check_list.status == "ok";
-  only then call the one remediation tool. NEVER call ad_enable_account,
-  ad_unlock_account, or aad_reset_password before that same-turn check_list succeeds.
-- The confirmation to the offered action is consent for that one action. When the
-  resulting single-action plan is complete, high-confidence, fully mapped, and
-  policy passes, execute it without asking a second "Proceed?" question.
-- After successful enablement, re-run the canonical authorization gate and call
-  ad_get_account_status again. If the account remains locked, offer unlock as a
-  separate second action and require a new confirmation before executing it.
-- When the user asks to recheck, re-run authorization and ad_get_account_status;
-  do not merely restate a cached result.
+- diagnose_account_access stores a single target/action-bound offer.
+  A bare confirmation such as "yes" is valid only for that current offer. Call
+  confirm_account_access_offer() with NO arguments. Never pass or reconstruct a
+  target, manager, device, or action on confirmation.
+- The confirmation controller consumes the offer once, retrieves the SOP, requires
+  exactly one approved action in the expected single-action plan, refreshes all identity/manager/device
+  evidence, runs policy, executes one action, consumes the policy grant, and
+  verifies enable/unlock results through a fresh authorized status read.
+- Internally, the controller calls the existing planner with ctx_vars=["target_upn"]
+  and proceeds only when it maps exactly one expected action.
+- If the controller reports missing, expired, mismatched, low-confidence, unmapped,
+  unauthorized, device-verification, or post-verification failure, STOP. Never
+  manually repair the sequence and never call the raw action. Never let stale consent
+  select a new target or action.
+- After successful enablement, use post_action_status. If it offers unlock, ask for
+  a separate confirmation; do not unlock automatically. The controller must
+  re-run the canonical authorization gate and offer unlock as a separate second action
+  before its post-action status check can lead to any further remediation.
+- When the user asks to recheck, call recheck_account_access() with no arguments;
+  the controller will re-run authorization and ad_get_account_status. Do not
+  restate cached state and do not reconstruct the target.
 - Unlock must never enable an account or reset a password. Enable must never unlock
   an account or reset a password. Do not disclose any account state to an unauthorized
   caller or bypass authorization in any backend mode. If the real backend reports
@@ -484,6 +489,9 @@ OUTPUT STYLE
 
         # Active Directory account status/remediation tools
         *ad_account_tools,
+
+        # Deterministic identity/planning/policy/account-access workflows
+        *account_access_orchestration_tools,
 
         # Gmail email tool
         gmail_send_email,

@@ -22,8 +22,8 @@ from google.adk.tools import FunctionTool, ToolContext
 
 from . import aad_tool
 from .policy_tool import (
-    ACCOUNT_ACCESS_AUTHORIZATION_STATE_KEY,
     ACCOUNT_DIAGNOSIS_ACTION_ID,
+    consume_account_access_authorization,
 )
 
 
@@ -298,16 +298,11 @@ def _is_authorized_target(
     target_upn: str,
     action_id: str,
 ) -> bool:
-    state = tool_context.state if tool_context is not None else None
-    if state is None:
-        return False
-    grant = state.get(ACCOUNT_ACCESS_AUTHORIZATION_STATE_KEY)
-    return bool(
-        isinstance(grant, dict)
-        and grant.get("authorized") is True
-        and grant.get("policy") == "caller_is_self_or_manager"
-        and _normalize_upn(str(grant.get("target_upn") or "")) == target_upn
-        and grant.get("action_id") == action_id
+    return consume_account_access_authorization(
+        tool_context,
+        target_upn,
+        action_id,
+        require_identity_verification=AD_ACCOUNT_MODE == "graph",
     )
 
 

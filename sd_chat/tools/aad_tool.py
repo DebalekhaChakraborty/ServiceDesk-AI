@@ -9,6 +9,8 @@ from .email_tool import send_email_via_gmail
 from .policy_tool import (
     AAD_MANAGER_LOOKUP_STATE_KEY,
     ACCOUNT_ACCESS_AUTHORIZATION_STATE_KEY,
+    ACCOUNT_ACCESS_IDENTITY_VERIFICATION_STATE_KEY,
+    consume_account_access_authorization,
 )
 
 
@@ -215,7 +217,9 @@ def aad_user_lookup(tool_context: ToolContext, query: str) -> Dict[str, Any]:
     # later bare confirmation might otherwise reuse.
     state[AAD_MANAGER_LOOKUP_STATE_KEY] = None
     state[ACCOUNT_ACCESS_AUTHORIZATION_STATE_KEY] = None
+    state[ACCOUNT_ACCESS_IDENTITY_VERIFICATION_STATE_KEY] = None
     state["account_access_diagnosis"] = None
+    state["account_access_offer"] = None
 
     if not _graph_is_configured():
         return {
@@ -517,6 +521,29 @@ def aad_reset_password(
         tool_context.state = state
 
     caller = _get_identity_context(state)
+
+    if not consume_account_access_authorization(
+        tool_context,
+        target_upn,
+        "aad.reset_password",
+        require_identity_verification=True,
+    ):
+        return {
+            "reset": {
+                "status": "error",
+                "message": (
+                    "A fresh, target-bound identity and policy verification is "
+                    "required before resetting this password."
+                ),
+                "audit": {
+                    "requested_by": caller,
+                    "target_upn": target_upn,
+                    "mode": mode,
+                    "backend": "graph",
+                },
+                "error": "ACCOUNT_ACCESS_AUTHORIZATION_REQUIRED",
+            }
+        }
 
     if not _graph_is_configured():
         return {
