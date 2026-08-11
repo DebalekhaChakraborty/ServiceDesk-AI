@@ -15,6 +15,7 @@ real lock check or unlock operation.
 
 import os
 import threading
+import time
 from typing import Any, Dict, Optional, Set, Tuple
 from urllib.parse import quote
 
@@ -29,6 +30,12 @@ from .policy_tool import (
 
 DEMO_BACKEND = "demo_ad_ds"
 GRAPH_BACKEND = "microsoft_graph"
+
+# Microsoft Graph can briefly return the pre-update accountEnabled value after a
+# successful PATCH. Verify the accepted mutation for one minute without issuing
+# the mutation a second time.
+GRAPH_ENABLE_VERIFICATION_WINDOW_SECONDS = 60
+GRAPH_ENABLE_VERIFICATION_INTERVAL_SECONDS = 5
 
 GRAPH_ACCOUNT_SELECT_FIELDS = (
     "id",
@@ -502,20 +509,48 @@ def _enable_graph_account(target_upn: str) -> Dict[str, Any]:
                 response.status_code,
             )
 
-    verified, verify_error = _read_graph_account(target_upn, operation="enable")
+    verification_attempts = 0
+    max_verification_attempts = (
+        GRAPH_ENABLE_VERIFICATION_WINDOW_SECONDS
+        // GRAPH_ENABLE_VERIFICATION_INTERVAL_SECONDS
+    ) + 1
+    verified = None
+    verify_error = None
+    for verification_attempts in range(1, max_verification_attempts + 1):
+        verified, verify_error = _read_graph_account(target_upn, operation="enable")
+        if verify_error is not None or (
+            verified is not None and verified["account_enabled"] is True
+        ):
+            break
+        if verification_attempts < max_verification_attempts:
+            time.sleep(GRAPH_ENABLE_VERIFICATION_INTERVAL_SECONDS)
+
     if verify_error is not None:
         return verify_error
     if verified is None or verified["account_enabled"] is not True:
         message = (
-            "Microsoft Graph did not verify accountEnabled=true after the enable "
-            "operation; success was not claimed."
+            "Microsoft Graph accepted the enable operation but did not verify "
+            f"accountEnabled=true within {GRAPH_ENABLE_VERIFICATION_WINDOW_SECONDS} "
+            "seconds; success was not claimed."
         )
-        return _graph_operation_error(
+        result = _graph_operation_error(
             "enable",
             target_upn,
             "GRAPH_ACCOUNT_ENABLE_VERIFICATION_FAILED",
             message,
         )
+        result["enable"].update(
+            {
+                "verification_attempts": verification_attempts,
+                "verification_window_seconds": (
+                    GRAPH_ENABLE_VERIFICATION_WINDOW_SECONDS
+                ),
+                "verification_interval_seconds": (
+                    GRAPH_ENABLE_VERIFICATION_INTERVAL_SECONDS
+                ),
+            }
+        )
+        return result
 
     if was_enabled:
         message = f"Account {target_upn} is already enabled; no change was needed."
@@ -532,6 +567,11 @@ def _enable_graph_account(target_upn: str) -> Dict[str, Any]:
             "backend": GRAPH_BACKEND,
             "message": message,
             "directory_profile": verified,
+            "verification_attempts": verification_attempts,
+            "verification_window_seconds": GRAPH_ENABLE_VERIFICATION_WINDOW_SECONDS,
+            "verification_interval_seconds": (
+                GRAPH_ENABLE_VERIFICATION_INTERVAL_SECONDS
+            ),
         },
     }
 

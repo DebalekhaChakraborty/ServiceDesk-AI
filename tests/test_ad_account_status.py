@@ -597,11 +597,75 @@ def test_graph_enable_updates_and_verifies_real_account(monkeypatch):
     assert result["enable"]["was_enabled"] is False
     assert result["enable"]["is_enabled"] is True
     assert result["enable"]["backend"] == "microsoft_graph"
+    assert result["enable"]["verification_attempts"] == 1
     graph_patch.assert_called_once_with(
         "users/target%40example.com",
         {"accountEnabled": True},
     )
     assert graph_get.call_count == 2
+
+
+def test_graph_enable_waits_for_delayed_verification_without_repeating_patch(
+    monkeypatch,
+):
+    tool_context = _tool_context()
+    _authorize_action(tool_context, "ad.enable_account")
+    monkeypatch.setattr(ad_account_tool, "AD_ACCOUNT_MODE", "graph")
+    graph_get = Mock(
+        side_effect=[
+            _graph_response(200, _graph_account_payload(False)),
+            _graph_response(200, _graph_account_payload(False)),
+            _graph_response(200, _graph_account_payload(False)),
+            _graph_response(200, _graph_account_payload(True)),
+        ]
+    )
+    graph_patch = Mock(return_value=_graph_response(204, {}))
+    sleep = Mock()
+    monkeypatch.setattr(aad_tool, "_graph_get", graph_get)
+    monkeypatch.setattr(aad_tool, "_graph_patch", graph_patch)
+    monkeypatch.setattr(ad_account_tool.time, "sleep", sleep)
+
+    result = _enable(tool_context)
+
+    assert result["status"] == "ok"
+    assert result["enable"]["is_enabled"] is True
+    assert result["enable"]["verification_attempts"] == 3
+    assert result["enable"]["verification_window_seconds"] == 60
+    assert result["enable"]["verification_interval_seconds"] == 5
+    graph_patch.assert_called_once_with(
+        "users/target%40example.com",
+        {"accountEnabled": True},
+    )
+    assert graph_get.call_count == 4
+    assert sleep.call_count == 2
+    sleep.assert_called_with(5)
+
+
+def test_graph_enable_stops_after_one_minute_without_claiming_success(monkeypatch):
+    tool_context = _tool_context()
+    _authorize_action(tool_context, "ad.enable_account")
+    monkeypatch.setattr(ad_account_tool, "AD_ACCOUNT_MODE", "graph")
+    graph_get = Mock(
+        return_value=_graph_response(200, _graph_account_payload(False))
+    )
+    graph_patch = Mock(return_value=_graph_response(204, {}))
+    sleep = Mock()
+    monkeypatch.setattr(aad_tool, "_graph_get", graph_get)
+    monkeypatch.setattr(aad_tool, "_graph_patch", graph_patch)
+    monkeypatch.setattr(ad_account_tool.time, "sleep", sleep)
+
+    result = _enable(tool_context)
+
+    assert result["status"] == "error"
+    assert result["code"] == "GRAPH_ACCOUNT_ENABLE_VERIFICATION_FAILED"
+    assert result["enable"]["verification_attempts"] == 13
+    assert result["enable"]["verification_window_seconds"] == 60
+    assert result["enable"]["verification_interval_seconds"] == 5
+    assert "accepted the enable operation" in result["message"]
+    assert "success was not claimed" in result["message"]
+    graph_patch.assert_called_once()
+    assert graph_get.call_count == 14
+    assert sleep.call_count == 12
 
 
 def test_graph_enable_failure_does_not_claim_success(monkeypatch):
