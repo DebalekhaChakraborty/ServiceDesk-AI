@@ -1,17 +1,26 @@
-"""Protected Active Directory account-status and remediation tools.
+"""Protected Microsoft Entra / Active Directory account tools.
 
-The current backend is an in-process deterministic demo fixture. Caller identity,
-target lookup, manager lookup, and authorization remain the responsibility of the
-existing root orchestrator and policy gate. Lock and disabled state are modeled
-independently so unlock, enable, and password reset remain separate actions.
+Runtime account status and enablement can use the repository's existing Microsoft
+Graph application credentials. The deterministic demo backend remains available
+only when explicitly selected for isolated development and unit tests. Caller
+identity, target lookup, manager lookup, and authorization remain the
+responsibility of the existing root orchestrator and policy gate.
+
+Microsoft Graph exposes the authoritative ``accountEnabled`` property, but it does
+not expose a current AD DS lockout boolean on the user resource. Graph-backed
+responses therefore report lock state as unknown instead of claiming that the
+account is unlocked. A separately configured AD DS connector is required for a
+real lock check or unlock operation.
 """
 
 import os
 import threading
-from typing import Any, Dict, Set
+from typing import Any, Dict, Optional, Set, Tuple
+from urllib.parse import quote
 
 from google.adk.tools import FunctionTool, ToolContext
 
+from . import aad_tool
 from .policy_tool import (
     ACCOUNT_ACCESS_AUTHORIZATION_STATE_KEY,
     ACCOUNT_DIAGNOSIS_ACTION_ID,
@@ -19,6 +28,32 @@ from .policy_tool import (
 
 
 DEMO_BACKEND = "demo_ad_ds"
+GRAPH_BACKEND = "microsoft_graph"
+
+GRAPH_ACCOUNT_SELECT_FIELDS = (
+    "id",
+    "displayName",
+    "userPrincipalName",
+    "mail",
+    "accountEnabled",
+    "userType",
+    "createdDateTime",
+    "lastPasswordChangeDateTime",
+    "passwordPolicies",
+    "onPremisesSyncEnabled",
+    "onPremisesLastSyncDateTime",
+    "onPremisesDistinguishedName",
+    "creationType",
+    "externalUserState",
+    "externalUserStateChangeDateTime",
+    "usageLocation",
+    "employeeId",
+    "employeeType",
+    "jobTitle",
+    "department",
+    "companyName",
+    "officeLocation",
+)
 
 
 def _configured_account_mode() -> str:
@@ -32,27 +67,10 @@ def _normalize_upn(value: str) -> str:
     return (value or "").strip().lower()
 
 
-def _configured_demo_upns(variable_name: str) -> Set[str]:
-    configured = os.getenv(variable_name, "")
-    return {
-        normalized
-        for item in configured.split(",")
-        if (normalized := _normalize_upn(item))
-    }
-
-
-def _configured_demo_locked_upns() -> Set[str]:
-    return _configured_demo_upns("AD_DEMO_LOCKED_UPNS")
-
-
-def _configured_demo_disabled_upns() -> Set[str]:
-    return _configured_demo_upns("AD_DEMO_DISABLED_UPNS")
-
-
-# Initialized once when the application imports this module. Restarting the
-# backend deliberately restores both environment-configured demo fixtures.
-_demo_locked_upns = _configured_demo_locked_upns()
-_demo_disabled_upns = _configured_demo_disabled_upns()
+# Demo state is deliberately process-local and has no environment-driven user
+# fixtures. Unit tests inject state directly; runtime account state comes from Graph.
+_demo_locked_upns: Set[str] = set()
+_demo_disabled_upns: Set[str] = set()
 _demo_state_lock = threading.Lock()
 
 
@@ -66,7 +84,7 @@ def _backend_error(operation: str, target_upn: str) -> Dict[str, Any]:
         code = "AD_ACCOUNT_BACKEND_OFF"
         message = (
             "Active Directory account-status automation is off. "
-            "Configure AD_ACCOUNT_MODE=demo explicitly to use the demo backend."
+            "Configure AD_ACCOUNT_MODE=graph to use the real Microsoft Graph backend."
         )
     elif backend == "ad_ds":
         code = "AD_DS_BACKEND_NOT_CONFIGURED"
@@ -75,7 +93,7 @@ def _backend_error(operation: str, target_upn: str) -> Dict[str, Any]:
         code = "AD_ACCOUNT_MODE_INVALID"
         message = (
             f"Unsupported AD account mode '{backend}'. "
-            "Configure AD_ACCOUNT_MODE=demo."
+            "Configure AD_ACCOUNT_MODE=graph for real directory state."
         )
 
     result: Dict[str, Any] = {
@@ -93,6 +111,142 @@ def _backend_error(operation: str, target_upn: str) -> Dict[str, Any]:
         "error": code,
     }
     return result
+
+
+def _graph_error_message(response: Any) -> str:
+    """Extract a useful Graph error without exposing request credentials."""
+    try:
+        payload = response.json()
+    except Exception:
+        payload = None
+
+    if isinstance(payload, dict):
+        error = payload.get("error")
+        if isinstance(error, dict):
+            code = str(error.get("code") or "").strip()
+            message = str(error.get("message") or "").strip()
+            if code and message:
+                return f"{code}: {message}"
+            if message:
+                return message
+
+    text = str(getattr(response, "text", "") or "").strip()
+    return text or "Microsoft Graph returned an unspecified error."
+
+
+def _graph_operation_error(
+    operation: str,
+    target_upn: str,
+    code: str,
+    message: str,
+    http_status: Optional[int] = None,
+) -> Dict[str, Any]:
+    result: Dict[str, Any] = {
+        "status": "error",
+        "code": code,
+        "message": message,
+        "stdout": "",
+        "stderr": message,
+    }
+    if http_status is not None:
+        result["http_status"] = http_status
+    result[_detail_key(operation)] = {
+        "status": "error",
+        "target_upn": target_upn,
+        "backend": GRAPH_BACKEND,
+        "message": message,
+        "error": code,
+    }
+    return result
+
+
+def _normalize_graph_profile(data: Dict[str, Any]) -> Dict[str, Any]:
+    """Return relevant account metadata with stable, model-friendly names."""
+    return {
+        "aad_object_id": data.get("id"),
+        "display_name": data.get("displayName"),
+        "user_principal_name": data.get("userPrincipalName"),
+        "mail": data.get("mail"),
+        "account_enabled": data.get("accountEnabled"),
+        "user_type": data.get("userType"),
+        "created_date_time": data.get("createdDateTime"),
+        "last_password_change_date_time": data.get("lastPasswordChangeDateTime"),
+        "password_policies": data.get("passwordPolicies"),
+        "on_premises_sync_enabled": data.get("onPremisesSyncEnabled"),
+        "on_premises_last_sync_date_time": data.get("onPremisesLastSyncDateTime"),
+        "on_premises_distinguished_name": data.get("onPremisesDistinguishedName"),
+        "creation_type": data.get("creationType"),
+        "external_user_state": data.get("externalUserState"),
+        "external_user_state_change_date_time": data.get(
+            "externalUserStateChangeDateTime"
+        ),
+        "usage_location": data.get("usageLocation"),
+        "employee_id": data.get("employeeId"),
+        "employee_type": data.get("employeeType"),
+        "job_title": data.get("jobTitle"),
+        "department": data.get("department"),
+        "company_name": data.get("companyName"),
+        "office_location": data.get("officeLocation"),
+    }
+
+
+def _read_graph_account(
+    target_upn: str,
+    operation: str = "status",
+) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+    """Read one real Entra account from Microsoft Graph."""
+    path = f"users/{quote(target_upn, safe='')}"
+    params = {"$select": ",".join(GRAPH_ACCOUNT_SELECT_FIELDS)}
+    try:
+        response = aad_tool._graph_get(path, params=params)
+    except Exception as exc:
+        message = f"Microsoft Graph account lookup failed: {exc}"
+        return None, _graph_operation_error(
+            operation,
+            target_upn,
+            "GRAPH_ACCOUNT_LOOKUP_FAILED",
+            message,
+        )
+
+    if response.status_code != 200:
+        message = (
+            f"Microsoft Graph account lookup returned {response.status_code}: "
+            f"{_graph_error_message(response)}"
+        )
+        return None, _graph_operation_error(
+            operation,
+            target_upn,
+            "GRAPH_ACCOUNT_LOOKUP_FAILED",
+            message,
+            response.status_code,
+        )
+
+    try:
+        data = response.json()
+    except Exception as exc:
+        message = f"Microsoft Graph returned invalid account JSON: {exc}"
+        return None, _graph_operation_error(
+            operation,
+            target_upn,
+            "GRAPH_ACCOUNT_RESPONSE_INVALID",
+            message,
+            response.status_code,
+        )
+
+    if not isinstance(data, dict) or not isinstance(data.get("accountEnabled"), bool):
+        message = (
+            "Microsoft Graph did not return the required boolean accountEnabled "
+            "property; account state was not inferred."
+        )
+        return None, _graph_operation_error(
+            operation,
+            target_upn,
+            "GRAPH_ACCOUNT_ENABLED_MISSING",
+            message,
+            response.status_code,
+        )
+
+    return _normalize_graph_profile(data), None
 
 
 def _invalid_target(operation: str) -> Dict[str, Any]:
@@ -130,7 +284,9 @@ def _authorization_error(operation: str, target_upn: str) -> Dict[str, Any]:
     result[_detail_key(operation)] = {
         "status": "error",
         "target_upn": target_upn,
-        "backend": DEMO_BACKEND,
+        "backend": (
+            GRAPH_BACKEND if AD_ACCOUNT_MODE == "graph" else DEMO_BACKEND
+        ),
         "message": message,
         "error": "ACCOUNT_ACCESS_AUTHORIZATION_REQUIRED",
     }
@@ -155,15 +311,17 @@ def _is_authorized_target(
     )
 
 
-def _recommended_action(enabled: bool, locked: bool) -> str:
+def _recommended_action(enabled: bool, locked: Optional[bool]) -> str:
     if not enabled:
         return "enable"
-    if locked:
+    if locked is True:
         return "unlock"
-    return "password_reset"
+    if locked is False:
+        return "password_reset"
+    return "investigate_sign_in"
 
 
-def _account_snapshot(target_upn: str) -> Dict[str, Any]:
+def _demo_account_snapshot(target_upn: str) -> Dict[str, Any]:
     locked = target_upn in _demo_locked_upns
     enabled = target_upn not in _demo_disabled_upns
     return {
@@ -175,6 +333,27 @@ def _account_snapshot(target_upn: str) -> Dict[str, Any]:
     }
 
 
+def _graph_account_snapshot(
+    target_upn: str,
+    profile: Dict[str, Any],
+) -> Dict[str, Any]:
+    enabled = profile["account_enabled"]
+    locked = None
+    return {
+        "target_upn": target_upn,
+        "locked": locked,
+        "lock_state_available": False,
+        "lock_state_message": (
+            "Current AD DS or Microsoft Entra smart-lockout state is not exposed "
+            "by the Microsoft Graph user resource and was not inferred."
+        ),
+        "enabled": enabled,
+        "backend": GRAPH_BACKEND,
+        "recommended_action": _recommended_action(enabled, locked),
+        "directory_profile": profile,
+    }
+
+
 def _get_account_status(
     tool_context: ToolContext,
     target_upn: str,
@@ -182,8 +361,6 @@ def _get_account_status(
     normalized_upn = _normalize_upn(target_upn)
     if not normalized_upn:
         return _invalid_target("status")
-    if AD_ACCOUNT_MODE != "demo":
-        return _backend_error("status", normalized_upn)
     if not _is_authorized_target(
         tool_context,
         normalized_upn,
@@ -191,8 +368,23 @@ def _get_account_status(
     ):
         return _authorization_error("status", normalized_upn)
 
-    with _demo_state_lock:
-        account = _account_snapshot(normalized_upn)
+    if AD_ACCOUNT_MODE == "demo":
+        with _demo_state_lock:
+            account = _demo_account_snapshot(normalized_upn)
+    elif AD_ACCOUNT_MODE == "graph":
+        profile, error = _read_graph_account(normalized_upn)
+        if error is not None:
+            return error
+        if profile is None:
+            return _graph_operation_error(
+                "status",
+                normalized_upn,
+                "GRAPH_ACCOUNT_RESPONSE_INVALID",
+                "Microsoft Graph account lookup returned no profile.",
+            )
+        account = _graph_account_snapshot(normalized_upn, profile)
+    else:
+        return _backend_error("status", normalized_upn)
 
     state = tool_context.state
     if state is None:
@@ -210,7 +402,7 @@ def ad_get_account_status(
     tool_context: ToolContext,
     target_upn: str,
 ) -> Dict[str, Any]:
-    """Return enabled and locked state for one authorized account target."""
+    """Return real Entra account metadata and any available lock state."""
     return _get_account_status(tool_context, target_upn)
 
 
@@ -230,14 +422,27 @@ def ad_unlock_account(
     normalized_upn = _normalize_upn(target_upn)
     if not normalized_upn:
         return _invalid_target("unlock")
-    if AD_ACCOUNT_MODE != "demo":
-        return _backend_error("unlock", normalized_upn)
     if not _is_authorized_target(
         tool_context,
         normalized_upn,
         "ad.unlock_account",
     ):
         return _authorization_error("unlock", normalized_upn)
+
+    if AD_ACCOUNT_MODE == "graph":
+        message = (
+            "Microsoft Graph does not expose a current AD DS lockout boolean or "
+            "an administrative unlock operation for this account. Configure a "
+            "real AD DS connector before attempting unlock; no change was made."
+        )
+        return _graph_operation_error(
+            "unlock",
+            normalized_upn,
+            "GRAPH_ACCOUNT_UNLOCK_UNAVAILABLE",
+            message,
+        )
+    if AD_ACCOUNT_MODE != "demo":
+        return _backend_error("unlock", normalized_upn)
 
     with _demo_state_lock:
         was_locked = normalized_upn in _demo_locked_upns
@@ -262,6 +467,80 @@ def ad_unlock_account(
     }
 
 
+def _enable_graph_account(target_upn: str) -> Dict[str, Any]:
+    """Enable one real Entra account and verify the persisted Graph value."""
+    current, error = _read_graph_account(target_upn, operation="enable")
+    if error is not None:
+        return error
+    if current is None:
+        return _graph_operation_error(
+            "enable",
+            target_upn,
+            "GRAPH_ACCOUNT_RESPONSE_INVALID",
+            "Microsoft Graph account lookup returned no profile.",
+        )
+
+    was_enabled = current["account_enabled"]
+    if not was_enabled:
+        path = f"users/{quote(target_upn, safe='')}"
+        try:
+            response = aad_tool._graph_patch(path, {"accountEnabled": True})
+        except Exception as exc:
+            message = f"Microsoft Graph account enable failed: {exc}"
+            return _graph_operation_error(
+                "enable",
+                target_upn,
+                "GRAPH_ACCOUNT_ENABLE_FAILED",
+                message,
+            )
+
+        if response.status_code not in {200, 204}:
+            message = (
+                f"Microsoft Graph account enable returned {response.status_code}: "
+                f"{_graph_error_message(response)}"
+            )
+            return _graph_operation_error(
+                "enable",
+                target_upn,
+                "GRAPH_ACCOUNT_ENABLE_FAILED",
+                message,
+                response.status_code,
+            )
+
+    verified, verify_error = _read_graph_account(target_upn, operation="enable")
+    if verify_error is not None:
+        return verify_error
+    if verified is None or verified["account_enabled"] is not True:
+        message = (
+            "Microsoft Graph did not verify accountEnabled=true after the enable "
+            "operation; success was not claimed."
+        )
+        return _graph_operation_error(
+            "enable",
+            target_upn,
+            "GRAPH_ACCOUNT_ENABLE_VERIFICATION_FAILED",
+            message,
+        )
+
+    if was_enabled:
+        message = f"Account {target_upn} is already enabled; no change was needed."
+    else:
+        message = f"Account {target_upn} was enabled successfully."
+
+    return {
+        "status": "ok",
+        "enable": {
+            "status": "ok",
+            "target_upn": target_upn,
+            "was_enabled": was_enabled,
+            "is_enabled": True,
+            "backend": GRAPH_BACKEND,
+            "message": message,
+            "directory_profile": verified,
+        },
+    }
+
+
 def ad_enable_account(
     target_upn: str,
     tool_context: ToolContext,
@@ -270,14 +549,17 @@ def ad_enable_account(
     normalized_upn = _normalize_upn(target_upn)
     if not normalized_upn:
         return _invalid_target("enable")
-    if AD_ACCOUNT_MODE != "demo":
-        return _backend_error("enable", normalized_upn)
     if not _is_authorized_target(
         tool_context,
         normalized_upn,
         "ad.enable_account",
     ):
         return _authorization_error("enable", normalized_upn)
+
+    if AD_ACCOUNT_MODE == "graph":
+        return _enable_graph_account(normalized_upn)
+    if AD_ACCOUNT_MODE != "demo":
+        return _backend_error("enable", normalized_upn)
 
     with _demo_state_lock:
         was_enabled = normalized_upn not in _demo_disabled_upns

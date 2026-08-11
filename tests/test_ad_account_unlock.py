@@ -179,8 +179,16 @@ def test_unknown_target_stops_before_unlock():
 
 def test_backend_failure_matches_existing_failure_fallback_shape(monkeypatch):
     monkeypatch.setattr(ad_account_tool, "AD_ACCOUNT_MODE", "ad_ds")
+    tool_context = _tool_context()
+    check_list(
+        preconditions=["caller_is_self_or_manager"],
+        caller_upn=TARGET_UPN,
+        target_upn=TARGET_UPN,
+        tool_context=tool_context,
+        **_account_action_plan_kwargs("ad.unlock_account"),
+    )
 
-    result = _unlock(_tool_context(), TARGET_UPN)
+    result = _unlock(tool_context, TARGET_UPN)
 
     assert result["status"] == "error"
     assert result["code"] == "AD_DS_BACKEND_NOT_CONFIGURED"
@@ -200,8 +208,16 @@ def test_disabled_backend_cannot_claim_success_or_change_demo_state(monkeypatch)
     ad_account_tool._demo_locked_upns.add(TARGET_UPN)
     ad_account_tool._demo_disabled_upns.add(TARGET_UPN)
     monkeypatch.setattr(ad_account_tool, "AD_ACCOUNT_MODE", "off")
+    tool_context = _tool_context()
+    check_list(
+        preconditions=["caller_is_self_or_manager"],
+        caller_upn=TARGET_UPN,
+        target_upn=TARGET_UPN,
+        tool_context=tool_context,
+        **_account_action_plan_kwargs("ad.unlock_account"),
+    )
 
-    result = _unlock(_tool_context(), TARGET_UPN)
+    result = _unlock(tool_context, TARGET_UPN)
 
     assert result["status"] == "error"
     assert result["code"] == "AD_ACCOUNT_BACKEND_OFF"
@@ -614,11 +630,19 @@ def test_broad_access_instruction_checks_enabled_and_locked_state_together():
 
     assert "Call ad_get_account_status once after authorization" in instruction
     assert "enabled and locked as" in instruction
-    assert "independent booleans" in instruction
+    assert "independent fields" in instruction
+    assert "enabled is the real directory accountEnabled value" in instruction
+    assert "locked may be null" in instruction
+    assert "Null means unknown, never false" in instruction
+    assert 'never say "not locked"' in instruction
     assert "If enabled == false and locked == true" in instruction
     assert "offer only enable first" in instruction
+    assert "If enabled == false and locked == null" in instruction
+    assert "account is disabled and that current lock state is unavailable" in instruction
     assert "If enabled == true and locked == false" in instruction
     assert "offer the existing password reset" in instruction
+    assert "If enabled == true and locked == null" in instruction
+    assert "Do not describe the account as healthy or" in instruction
     assert "re-run authorization and ad_get_account_status" in instruction
 
 

@@ -12,6 +12,7 @@ from sd_chat.agent import root_agent, sd_chat
 from sd_chat.planner import reasoning_composer
 from sd_chat.tools import aad_tool, ad_account_tool
 from sd_chat.tools.aad_tool import aad_reset_password
+from sd_chat.tools.identity_context_tool import ensure_identity_context_in_state
 from sd_chat.tools.policy_tool import (
     AAD_MANAGER_LOOKUP_STATE_KEY,
     ACCOUNT_ACCESS_AUTHORIZATION_STATE_KEY,
@@ -75,6 +76,41 @@ def _unlock(tool_context, target_upn=TARGET_UPN):
 
 def _enable(tool_context, target_upn=TARGET_UPN):
     return ad_account_tool.ad_enable_account.func(target_upn, tool_context)
+
+
+def _graph_response(status_code, payload, text=""):
+    return SimpleNamespace(
+        status_code=status_code,
+        text=text,
+        json=lambda: payload,
+    )
+
+
+def _graph_account_payload(enabled):
+    return {
+        "id": "target-object-id",
+        "displayName": "Target User",
+        "userPrincipalName": TARGET_UPN,
+        "mail": "target.mail@example.com",
+        "accountEnabled": enabled,
+        "userType": "Member",
+        "createdDateTime": "2025-01-02T03:04:05Z",
+        "lastPasswordChangeDateTime": "2026-02-03T04:05:06Z",
+        "passwordPolicies": None,
+        "onPremisesSyncEnabled": None,
+        "onPremisesLastSyncDateTime": None,
+        "onPremisesDistinguishedName": None,
+        "creationType": None,
+        "externalUserState": None,
+        "externalUserStateChangeDateTime": None,
+        "usageLocation": None,
+        "employeeId": "1234",
+        "employeeType": None,
+        "jobTitle": "Engineer",
+        "department": "IT",
+        "companyName": "Example",
+        "officeLocation": None,
+    }
 
 
 @pytest.mark.parametrize(
@@ -431,35 +467,223 @@ def test_new_target_lookup_invalidates_stale_diagnosis_and_authorization(monkeyp
     assert tool_context.state["account_access_diagnosis"] is None
 
 
+def test_graph_status_reads_real_account_enabled_and_profile(monkeypatch):
+    tool_context = _tool_context()
+    _authorize_self(tool_context)
+    monkeypatch.setattr(ad_account_tool, "AD_ACCOUNT_MODE", "graph")
+    graph_get = Mock(return_value=_graph_response(200, _graph_account_payload(False)))
+    monkeypatch.setattr(aad_tool, "_graph_get", graph_get)
+
+    result = _status(tool_context)
+
+    account = result["account"]
+    assert result["status"] == "ok"
+    assert account["target_upn"] == TARGET_UPN
+    assert account["enabled"] is False
+    assert account["locked"] is None
+    assert account["lock_state_available"] is False
+    assert account["recommended_action"] == "enable"
+    assert account["backend"] == "microsoft_graph"
+    assert account["directory_profile"]["account_enabled"] is False
+    assert account["directory_profile"]["employee_id"] == "1234"
+    assert account["directory_profile"]["last_password_change_date_time"] == (
+        "2026-02-03T04:05:06Z"
+    )
+    assert tool_context.state["account_access_diagnosis"] == account
+    graph_get.assert_called_once_with(
+        "users/target%40example.com",
+        params={"$select": ",".join(ad_account_tool.GRAPH_ACCOUNT_SELECT_FIELDS)},
+    )
+
+
+def test_graph_enabled_account_does_not_claim_unlocked(monkeypatch):
+    tool_context = _tool_context()
+    _authorize_self(tool_context)
+    monkeypatch.setattr(ad_account_tool, "AD_ACCOUNT_MODE", "graph")
+    monkeypatch.setattr(
+        aad_tool,
+        "_graph_get",
+        Mock(return_value=_graph_response(200, _graph_account_payload(True))),
+    )
+
+    result = _status(tool_context)
+
+    assert result["account"]["enabled"] is True
+    assert result["account"]["locked"] is None
+    assert result["account"]["recommended_action"] == "investigate_sign_in"
+    assert "not exposed" in result["account"]["lock_state_message"]
+
+
+def test_graph_status_failure_never_infers_account_state(monkeypatch):
+    tool_context = _tool_context()
+    _authorize_self(tool_context)
+    monkeypatch.setattr(ad_account_tool, "AD_ACCOUNT_MODE", "graph")
+    monkeypatch.setattr(
+        aad_tool,
+        "_graph_get",
+        Mock(
+            return_value=_graph_response(
+                403,
+                {"error": {"code": "Authorization_RequestDenied", "message": "Denied"}},
+            )
+        ),
+    )
+
+    result = _status(tool_context)
+
+    assert result["status"] == "error"
+    assert result["code"] == "GRAPH_ACCOUNT_LOOKUP_FAILED"
+    assert result["http_status"] == 403
+    assert "account_access_diagnosis" not in tool_context.state
+
+
+def test_unauthorized_graph_status_does_not_call_graph(monkeypatch):
+    monkeypatch.setattr(ad_account_tool, "AD_ACCOUNT_MODE", "graph")
+    graph_get = Mock()
+    monkeypatch.setattr(aad_tool, "_graph_get", graph_get)
+
+    result = _status(_tool_context())
+
+    assert result["code"] == "ACCOUNT_ACCESS_AUTHORIZATION_REQUIRED"
+    graph_get.assert_not_called()
+
+
+def test_graph_enable_updates_and_verifies_real_account(monkeypatch):
+    tool_context = _tool_context()
+    _authorize_action(tool_context, "ad.enable_account")
+    monkeypatch.setattr(ad_account_tool, "AD_ACCOUNT_MODE", "graph")
+    graph_get = Mock(
+        side_effect=[
+            _graph_response(200, _graph_account_payload(False)),
+            _graph_response(200, _graph_account_payload(True)),
+        ]
+    )
+    graph_patch = Mock(return_value=_graph_response(204, {}))
+    monkeypatch.setattr(aad_tool, "_graph_get", graph_get)
+    monkeypatch.setattr(aad_tool, "_graph_patch", graph_patch)
+
+    result = _enable(tool_context)
+
+    assert result["status"] == "ok"
+    assert result["enable"]["was_enabled"] is False
+    assert result["enable"]["is_enabled"] is True
+    assert result["enable"]["backend"] == "microsoft_graph"
+    graph_patch.assert_called_once_with(
+        "users/target%40example.com",
+        {"accountEnabled": True},
+    )
+    assert graph_get.call_count == 2
+
+
+def test_graph_enable_failure_does_not_claim_success(monkeypatch):
+    tool_context = _tool_context()
+    _authorize_action(tool_context, "ad.enable_account")
+    monkeypatch.setattr(ad_account_tool, "AD_ACCOUNT_MODE", "graph")
+    monkeypatch.setattr(
+        aad_tool,
+        "_graph_get",
+        Mock(return_value=_graph_response(200, _graph_account_payload(False))),
+    )
+    monkeypatch.setattr(
+        aad_tool,
+        "_graph_patch",
+        Mock(
+            return_value=_graph_response(
+                403,
+                {"error": {"code": "Authorization_RequestDenied", "message": "Denied"}},
+            )
+        ),
+    )
+
+    result = _enable(tool_context)
+
+    assert result["status"] == "error"
+    assert result["code"] == "GRAPH_ACCOUNT_ENABLE_FAILED"
+    assert result["enable"]["status"] == "error"
+
+
+def test_graph_unlock_fails_truthfully_without_mutation(monkeypatch):
+    tool_context = _tool_context()
+    _authorize_action(tool_context, "ad.unlock_account")
+    monkeypatch.setattr(ad_account_tool, "AD_ACCOUNT_MODE", "graph")
+    graph_get = Mock()
+    graph_patch = Mock()
+    monkeypatch.setattr(aad_tool, "_graph_get", graph_get)
+    monkeypatch.setattr(aad_tool, "_graph_patch", graph_patch)
+
+    result = _unlock(tool_context)
+
+    assert result["status"] == "error"
+    assert result["code"] == "GRAPH_ACCOUNT_UNLOCK_UNAVAILABLE"
+    graph_get.assert_not_called()
+    graph_patch.assert_not_called()
+
+
 def test_off_backend_blocks_status_unlock_and_enable_without_mutation(monkeypatch):
     ad_account_tool._demo_locked_upns.add(TARGET_UPN)
     ad_account_tool._demo_disabled_upns.add(TARGET_UPN)
-    tool_context = _tool_context()
-    _authorize_self(tool_context)
     monkeypatch.setattr(ad_account_tool, "AD_ACCOUNT_MODE", "off")
 
+    status_context = _tool_context()
+    _authorize_self(status_context)
+    unlock_context = _tool_context()
+    _authorize_action(unlock_context, "ad.unlock_account")
+    enable_context = _tool_context()
+    _authorize_action(enable_context, "ad.enable_account")
+
     results = [
-        _status(tool_context),
-        _unlock(tool_context),
-        _enable(tool_context),
+        _status(status_context),
+        _unlock(unlock_context),
+        _enable(enable_context),
     ]
 
     assert {result["code"] for result in results} == {"AD_ACCOUNT_BACKEND_OFF"}
     assert all(result["status"] == "error" for result in results)
-    assert "account_access_diagnosis" not in tool_context.state
+    assert "account_access_diagnosis" not in status_context.state
     assert TARGET_UPN in ad_account_tool._demo_locked_upns
     assert TARGET_UPN in ad_account_tool._demo_disabled_upns
 
 
-def test_demo_configuration_uses_two_independent_comma_separated_sets(monkeypatch):
-    monkeypatch.setenv("AD_DEMO_LOCKED_UPNS", f" {CALLER_UPN}, {TARGET_UPN} ")
-    monkeypatch.setenv("AD_DEMO_DISABLED_UPNS", TARGET_UPN.upper())
+def test_runtime_has_no_environment_driven_per_user_status_fixtures():
+    source = inspect.getsource(ad_account_tool)
 
-    assert ad_account_tool._configured_demo_locked_upns() == {
-        CALLER_UPN,
-        TARGET_UPN,
+    assert "AD_DEMO_LOCKED_UPNS" not in source
+    assert "AD_DEMO_DISABLED_UPNS" not in source
+
+
+def test_identity_context_manager_comes_from_persona_not_a_hardcoded_user():
+    state = {
+        "persona": {
+            "name": "Requesting User",
+            "user_principal_name": "requester@example.com",
+            "email": "requester@example.com",
+            "manager": {
+                "displayName": "Directory Manager",
+                "userPrincipalName": "directory.manager@example.com",
+            },
+        }
     }
-    assert ad_account_tool._configured_demo_disabled_upns() == {TARGET_UPN}
+
+    result = ensure_identity_context_in_state(state)
+
+    assert result["identity"]["manager"] == {
+        "name": "Directory Manager",
+        "email": "directory.manager@example.com",
+    }
+
+
+def test_identity_context_does_not_invent_a_missing_manager():
+    state = {
+        "persona": {
+            "name": "Requesting User",
+            "user_principal_name": "requester@example.com",
+            "email": "requester@example.com",
+        }
+    }
+
+    result = ensure_identity_context_in_state(state)
+
+    assert result["identity"]["manager"] == {"name": None, "email": None}
 
 
 def test_account_tools_and_registry_actions_are_registered():
@@ -512,9 +736,14 @@ def test_disabled_locked_and_healthy_branch_contracts_are_explicit():
 
     assert "If enabled == false and locked == true" in instruction
     assert "offer only enable first" in instruction
+    assert "If enabled == false and locked == null" in instruction
+    assert "account is disabled and that current lock state is unavailable" in instruction
     assert "do not execute until the user confirms" in instruction.lower()
     assert "If enabled == true and locked == false" in instruction
     assert "offer the existing password reset" in instruction
+    assert "If enabled == true and locked == null" in instruction
+    assert "Null means unknown, never false" in instruction
+    assert 'never say "not locked"' in instruction
     assert "re-run the canonical authorization gate" in instruction
     assert "offer unlock as a" in instruction
     assert "separate second action" in instruction
