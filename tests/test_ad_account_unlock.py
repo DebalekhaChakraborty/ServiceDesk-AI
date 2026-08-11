@@ -643,6 +643,11 @@ def test_broad_access_instruction_checks_enabled_and_locked_state_together():
     assert "offer the existing password reset" in instruction
     assert "If enabled == true and locked == null" in instruction
     assert "Do not describe the account as healthy or" in instruction
+    assert "A recent" in instruction
+    assert "error code 50053 is historical evidence" in instruction
+    assert "never convert it" in instruction
+    assert "Absence of a sampled 50053 event does not prove" in instruction
+    assert "Never offer or execute unlock/password reset automatically" in instruction
     assert "re-run authorization and ad_get_account_status" in instruction
 
 

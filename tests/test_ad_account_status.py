@@ -2,7 +2,7 @@ import os
 import inspect
 import time
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, call
 
 import pytest
 
@@ -136,6 +136,36 @@ def _graph_account_payload(enabled):
         "department": "IT",
         "companyName": "Example",
         "officeLocation": None,
+    }
+
+
+def _graph_sign_in_event(
+    created_date_time,
+    error_code,
+    failure_reason,
+    app_display_name="Microsoft 365",
+):
+    return {
+        "id": f"event-{created_date_time}",
+        "createdDateTime": created_date_time,
+        "appDisplayName": app_display_name,
+        "resourceDisplayName": "Microsoft Graph",
+        "clientAppUsed": "Browser",
+        "isInteractive": True,
+        "ipAddress": "192.0.2.10",
+        "status": {
+            "errorCode": error_code,
+            "failureReason": failure_reason,
+            "additionalDetails": "Additional diagnostic context",
+        },
+        "deviceDetail": {
+            "displayName": "target-laptop",
+            "operatingSystem": "Windows",
+            "browser": "Edge",
+            "isCompliant": True,
+            "isManaged": True,
+            "trustType": "Microsoft Entra joined",
+        },
     }
 
 
@@ -500,7 +530,12 @@ def test_graph_status_reads_real_account_enabled_and_profile(monkeypatch):
     tool_context = _tool_context()
     _authorize_self(tool_context)
     monkeypatch.setattr(ad_account_tool, "AD_ACCOUNT_MODE", "graph")
-    graph_get = Mock(return_value=_graph_response(200, _graph_account_payload(False)))
+    graph_get = Mock(
+        side_effect=[
+            _graph_response(200, _graph_account_payload(False)),
+            _graph_response(200, {"value": []}),
+        ]
+    )
     monkeypatch.setattr(aad_tool, "_graph_get", graph_get)
 
     result = _status(tool_context)
@@ -518,22 +553,32 @@ def test_graph_status_reads_real_account_enabled_and_profile(monkeypatch):
     assert account["directory_profile"]["last_password_change_date_time"] == (
         "2026-02-03T04:05:06Z"
     )
+    assert account["sign_in_investigation"]["status"] == "ok"
+    assert account["sign_in_investigation"]["events_examined"] == 0
     assert tool_context.state["account_access_diagnosis"] == account
-    graph_get.assert_called_once_with(
+    assert graph_get.call_args_list[0] == call(
         "users/target%40example.com",
         params={"$select": ",".join(ad_account_tool.GRAPH_ACCOUNT_SELECT_FIELDS)},
     )
+    sign_in_path = graph_get.call_args_list[1].args[0]
+    sign_in_kwargs = graph_get.call_args_list[1].kwargs
+    assert sign_in_path == "auditLogs/signIns"
+    assert "userId eq 'target-object-id'" in sign_in_kwargs["params"]["$filter"]
+    assert "createdDateTime ge " in sign_in_kwargs["params"]["$filter"]
+    assert sign_in_kwargs["params"]["$top"] == "20"
 
 
 def test_graph_enabled_account_does_not_claim_unlocked(monkeypatch):
     tool_context = _tool_context()
     _authorize_self(tool_context)
     monkeypatch.setattr(ad_account_tool, "AD_ACCOUNT_MODE", "graph")
-    monkeypatch.setattr(
-        aad_tool,
-        "_graph_get",
-        Mock(return_value=_graph_response(200, _graph_account_payload(True))),
+    graph_get = Mock(
+        side_effect=[
+            _graph_response(200, _graph_account_payload(True)),
+            _graph_response(200, {"value": []}),
+        ]
     )
+    monkeypatch.setattr(aad_tool, "_graph_get", graph_get)
 
     result = _status(tool_context)
 
@@ -541,6 +586,105 @@ def test_graph_enabled_account_does_not_claim_unlocked(monkeypatch):
     assert result["account"]["locked"] is None
     assert result["account"]["recommended_action"] == "investigate_sign_in"
     assert "not exposed" in result["account"]["lock_state_message"]
+    evidence = result["account"]["sign_in_investigation"]
+    assert evidence["status"] == "ok"
+    assert evidence["current_lock_state"] == "unknown"
+    assert evidence["current_lock_state_available"] is False
+    assert evidence["possible_lockout_evidence"]["found"] is False
+    assert "does not prove" in evidence["possible_lockout_evidence"]["interpretation"]
+
+
+def test_graph_sign_in_evidence_reports_50053_without_claiming_current_lock(
+    monkeypatch,
+):
+    tool_context = _tool_context()
+    _authorize_self(tool_context)
+    monkeypatch.setattr(ad_account_tool, "AD_ACCOUNT_MODE", "graph")
+    graph_patch = Mock()
+    graph_get = Mock(
+        side_effect=[
+            _graph_response(200, _graph_account_payload(True)),
+            _graph_response(
+                200,
+                {
+                    "value": [
+                        _graph_sign_in_event(
+                            "2026-08-11T12:00:00Z",
+                            50053,
+                            "The account is locked due to repeated sign-in attempts.",
+                        ),
+                        _graph_sign_in_event(
+                            "2026-08-11T12:05:00Z",
+                            0,
+                            "Sign-in succeeded.",
+                        ),
+                        _graph_sign_in_event(
+                            "2026-08-11T12:10:00Z",
+                            50126,
+                            "Error validating credentials.",
+                            app_display_name="Microsoft Teams",
+                        ),
+                    ]
+                },
+            ),
+        ]
+    )
+    monkeypatch.setattr(aad_tool, "_graph_get", graph_get)
+    monkeypatch.setattr(aad_tool, "_graph_patch", graph_patch)
+
+    result = _status(tool_context)
+
+    account = result["account"]
+    evidence = account["sign_in_investigation"]
+    assert result["status"] == "ok"
+    assert account["locked"] is None
+    assert account["recommended_action"] == "investigate_sign_in"
+    assert evidence["current_lock_state"] == "unknown"
+    assert evidence["possible_lockout_evidence"]["found"] is True
+    assert evidence["possible_lockout_evidence"]["error_code"] == 50053
+    assert evidence["possible_lockout_evidence"]["later_success_observed"] is True
+    assert evidence["latest_event"]["error_code"] == 50126
+    assert evidence["latest_failure"]["error_code"] == 50126
+    assert evidence["latest_success"]["error_code"] == 0
+    assert len(evidence["recent_events"]) == 3
+    assert "192.0.2.10" not in str(evidence)
+    graph_patch.assert_not_called()
+
+
+def test_graph_sign_in_permission_failure_preserves_safe_account_diagnosis(
+    monkeypatch,
+):
+    tool_context = _tool_context()
+    _authorize_self(tool_context)
+    monkeypatch.setattr(ad_account_tool, "AD_ACCOUNT_MODE", "graph")
+    graph_get = Mock(
+        side_effect=[
+            _graph_response(200, _graph_account_payload(True)),
+            _graph_response(
+                403,
+                {
+                    "error": {
+                        "code": "Authentication_MSGraphPermissionMissing",
+                        "message": "Missing permission.",
+                    }
+                },
+            ),
+        ]
+    )
+    monkeypatch.setattr(aad_tool, "_graph_get", graph_get)
+
+    result = _status(tool_context)
+
+    account = result["account"]
+    evidence = account["sign_in_investigation"]
+    assert result["status"] == "ok"
+    assert account["enabled"] is True
+    assert account["locked"] is None
+    assert account["recommended_action"] == "investigate_sign_in"
+    assert evidence["status"] == "unavailable"
+    assert evidence["code"] == "GRAPH_SIGN_IN_LOG_PERMISSION_REQUIRED"
+    assert evidence["required_application_permission"] == "AuditLog.Read.All"
+    assert evidence["current_lock_state_available"] is False
 
 
 def test_graph_status_failure_never_infers_account_state(monkeypatch):

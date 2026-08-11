@@ -12,8 +12,18 @@ AD_ACCOUNT_MODE=graph
 
 Graph status reads relevant account metadata directly from `/users/{UPN}`. Microsoft
 Graph does not expose a current AD DS lockout boolean on the user resource, so Graph
-mode reports lock state as unknown rather than claiming the account is unlocked. A
-real AD DS connector is still required for lock inspection and unlock.
+mode reports lock state as unknown rather than claiming the account is unlocked.
+For authorized Account Access diagnosis, the backend also samples up to 20 sign-in
+events from the previous 24 hours through `/auditLogs/signIns`. It returns sanitized
+failure, application, and device evidence, including any error code `50053`, while
+keeping the current lock state unknown and never selecting remediation from log
+evidence alone.
+
+Sign-in investigation requires the Microsoft Graph `AuditLog.Read.All` application
+permission with administrator consent and an applicable Microsoft Entra ID P1/P2
+license. If that permission or service is unavailable, account profile diagnosis
+continues and reports the sign-in evidence limitation explicitly. A real AD DS
+connector is still required for authoritative AD DS lock inspection and unlock.
 
 The deterministic in-process backend is retained only as a unit-test seam. It has
 no environment-driven per-user status lists and must not be used to represent live

@@ -16,6 +16,7 @@ real lock check or unlock operation.
 import os
 import threading
 import time
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional, Set, Tuple
 from urllib.parse import quote
 
@@ -36,6 +37,11 @@ GRAPH_BACKEND = "microsoft_graph"
 # the mutation a second time.
 GRAPH_ENABLE_VERIFICATION_WINDOW_SECONDS = 60
 GRAPH_ENABLE_VERIFICATION_INTERVAL_SECONDS = 5
+GRAPH_SIGN_IN_LOOKBACK_HOURS = 24
+GRAPH_SIGN_IN_MAX_EVENTS = 20
+GRAPH_SIGN_IN_PUBLIC_EVENTS = 5
+GRAPH_SIGN_IN_LOCKOUT_ERROR_CODE = 50053
+GRAPH_SIGN_IN_REQUIRED_PERMISSION = "AuditLog.Read.All"
 
 GRAPH_ACCOUNT_SELECT_FIELDS = (
     "id",
@@ -256,6 +262,201 @@ def _read_graph_account(
     return _normalize_graph_profile(data), None
 
 
+def _sign_in_investigation_unavailable(
+    code: str,
+    message: str,
+    http_status: Optional[int] = None,
+) -> Dict[str, Any]:
+    investigation: Dict[str, Any] = {
+        "status": "unavailable",
+        "code": code,
+        "message": message,
+        "source": "microsoft_graph_sign_in_logs",
+        "current_lock_state": "unknown",
+        "current_lock_state_available": False,
+    }
+    if http_status is not None:
+        investigation["http_status"] = http_status
+    if code == "GRAPH_SIGN_IN_LOG_PERMISSION_REQUIRED":
+        investigation["required_application_permission"] = (
+            GRAPH_SIGN_IN_REQUIRED_PERMISSION
+        )
+    return investigation
+
+
+def _normalize_sign_in_event(raw: Dict[str, Any]) -> Dict[str, Any]:
+    """Expose only troubleshooting fields needed by the Account Access flow."""
+    raw_status = raw.get("status")
+    if not isinstance(raw_status, dict):
+        raw_status = {}
+    raw_error_code = raw_status.get("errorCode")
+    try:
+        error_code = int(raw_error_code)
+    except (TypeError, ValueError):
+        error_code = None
+
+    raw_device = raw.get("deviceDetail")
+    if not isinstance(raw_device, dict):
+        raw_device = {}
+    device = {
+        "display_name": raw_device.get("displayName"),
+        "operating_system": raw_device.get("operatingSystem"),
+        "browser": raw_device.get("browser"),
+        "is_compliant": raw_device.get("isCompliant"),
+        "is_managed": raw_device.get("isManaged"),
+        "trust_type": raw_device.get("trustType"),
+    }
+
+    return {
+        "created_date_time": raw.get("createdDateTime"),
+        "app_display_name": raw.get("appDisplayName"),
+        "resource_display_name": raw.get("resourceDisplayName"),
+        "client_app_used": raw.get("clientAppUsed"),
+        "is_interactive": raw.get("isInteractive"),
+        "error_code": error_code,
+        "failure_reason": raw_status.get("failureReason"),
+        "additional_details": raw_status.get("additionalDetails"),
+        "device": device,
+    }
+
+
+def _read_graph_sign_in_investigation(profile: Dict[str, Any]) -> Dict[str, Any]:
+    """Read recent sign-in evidence without inferring a current lock boolean."""
+    object_id = str(profile.get("aad_object_id") or "").strip()
+    if not object_id:
+        return _sign_in_investigation_unavailable(
+            "GRAPH_SIGN_IN_TARGET_ID_MISSING",
+            "Microsoft Graph did not return the object ID required for sign-in investigation.",
+        )
+
+    window_start = (
+        datetime.now(timezone.utc) - timedelta(hours=GRAPH_SIGN_IN_LOOKBACK_HOURS)
+    ).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    params = {
+        "$filter": f"userId eq '{object_id}' and createdDateTime ge {window_start}",
+        "$top": str(GRAPH_SIGN_IN_MAX_EVENTS),
+    }
+    try:
+        response = aad_tool._graph_get("auditLogs/signIns", params=params)
+    except Exception as exc:
+        return _sign_in_investigation_unavailable(
+            "GRAPH_SIGN_IN_LOG_LOOKUP_FAILED",
+            f"Microsoft Graph sign-in-log lookup failed: {exc}",
+        )
+
+    if response.status_code != 200:
+        try:
+            error_payload = response.json()
+        except Exception:
+            error_payload = None
+        graph_error_code = ""
+        if isinstance(error_payload, dict) and isinstance(
+            error_payload.get("error"), dict
+        ):
+            graph_error_code = str(
+                error_payload["error"].get("code") or ""
+            ).strip()
+        if (
+            response.status_code == 403
+            and graph_error_code == "Authentication_MSGraphPermissionMissing"
+        ):
+            return _sign_in_investigation_unavailable(
+                "GRAPH_SIGN_IN_LOG_PERMISSION_REQUIRED",
+                "Recent sign-in evidence requires the AuditLog.Read.All Microsoft "
+                "Graph application permission with administrator consent.",
+                response.status_code,
+            )
+        return _sign_in_investigation_unavailable(
+            "GRAPH_SIGN_IN_LOG_LOOKUP_FAILED",
+            f"Microsoft Graph sign-in-log lookup returned {response.status_code}: "
+            f"{_graph_error_message(response)}",
+            response.status_code,
+        )
+
+    try:
+        payload = response.json()
+    except Exception as exc:
+        return _sign_in_investigation_unavailable(
+            "GRAPH_SIGN_IN_LOG_RESPONSE_INVALID",
+            f"Microsoft Graph returned invalid sign-in-log JSON: {exc}",
+            response.status_code,
+        )
+    raw_events = payload.get("value") if isinstance(payload, dict) else None
+    if not isinstance(raw_events, list):
+        return _sign_in_investigation_unavailable(
+            "GRAPH_SIGN_IN_LOG_RESPONSE_INVALID",
+            "Microsoft Graph did not return a sign-in event collection.",
+            response.status_code,
+        )
+
+    events = [
+        _normalize_sign_in_event(event)
+        for event in raw_events
+        if isinstance(event, dict)
+    ]
+    events.sort(key=lambda item: str(item.get("created_date_time") or ""), reverse=True)
+    latest_failure = next(
+        (event for event in events if event.get("error_code") not in {None, 0}),
+        None,
+    )
+    latest_success = next(
+        (event for event in events if event.get("error_code") == 0),
+        None,
+    )
+    latest_50053_index = next(
+        (
+            index
+            for index, event in enumerate(events)
+            if event.get("error_code") == GRAPH_SIGN_IN_LOCKOUT_ERROR_CODE
+        ),
+        None,
+    )
+    latest_50053 = (
+        events[latest_50053_index]
+        if latest_50053_index is not None
+        else None
+    )
+    later_success_observed = bool(
+        latest_50053_index is not None
+        and any(
+            event.get("error_code") == 0
+            for event in events[:latest_50053_index]
+        )
+    )
+    if latest_50053 is not None:
+        interpretation = (
+            "A recent error code 50053 can represent Microsoft Entra Smart Lockout "
+            "or a malicious-IP block. Review failure_reason; this historical event "
+            "does not establish the current lock state."
+        )
+    else:
+        interpretation = (
+            "No error code 50053 was returned in the sampled window. This does not "
+            "prove that the account is currently unlocked."
+        )
+
+    return {
+        "status": "ok",
+        "source": "microsoft_graph_sign_in_logs",
+        "lookback_hours": GRAPH_SIGN_IN_LOOKBACK_HOURS,
+        "window_start": window_start,
+        "events_examined": len(events),
+        "current_lock_state": "unknown",
+        "current_lock_state_available": False,
+        "latest_event": events[0] if events else None,
+        "latest_failure": latest_failure,
+        "latest_success": latest_success,
+        "possible_lockout_evidence": {
+            "found": latest_50053 is not None,
+            "error_code": GRAPH_SIGN_IN_LOCKOUT_ERROR_CODE,
+            "latest_event": latest_50053,
+            "later_success_observed": later_success_observed,
+            "interpretation": interpretation,
+        },
+        "recent_events": events[:GRAPH_SIGN_IN_PUBLIC_EVENTS],
+    }
+
+
 def _invalid_target(operation: str) -> Dict[str, Any]:
     message = "A resolved target UPN is required for the account operation."
     result: Dict[str, Any] = {
@@ -385,6 +586,9 @@ def _get_account_status(
                 "Microsoft Graph account lookup returned no profile.",
             )
         account = _graph_account_snapshot(normalized_upn, profile)
+        account["sign_in_investigation"] = _read_graph_sign_in_investigation(
+            profile
+        )
     else:
         return _backend_error("status", normalized_upn)
 

@@ -160,6 +160,39 @@ def test_current_graph_manager_can_diagnose_employee_with_both_device_sets(monke
     assert calls["devices"] == [CALLER_UPN, TARGET_UPN]
 
 
+def test_sign_in_evidence_never_creates_an_automatic_remediation_offer(monkeypatch):
+    _install_directory(monkeypatch, manager_upn=MANAGER_UPN)
+    context = _context()
+    status = Mock(
+        return_value={
+            "status": "ok",
+            "account": {
+                "target_upn": CALLER_UPN,
+                "enabled": True,
+                "locked": None,
+                "recommended_action": "investigate_sign_in",
+                "sign_in_investigation": {
+                    "status": "ok",
+                    "current_lock_state": "unknown",
+                    "possible_lockout_evidence": {
+                        "found": True,
+                        "error_code": 50053,
+                    },
+                },
+            },
+        }
+    )
+    monkeypatch.setattr(ad_account_tool.ad_get_account_status, "func", status)
+
+    result = orchestrator.diagnose_account_access.func(CALLER_UPN, context)
+
+    assert result["status"] == "ok"
+    assert result["account"]["locked"] is None
+    assert result["account"]["recommended_action"] == "investigate_sign_in"
+    assert result["offer"] is None
+    assert context.state[orchestrator.ACCOUNT_ACCESS_OFFER_STATE_KEY] is None
+
+
 def test_unauthorized_requester_cannot_read_target_devices_or_account_state(monkeypatch):
     calls, _ = _install_directory(monkeypatch, manager_upn=MANAGER_UPN)
     context = _context()
