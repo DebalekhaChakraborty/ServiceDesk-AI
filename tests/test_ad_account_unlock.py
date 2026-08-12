@@ -671,6 +671,19 @@ def test_account_access_instruction_requires_diagnosis_before_remediation():
     assert "enters the protected Account Access diagnosis" in instruction
 
 
+def test_on_behalf_account_access_reuses_named_target_and_stops_if_unverified():
+    instruction = sd_chat.instruction
+
+    assert "person as the pending Account Access target" in instruction
+    assert "diagnose_account_access_for_other_user" in instruction
+    assert "not call aad_user_lookup" in instruction
+    assert "checks the current manager before" in instruction
+    assert "REQUESTER_NOT_TARGET_MANAGER" in instruction
+    assert "I can only assist the account" in instruction
+    assert "Stop there" in instruction
+    assert "continue an on-behalf troubleshooting flow" in instruction
+
+
 def test_account_access_instruction_rejects_unsupported_time_sync_and_stale_plan():
     instruction = sd_chat.instruction
 

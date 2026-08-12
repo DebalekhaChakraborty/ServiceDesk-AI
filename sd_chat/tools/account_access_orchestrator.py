@@ -39,6 +39,10 @@ OFFER_TTL_SECONDS = 10 * 60
 
 _USER_SELECT = "id,displayName,userPrincipalName,mail"
 _DEVICE_SELECT = "id,displayName,deviceId,operatingSystem"
+_ON_BEHALF_DENIAL_MESSAGE = (
+    "I can only assist the account holder or their verified manager with Account "
+    "Access issues."
+)
 
 _ACTION_SPECS: Dict[str, Dict[str, str]] = {
     "ad.unlock_account": {
@@ -153,6 +157,79 @@ def _read_directory_user(user_upn: str) -> Tuple[Optional[Dict[str, Any]], Optio
         "display_name": raw.get("displayName"),
         "mail": raw.get("mail"),
     }, None
+
+
+def _resolve_other_user_target(
+    target_query: str,
+) -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
+    """Resolve an on-behalf target internally without returning directory matches."""
+    query = str(target_query or "").strip()
+    if not query:
+        return None, _error(
+            "ACCOUNT_ACCESS_TARGET_QUERY_REQUIRED",
+            "Account Access support for another person requires their exact UPN.",
+        )
+
+    if "@" in query:
+        target, lookup_error = _read_directory_user(_norm_upn(query))
+        if lookup_error is not None or target is None:
+            return None, _error(
+                "ACCOUNT_ACCESS_TARGET_NOT_RESOLVED",
+                "The requested Account Access target could not be resolved.",
+            )
+        return target["upn"], None
+
+    escaped_query = query.replace("'", "''")
+    try:
+        response = aad_tool._graph_get(
+            "users",
+            params={
+                "$filter": f"startsWith(displayName,'{escaped_query}')",
+                "$select": _USER_SELECT,
+                "$top": "10",
+            },
+        )
+    except Exception:
+        return None, _error(
+            "ACCOUNT_ACCESS_TARGET_RESOLUTION_FAILED",
+            "The requested Account Access target could not be resolved securely.",
+        )
+    if response.status_code != 200:
+        return None, _error(
+            "ACCOUNT_ACCESS_TARGET_RESOLUTION_FAILED",
+            "The requested Account Access target could not be resolved securely.",
+        )
+    try:
+        payload = response.json()
+    except Exception:
+        return None, _error(
+            "ACCOUNT_ACCESS_TARGET_RESOLUTION_FAILED",
+            "The requested Account Access target could not be resolved securely.",
+        )
+    raw_matches = payload.get("value") if isinstance(payload, dict) else None
+    if not isinstance(raw_matches, list):
+        return None, _error(
+            "ACCOUNT_ACCESS_TARGET_RESOLUTION_FAILED",
+            "The requested Account Access target could not be resolved securely.",
+        )
+    matches = {
+        _norm_upn(item.get("userPrincipalName") or item.get("mail"))
+        for item in raw_matches
+        if isinstance(item, dict)
+        and _norm_upn(item.get("userPrincipalName") or item.get("mail"))
+    }
+    if len(matches) == 1:
+        return next(iter(matches)), None
+    if len(matches) > 1:
+        return None, _error(
+            "ACCOUNT_ACCESS_TARGET_AMBIGUOUS",
+            "Account Access support for another person requires their exact UPN. "
+            "The account holder or their verified manager can provide it.",
+        )
+    return None, _error(
+        "ACCOUNT_ACCESS_TARGET_NOT_RESOLVED",
+        "The requested Account Access target could not be resolved.",
+    )
 
 
 def _read_manager(target_upn: str) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
@@ -352,7 +429,7 @@ def _verify_identity(
     if not caller_is_self and (not manager_upn or manager_upn != caller_upn):
         return _error(
             "REQUESTER_NOT_TARGET_MANAGER",
-            "The requester is neither the target account owner nor its current Microsoft Graph manager.",
+            _ON_BEHALF_DENIAL_MESSAGE,
         )
 
     if manager_upn:
@@ -545,6 +622,24 @@ def diagnose_account_access(
     state = _state(tool_context)
     state[ACCOUNT_ACCESS_OFFER_STATE_KEY] = None
     return _diagnose_verified_target(_norm_upn(target_upn), tool_context)
+
+
+def diagnose_account_access_for_other_user(
+    target_query: str,
+    tool_context: ToolContext,
+) -> Dict[str, Any]:
+    """Resolve and authorize an on-behalf target before returning any account data."""
+    state = _state(tool_context)
+    _invalidate_security_state(state)
+    state["account_access_diagnosis"] = None
+    state[ACCOUNT_ACCESS_OFFER_STATE_KEY] = None
+    target_upn, target_error = _resolve_other_user_target(target_query)
+    if target_error is not None or target_upn is None:
+        return target_error or _error(
+            "ACCOUNT_ACCESS_TARGET_NOT_RESOLVED",
+            "The requested Account Access target could not be resolved.",
+        )
+    return _diagnose_verified_target(target_upn, tool_context)
 
 
 def recheck_account_access(tool_context: ToolContext) -> Dict[str, Any]:
@@ -820,6 +915,44 @@ def execute_explicit_account_unlock(
     )
 
 
+def _execute_explicit_account_action_for_other_user(
+    action_id: str,
+    target_query: str,
+    tool_context: ToolContext,
+) -> Dict[str, Any]:
+    """Authorize an on-behalf target before any planning or remediation work."""
+    state = _state(tool_context)
+    _invalidate_security_state(state)
+    state["account_access_diagnosis"] = None
+    state[ACCOUNT_ACCESS_OFFER_STATE_KEY] = None
+    target_upn, target_error = _resolve_other_user_target(target_query)
+    if target_error is not None or target_upn is None:
+        return target_error or _error(
+            "ACCOUNT_ACCESS_TARGET_NOT_RESOLVED",
+            "The requested Account Access target could not be resolved.",
+        )
+    preflight = _verify_identity(tool_context, target_upn)
+    if preflight.get("status") != "ok":
+        return preflight
+    _invalidate_security_state(state)
+    return _execute_exact_action(
+        action_id,
+        target_upn,
+        tool_context,
+        recheck_after=False,
+    )
+
+
+def execute_explicit_account_unlock_for_other_user(
+    target_query: str,
+    tool_context: ToolContext,
+) -> Dict[str, Any]:
+    """Run protected explicit unlock only for an authorized on-behalf request."""
+    return _execute_explicit_account_action_for_other_user(
+        "ad.unlock_account", target_query, tool_context
+    )
+
+
 def execute_explicit_account_enable(
     target_upn: str,
     tool_context: ToolContext,
@@ -830,6 +963,16 @@ def execute_explicit_account_enable(
         _norm_upn(target_upn),
         tool_context,
         recheck_after=False,
+    )
+
+
+def execute_explicit_account_enable_for_other_user(
+    target_query: str,
+    tool_context: ToolContext,
+) -> Dict[str, Any]:
+    """Run protected explicit enable only for an authorized on-behalf request."""
+    return _execute_explicit_account_action_for_other_user(
+        "ad.enable_account", target_query, tool_context
     )
 
 
@@ -846,18 +989,44 @@ def execute_explicit_password_reset(
     )
 
 
+def execute_explicit_password_reset_for_other_user(
+    target_query: str,
+    tool_context: ToolContext,
+) -> Dict[str, Any]:
+    """Run protected password reset only for an authorized on-behalf request."""
+    return _execute_explicit_account_action_for_other_user(
+        "aad.reset_password", target_query, tool_context
+    )
+
+
 diagnose_account_access = FunctionTool(func=diagnose_account_access)
+diagnose_account_access_for_other_user = FunctionTool(
+    func=diagnose_account_access_for_other_user
+)
 recheck_account_access = FunctionTool(func=recheck_account_access)
 confirm_account_access_offer = FunctionTool(func=confirm_account_access_offer)
 execute_explicit_account_unlock = FunctionTool(func=execute_explicit_account_unlock)
+execute_explicit_account_unlock_for_other_user = FunctionTool(
+    func=execute_explicit_account_unlock_for_other_user
+)
 execute_explicit_account_enable = FunctionTool(func=execute_explicit_account_enable)
+execute_explicit_account_enable_for_other_user = FunctionTool(
+    func=execute_explicit_account_enable_for_other_user
+)
 execute_explicit_password_reset = FunctionTool(func=execute_explicit_password_reset)
+execute_explicit_password_reset_for_other_user = FunctionTool(
+    func=execute_explicit_password_reset_for_other_user
+)
 
 account_access_orchestration_tools = [
     diagnose_account_access,
+    diagnose_account_access_for_other_user,
     recheck_account_access,
     confirm_account_access_offer,
     execute_explicit_account_unlock,
+    execute_explicit_account_unlock_for_other_user,
     execute_explicit_account_enable,
+    execute_explicit_account_enable_for_other_user,
     execute_explicit_password_reset,
+    execute_explicit_password_reset_for_other_user,
 ]

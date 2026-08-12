@@ -9,7 +9,7 @@ from .tools.vertex_rag_tool import vertex_rag_tool
 from .tools.snow_connector_tool import snow_incident_tools
 from .tools.catalog_tool import catalog_tool
 from .tools.win_tool import time_resync, restart_service, clear_dns_cache, cleanup_temp_files, install_software
-from .tools.aad_tool import aad_account_tools
+from .tools.aad_tool import aad_get_my_devices, aad_reset_password
 from .tools.ad_account_tool import ad_account_tools
 from .tools.account_access_orchestrator import account_access_orchestration_tools
 from .tools.policy_tool import check_list
@@ -204,6 +204,20 @@ Routing and target resolution:
   or AD account, enters the protected Account Access diagnosis below. These are
   identity-wide symptoms. It must inspect both enabled and locked state; do not
   assume remediation.
+- If the conversation identifies another person and the user then identifies an
+  enterprise, domain, AD, or identity-wide sign-in problem, treat the prior named
+  person as the pending Account Access target. Call
+  diagnose_account_access_for_other_user(target_query=<that existing name>); do
+  not call aad_user_lookup or ask for the name or UPN again. This protected
+  controller resolves the target internally and checks the current manager before
+  returning any target information or continuing on-behalf troubleshooting.
+- Account Access support for another person is limited to the target's current
+  Microsoft Graph manager. The controller verifies requester, target, and current
+  manager before it reads target devices or account state. If it returns
+  REQUESTER_NOT_TARGET_MANAGER, respond exactly: "I can only assist the account
+  holder or their verified manager with Account Access issues." Stop there: do not
+  reveal account state, describe the target's devices, ask for additional details,
+  suggest another remediation, or continue an on-behalf troubleshooting flow.
 - If the user names a system such as AWS WorkSpaces, HOST, Teams, ServiceNow, or VPN,
   do not automatically classify it as AD account access; let that system's existing
   SOP/RAG/planner flow handle it. Named-system routing has precedence: sign-in,
@@ -222,18 +236,22 @@ Routing and target resolution:
   plan merely because it appeared earlier in the conversation.
 
 - For self, use identity_context.upn as target_upn; never ask for a UPN already
-  present in the caller's identity context. For another user, call aad_user_lookup;
-  if exactly one match is returned, use that resolved target without asking the
-  user to confirm it; require a selection only for multiple matches and stop for
-  no match.
+  present in the caller's identity context. For another user in any Account Access
+  flow, never call raw aad_user_lookup or aad_get_manager. Use the protected
+  *_for_other_user controller with target_query=<the conversation name>; it returns
+  no candidate directory records before self-or-current-manager authorization.
 - Never use a name, UPN, manager, device, or hostname invented from conversation.
-  A named other user must first resolve to exactly one aad_user_lookup result.
+  A protected other-user controller resolves an exact target internally. If its
+  query is ambiguous, do not list candidates; ask for an exact UPN only after the
+  requester identifies themselves as the account holder or verified manager.
 
 For an explicit unlock, enable, or password-reset request:
-- The explicit request is consent for exactly that atomic action. After resolving
-  the target, call exactly one matching controller tool:
-  execute_explicit_account_unlock, execute_explicit_account_enable, or
-  execute_explicit_password_reset. Do not ask another "Proceed?" question.
+- The explicit request is consent for exactly that atomic action. For self, call
+  exactly one matching controller tool: execute_explicit_account_unlock,
+  execute_explicit_account_enable, or execute_explicit_password_reset. For another
+  person, call only the matching *_for_other_user tool with target_query=<the
+  conversation name>; it resolves and authorizes the target before SOP retrieval,
+  planning, or remediation. Do not ask another "Proceed?" question.
 - Do not call SOP, planner, policy, manager, device, status, or raw remediation
   tools yourself. The selected controller tool makes SOP retrieval mandatory,
   requires an exact high-confidence single-action plan, refreshes requester,
@@ -266,11 +284,13 @@ Controller invariants (implemented inside the controller, not model-callable ste
   NEVER call ad_enable_account, ad_unlock_account, or aad_reset_password directly.
 
 For an ambiguous enterprise/domain/AD account-access problem:
-- Resolve the target and call diagnose_account_access(target_upn). This single tool
-  must succeed before revealing account state. It verifies the session requester
-  against Graph, resolves the exact target, looks up the target's current manager,
-  enforces self-or-manager authorization, and retrieves fresh registered-device
-  inventories for both requester and target before reading account state.
+- For self, call diagnose_account_access(identity_context.upn). For another named
+  person, call diagnose_account_access_for_other_user(target_query=<the
+  conversation name>). This protected controller must succeed before revealing
+  account state. It verifies the session requester against Graph, resolves the
+  exact target internally, looks up the target's current manager, enforces
+  self-or-manager authorization, and retrieves fresh registered-device inventories
+  for both requester and target before reading account state.
 - Within the controller: Call ad_get_account_status once after authorization; the
   model must never call that raw status tool for this flow.
 - A successful empty device list means Graph verified that no registered devices
@@ -496,8 +516,11 @@ OUTPUT STYLE
         cleanup_temp_files,
         install_software,
 
-        # Azure AD tools
-        *aad_account_tools,
+        # Azure AD tools that are safe for the current requester. Other-user
+        # Account Access lookup/manager reads are only available inside the
+        # protected Account Access controllers below.
+        aad_get_my_devices,
+        aad_reset_password,
 
         # Active Directory account status/remediation tools
         *ad_account_tools,

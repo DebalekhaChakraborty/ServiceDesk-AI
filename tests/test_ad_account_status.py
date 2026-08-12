@@ -944,6 +944,10 @@ def test_root_agent_export_and_account_tools_remain_available():
     assert "ad_get_account_status" in root_tool_names
     assert "ad_unlock_account" in root_tool_names
     assert "ad_enable_account" in root_tool_names
+    assert "diagnose_account_access_for_other_user" in root_tool_names
+    assert "execute_explicit_account_unlock_for_other_user" in root_tool_names
+    assert "aad_user_lookup" not in root_tool_names
+    assert "aad_get_manager" not in root_tool_names
 
 
 def test_account_access_routing_and_stale_confirmation_contract():
@@ -963,9 +967,9 @@ def test_account_access_routing_and_stale_confirmation_contract():
     assert "call aad_get_manager" in instruction
     assert "immediately before check_list" in instruction
     assert "do not call check_list first" in instruction
-    assert "if exactly one match is returned" in instruction
-    assert "without asking the" in instruction
-    assert "require a selection only for multiple matches" in instruction
+    assert "never call raw aad_user_lookup or aad_get_manager" in instruction
+    assert "no candidate directory records" in instruction
+    assert "do not list candidates" in instruction
 
 
 def test_disabled_locked_and_healthy_branch_contracts_are_explicit():

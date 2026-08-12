@@ -48,6 +48,10 @@ def _directory_user(upn):
     }
 
 
+def _graph_response(status_code, payload):
+    return SimpleNamespace(status_code=status_code, json=lambda: payload)
+
+
 def _install_directory(
     monkeypatch,
     manager_upn=MANAGER_UPN,
@@ -212,6 +216,137 @@ def test_unauthorized_requester_cannot_read_target_devices_or_account_state(monk
     assert calls["devices"] == []
     status.assert_not_called()
     assert "account_access_diagnosis" not in context.state
+
+
+def test_unverified_on_behalf_request_stops_before_any_target_disclosure(monkeypatch):
+    calls, _ = _install_directory(monkeypatch, manager_upn=MANAGER_UPN)
+    context = _context()
+    status = Mock(wraps=ad_account_tool.ad_get_account_status.func)
+    monkeypatch.setattr(ad_account_tool.ad_get_account_status, "func", status)
+
+    result = orchestrator.diagnose_account_access.func(TARGET_UPN, context)
+
+    assert result["code"] == "REQUESTER_NOT_TARGET_MANAGER"
+    assert result["message"] == (
+        "I can only assist the account holder or their verified manager with "
+        "Account Access issues."
+    )
+    assert TARGET_UPN in calls["users"]
+    assert calls["managers"] == [TARGET_UPN]
+    assert calls["devices"] == []
+    status.assert_not_called()
+    assert context.state[orchestrator.ACCOUNT_ACCESS_OFFER_STATE_KEY] is None
+    assert "account_access_diagnosis" not in context.state
+
+
+def test_protected_other_user_resolution_hides_ambiguous_directory_matches(monkeypatch):
+    context = _context()
+    graph_get = Mock(
+        return_value=_graph_response(
+            200,
+            {
+                "value": [
+                    {
+                        "id": "id-one",
+                        "displayName": "Employee One",
+                        "userPrincipalName": "employee.one@example.com",
+                    },
+                    {
+                        "id": "id-two",
+                        "displayName": "Employee Two",
+                        "userPrincipalName": "employee.two@example.com",
+                    },
+                ]
+            },
+        )
+    )
+    monkeypatch.setattr(aad_tool, "_graph_get", graph_get)
+
+    result = orchestrator.diagnose_account_access_for_other_user.func(
+        "Employee",
+        context,
+    )
+
+    assert result["code"] == "ACCOUNT_ACCESS_TARGET_AMBIGUOUS"
+    assert "employee.one@example.com" not in str(result)
+    assert "employee.two@example.com" not in str(result)
+    graph_get.assert_called_once_with(
+        "users",
+        params={
+            "$filter": "startsWith(displayName,'Employee')",
+            "$select": orchestrator._USER_SELECT,
+            "$top": "10",
+        },
+    )
+    assert context.state[orchestrator.ACCOUNT_ACCESS_OFFER_STATE_KEY] is None
+    assert context.state["account_access_diagnosis"] is None
+
+
+def test_protected_other_user_diagnosis_authorizes_before_account_status(monkeypatch):
+    calls, _ = _install_directory(monkeypatch, manager_upn=MANAGER_UPN)
+    context = _context()
+    graph_get = Mock(
+        return_value=_graph_response(
+            200,
+            {
+                "value": [
+                    {
+                        "id": "id-employee",
+                        "displayName": "Employee",
+                        "userPrincipalName": TARGET_UPN,
+                    }
+                ]
+            },
+        )
+    )
+    status = Mock(wraps=ad_account_tool.ad_get_account_status.func)
+    monkeypatch.setattr(aad_tool, "_graph_get", graph_get)
+    monkeypatch.setattr(ad_account_tool.ad_get_account_status, "func", status)
+
+    result = orchestrator.diagnose_account_access_for_other_user.func(
+        "Employee",
+        context,
+    )
+
+    assert result["code"] == "REQUESTER_NOT_TARGET_MANAGER"
+    assert result["message"] == (
+        "I can only assist the account holder or their verified manager with "
+        "Account Access issues."
+    )
+    assert calls["managers"] == [TARGET_UPN]
+    assert calls["devices"] == []
+    status.assert_not_called()
+
+
+def test_protected_other_user_explicit_action_stops_before_sop_for_nonmanager(
+    monkeypatch,
+):
+    _install_directory(monkeypatch, manager_upn=MANAGER_UPN)
+    retrieval = _install_planning(monkeypatch)
+    context = _context()
+    graph_get = Mock(
+        return_value=_graph_response(
+            200,
+            {
+                "value": [
+                    {
+                        "id": "id-employee",
+                        "displayName": "Employee",
+                        "userPrincipalName": TARGET_UPN,
+                    }
+                ]
+            },
+        )
+    )
+    monkeypatch.setattr(aad_tool, "_graph_get", graph_get)
+
+    result = orchestrator.execute_explicit_account_unlock_for_other_user.func(
+        "Employee",
+        context,
+    )
+
+    assert result["code"] == "REQUESTER_NOT_TARGET_MANAGER"
+    retrieval.assert_not_called()
 
 
 def test_device_lookup_failure_revokes_policy_and_stops_before_status(monkeypatch):
