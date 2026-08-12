@@ -1,0 +1,14 @@
+{
+  "id": "ad.enable_account",
+  "title": "Enable the target Active Directory account",
+  "description": "Enable an administratively disabled Microsoft Entra user account by setting its real Microsoft Graph accountEnabled property to true and verifying the persisted result. This action does not unlock an account lockout and does not reset the password.",
+  "inputs": ["target_upn"],
+  "outputs": ["enable.status", "enable.message"],
+  "preconditions": ["caller_is_self_or_manager"],
+  "effects": ["account_enabled(${target_upn})"],
+  "tool": "ad_account_tool",
+  "action": "enable_account",
+  "args_template": {
+    "target_upn": "${target_upn}"
+  }
+}

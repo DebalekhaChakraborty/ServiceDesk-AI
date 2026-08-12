@@ -105,6 +105,12 @@ def _extract_steps_from_llm(user_text: str, sop_snippets: List[str]) -> List[str
         "needed to resolve the issue, expressed as concise imperative labels.\n\n"
         "RULES:\n"
         "- Steps must be high-level, not tied to any specific tool or function name.\n"
+        "- Include only executable remediation operations. Exclude user/target lookup, "
+        "identity verification, authorization or policy checks, diagnosis/status inspection, "
+        "consent prompts, and post-action verification; the orchestrator and atomic tools own "
+        "those prerequisites and postconditions.\n"
+        "- When the user explicitly requests one atomic remediation, return exactly one step "
+        "for that requested remediation.\n"
         "- Do not talk about JSON, code, or internal implementation.\n"
         "- Return ONLY compact JSON with keys: steps (array of strings), rationale (string), confidence (0..1).\n"
     )
@@ -412,6 +418,11 @@ def propose_plan(
     """
     Dynamic, multi-step plan builder.
 
+    ``ctx_vars`` contains known variable names, for example ``["target_upn"]``.
+    For resilience to automatic tool callers, ``"target_upn:<value>"`` is also
+    recognized as the known variable name ``target_upn``; the value is not parsed
+    or used by the planner.
+
     - If sop_texts are provided (from sop_retriever), treat them as already distilled step labels.
     - Otherwise, ask the LLM to extract steps from (user_text + SOP snippets).
     - Try LLM-based mapping steps -> actions.
@@ -484,7 +495,20 @@ def propose_plan(
             inputs |= set(act.get("inputs", []) or [])
             preconds |= set(act.get("preconditions", []) or [])
 
-    missing = sorted([v for v in inputs if v not in (ctx_vars or [])])
+    known_ctx_vars = set()
+    for raw_value in ctx_vars or []:
+        if not isinstance(raw_value, str):
+            continue
+        normalized = raw_value.strip()
+        if not normalized:
+            continue
+        known_ctx_vars.add(normalized)
+        if ":" in normalized:
+            candidate = normalized.split(":", 1)[0].strip()
+            if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", candidate):
+                known_ctx_vars.add(candidate)
+
+    missing = sorted([v for v in inputs if v not in known_ctx_vars])
 
     # Confidence: average of scores (either LLM or fallback) for mapped steps
     confidence = 0.0
@@ -519,7 +543,12 @@ def propose_plan(
         #   - we have mapped steps
         #   - nothing is unmapped
         #   - AND confidence is above threshold
-        "can_execute_fully": (len(unmapped) == 0 and len(mapped) > 0 and not low_confidence),
+        "can_execute_fully": (
+            len(unmapped) == 0
+            and len(mapped) > 0
+            and len(missing) == 0
+            and not low_confidence
+        ),
         "must_validate_preconditions": True,
         "confidence": confidence,
         "low_confidence": low_confidence,
@@ -528,4 +557,3 @@ def propose_plan(
 
     status = "ok" if (mapped or unmapped) else "no_match"
     return {"status": status, "plan": plan}
-

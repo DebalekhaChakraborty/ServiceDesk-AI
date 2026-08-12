@@ -271,11 +271,8 @@ def ensure_identity_context_in_state(state: Dict[str, Any]) -> Dict[str, Any]:
         "devices": devices,
         "allowed_hosts": allowed_hosts,  # NEW: derived from devices
         "manager": {
-            # "name": manager_name,
-            # "email": manager_email,
-            ## TODO: Manager info not loading from persona in some cases; fix later
-            "name": "Ashok Giri",
-            "email": "ashok.giri@debalekhachakrabortyoutlook.onmicrosoft.com",
+            "name": manager_name,
+            "email": manager_email,
         },
         "source": source,
     }

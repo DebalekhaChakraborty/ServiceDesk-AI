@@ -6,6 +6,12 @@ from google.adk.tools import FunctionTool, ToolContext
 import secrets
 import string
 from .email_tool import send_email_via_gmail
+from .policy_tool import (
+    AAD_MANAGER_LOOKUP_STATE_KEY,
+    ACCOUNT_ACCESS_AUTHORIZATION_STATE_KEY,
+    ACCOUNT_ACCESS_IDENTITY_VERIFICATION_STATE_KEY,
+    consume_account_access_authorization,
+)
 
 
 # ==============================================================================
@@ -202,9 +208,18 @@ def aad_user_lookup(tool_context: ToolContext, query: str) -> Dict[str, Any]:
         "error": "...optional..."
       }
     """
-    state: Dict[str, Any] = tool_context.state or {}
-    if tool_context.state is None:
+    state = tool_context.state
+    if state is None:
+        state = {}
         tool_context.state = state
+    # Starting a new target lookup invalidates manager evidence for any
+    # previously resolved target, as well as a diagnosis/authorization that a
+    # later bare confirmation might otherwise reuse.
+    state[AAD_MANAGER_LOOKUP_STATE_KEY] = None
+    state[ACCOUNT_ACCESS_AUTHORIZATION_STATE_KEY] = None
+    state[ACCOUNT_ACCESS_IDENTITY_VERIFICATION_STATE_KEY] = None
+    state["account_access_diagnosis"] = None
+    state["account_access_offer"] = None
 
     if not _graph_is_configured():
         return {
@@ -292,9 +307,11 @@ def aad_get_manager(tool_context: ToolContext, target_upn: str) -> Dict[str, Any
         "error": "...optional..."
       }
     """
-    state: Dict[str, Any] = tool_context.state or {}
-    if tool_context.state is None:
+    state = tool_context.state
+    if state is None:
+        state = {}
         tool_context.state = state
+    state[AAD_MANAGER_LOOKUP_STATE_KEY] = None
 
     if not _graph_is_configured():
         return {
@@ -322,6 +339,22 @@ def aad_get_manager(tool_context: ToolContext, target_upn: str) -> Dict[str, Any
             "display_name": m.get("displayName"),
             "upn": m.get("userPrincipalName") or m.get("mail"),
             "aad_object_id": m.get("id"),
+        }
+
+        normalized_target = (target_upn or "").strip().lower()
+        normalized_manager = (manager["upn"] or "").strip().lower()
+        if not normalized_target or not normalized_manager:
+            return {
+                "ok": False,
+                "target_upn": target_upn,
+                "manager": None,
+                "error": "Graph manager response did not include a usable UPN.",
+            }
+
+        state[AAD_MANAGER_LOOKUP_STATE_KEY] = {
+            "target_upn": normalized_target,
+            "manager_upn": normalized_manager,
+            "source": "microsoft_graph",
         }
 
         return {
@@ -488,6 +521,29 @@ def aad_reset_password(
         tool_context.state = state
 
     caller = _get_identity_context(state)
+
+    if not consume_account_access_authorization(
+        tool_context,
+        target_upn,
+        "aad.reset_password",
+        require_identity_verification=True,
+    ):
+        return {
+            "reset": {
+                "status": "error",
+                "message": (
+                    "A fresh, target-bound identity and policy verification is "
+                    "required before resetting this password."
+                ),
+                "audit": {
+                    "requested_by": caller,
+                    "target_upn": target_upn,
+                    "mode": mode,
+                    "backend": "graph",
+                },
+                "error": "ACCOUNT_ACCESS_AUTHORIZATION_REQUIRED",
+            }
+        }
 
     if not _graph_is_configured():
         return {
