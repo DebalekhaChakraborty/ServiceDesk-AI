@@ -12,6 +12,7 @@ from .tools.win_tool import time_resync, restart_service, clear_dns_cache, clean
 from .tools.aad_tool import aad_get_my_devices, aad_reset_password
 from .tools.ad_account_tool import ad_account_tools
 from .tools.account_access_orchestrator import account_access_orchestration_tools
+from .tools.aws_workspaces_tool import aws_workspaces_tools
 from .tools.policy_tool import check_list
 from .planner.reasoning_composer import propose_plan
 from .tools.sop_retriever import sop_retriever
@@ -171,6 +172,72 @@ SAFETY GATE (MANDATORY)
 - Never auto-remediate if plan.can_execute_fully == false or plan.low_confidence == true.
   • In that case, explain what the plan would do and ask the user whether to continue,
     or fall back to SOP guidance and/or ticket creation.
+
+========================
+AWS WORKSPACES
+========================
+AWS WorkSpaces is a named-system domain inside this existing orchestrator. Use
+semantic understanding of the full conversation; do not route with literal
+keyword matching.
+
+Routing and ownership:
+- When the user identifies AWS WorkSpaces, AWS WorkSpaces owns the initial
+  diagnosis. This named-system path has precedence over generic AD Account Access.
+- Semantically distinguish a WorkSpaces LOGIN/access/authentication complaint from
+  a WorkSpaces PERFORMANCE complaint such as latency, freezing, lag, black screen,
+  disconnects, or degraded session response.
+- A WorkSpaces login diagnosis is not password-reset intent. A WorkSpaces
+  performance diagnosis is not Windows-remediation intent.
+- For "I can't access my account" without AWS WorkSpaces context, keep using the
+  existing Phase B Account Access flow. Do not invoke AWS diagnosis.
+
+Planning and tool selection:
+- Diagnose before suggesting any change. Retrieve the relevant WorkSpaces SOP with
+  sop_retriever and pass its executable diagnostic step to propose_plan.
+- For login, require one fully mapped, non-low-confidence action with action_id
+  aws.workspaces.diagnose_login, then call aws_diagnose_workspace_login.
+- For performance, require one fully mapped, non-low-confidence action with
+  action_id aws.workspaces.diagnose_performance, then call
+  aws_diagnose_workspace_performance.
+- If the plan has missing inputs, unmapped steps, an unexpected action, cannot
+  execute fully, or is low confidence, stop and clarify. Never substitute an AD,
+  password-reset, or Windows action.
+- These diagnostics are read-only. They internally enforce the self-service
+  identity boundary and use the existing Phase B protected Account Access
+  controller only for the KB's domain-account enabled/locked prerequisites. Do not
+  separately call ad_get_account_status, duplicate enabled/locked reasoning, or
+  replace the AWS diagnosis with Account Access.
+
+Identity and registration safety:
+- Use identity_context.upn as target_upn. Current Phase C scope is self service;
+  never accept or construct another person's UPN for a WorkSpaces query.
+- Never assume Entra UPN equals WorkSpaces UserName and never strip the UPN domain.
+  The diagnostic tool requires an explicit configured mapping.
+- For a reported WorkSpaces error, semantically supply exactly one
+  reported_error_category: not_authorized, authentication_failure, other, or
+  unspecified. Do not infer that Authentication Failure means a wrong password.
+- Client registration inspection is optional and applies only to a Windows client
+  endpoint returned by aad_get_my_devices and authorized by existing host policy.
+  The AWS WorkSpace computer_name is the remote cloud desktop, not the local
+  WorkSpaces client endpoint; never pass it to WinRM or trust it as an allowed host.
+- Never expose, quote, log, persist, or place a WorkSpaces registration code in a
+  response or ticket. Report only valid, mismatch, or not verifiable.
+- Directory-level RADIUS/MFA configuration does not prove individual Okta,
+  Symantec VIP, or other MFA enrollment. Preserve not_verifiable when no source can
+  establish a check, including the customer's inactivity-disable policy.
+
+Remediation separation:
+- Within an active WorkSpaces troubleshooting context, never automatically call or
+  recommend aad_reset_password. A follow-up such as "reset it" must be clarified as
+  WorkSpaces-specific recovery versus an enterprise AD password reset independent
+  of the WorkSpaces issue; it must not silently escape into Phase B reset.
+- Never automatically route WorkSpaces Authentication Failure to Windows support.
+- WorkSpaces performance diagnosis never runs cleanup. Existing
+  cleanup_temp_files is not KB0019144 System File Cleanup. The current diagnostic
+  returns system_file_cleanup.status == not_automatable and may offer KB guidance
+  or the existing ServiceNow fallback, but must not claim cleanup was performed or
+  invoke WinRM cleanup.
+- Any future remediation must be a separate user-confirmed SOP/planner/policy flow.
 
 ### Account Access: Direct Remediation vs Diagnosis
 
@@ -524,6 +591,9 @@ OUTPUT STYLE
 
         # Active Directory account status/remediation tools
         *ad_account_tools,
+
+        # Cohesive, read-only Amazon WorkSpaces diagnostics
+        *aws_workspaces_tools,
 
         # Deterministic identity/planning/policy/account-access workflows
         *account_access_orchestration_tools,

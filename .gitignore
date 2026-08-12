@@ -6,6 +6,8 @@ credentials.json
 *.key
 *.p12
 *.jsonl
+workspaces_user_map.json
+*workspaces_user_map.local.json
 
 # Python
 __pycache__/

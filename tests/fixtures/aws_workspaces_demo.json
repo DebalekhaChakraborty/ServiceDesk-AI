@@ -1,0 +1,55 @@
+{
+  "workspaces": [
+    {
+      "region": "us-east-1",
+      "directory_id": "d-1234567890",
+      "workspace_username": "example.directory.user",
+      "workspace": {
+        "WorkspaceId": "ws-1234567890",
+        "DirectoryId": "d-1234567890",
+        "UserName": "example.directory.user",
+        "ComputerName": "DEMO-REMOTE-DESKTOP",
+        "State": "AVAILABLE",
+        "BundleId": "wsb-1234567890",
+        "WorkspaceProperties": {
+          "RunningMode": "AUTO_STOP",
+          "Protocols": ["WSP"]
+        }
+      },
+      "connection": {
+        "ConnectionState": "CONNECTED",
+        "ConnectionStateCheckTimestamp": "2026-01-01T10:00:00Z",
+        "LastKnownUserConnectionTimestamp": "2026-01-01T09:59:00Z"
+      },
+      "registration_status": "pass",
+      "mfa_directory_status": "enabled",
+      "inactivity_access_status": "not_verifiable",
+      "metrics": {
+        "InSessionLatency": {"value": 243, "timestamp": "2026-01-01T10:00:00Z"},
+        "CPUUsage": {"value": 78, "timestamp": "2026-01-01T10:00:00Z"},
+        "MemoryUsage": {"value": 64, "timestamp": "2026-01-01T10:00:00Z"},
+        "RootVolumeDiskUsage": {"value": 51, "timestamp": "2026-01-01T10:00:00Z"},
+        "UserVolumeDiskUsage": {"value": 42, "timestamp": "2026-01-01T10:00:00Z"},
+        "ConnectionAttempt": {"value": 3, "timestamp": "2026-01-01T10:00:00Z"},
+        "ConnectionSuccess": {"value": 3, "timestamp": "2026-01-01T10:00:00Z"},
+        "ConnectionFailure": {"value": 0, "timestamp": "2026-01-01T10:00:00Z"},
+        "SessionLaunchTime": {"value": 8, "timestamp": "2026-01-01T10:00:00Z"},
+        "SessionDisconnect": {"value": 1, "timestamp": "2026-01-01T10:00:00Z"},
+        "UserConnected": {"value": 1, "timestamp": "2026-01-01T10:00:00Z"},
+        "UDPPacketLossRate": {"value": 1.2, "timestamp": "2026-01-01T10:00:00Z"},
+        "TCPRetransmissionRate": {"value": 0.4, "timestamp": "2026-01-01T10:00:00Z"}
+      }
+    },
+    {
+      "region": "us-east-1",
+      "directory_id": "d-0987654321",
+      "workspace_username": "unassigned.directory.user",
+      "workspace": null,
+      "connection": {"ConnectionState": "UNKNOWN"},
+      "registration_status": "not_verifiable",
+      "mfa_directory_status": "not_verifiable",
+      "inactivity_access_status": "not_verifiable",
+      "metrics": {}
+    }
+  ]
+}
