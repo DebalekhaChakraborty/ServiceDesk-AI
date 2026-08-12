@@ -190,6 +190,12 @@ def test_sign_in_evidence_never_creates_an_automatic_remediation_offer(monkeypat
     assert result["account"]["locked"] is None
     assert result["account"]["recommended_action"] == "investigate_sign_in"
     assert result["offer"] is None
+    assert result["next_step"] == {
+        "kind": "sign_in_intake",
+        "question": (
+            "Which application or system is affected, and what exact error is shown?"
+        ),
+    }
     assert context.state[orchestrator.ACCOUNT_ACCESS_OFFER_STATE_KEY] is None
 
 

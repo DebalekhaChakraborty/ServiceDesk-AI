@@ -648,6 +648,9 @@ def test_broad_access_instruction_checks_enabled_and_locked_state_together():
     assert "never convert it" in instruction
     assert "Absence of a sampled 50053 event does not prove" in instruction
     assert "Never offer or execute unlock/password reset automatically" in instruction
+    assert "next_step.kind ==" in instruction
+    assert "ask its next_step.question verbatim" in instruction
+    assert "Do not offer a password reset" in instruction
     assert "re-run authorization and ad_get_account_status" in instruction
 
 

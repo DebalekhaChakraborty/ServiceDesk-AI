@@ -62,6 +62,13 @@ _RECOMMENDATION_TO_ACTION = {
     spec["recommendation"]: action_id for action_id, spec in _ACTION_SPECS.items()
 }
 
+_SIGN_IN_INVESTIGATION_NEXT_STEP = {
+    "kind": "sign_in_intake",
+    "question": (
+        "Which application or system is affected, and what exact error is shown?"
+    ),
+}
+
 
 def _norm_upn(value: Any) -> str:
     return str(value or "").strip().lower()
@@ -483,6 +490,13 @@ def _new_offer(
     return offer
 
 
+def _next_step(account: Dict[str, Any]) -> Optional[Dict[str, str]]:
+    """Return a deterministic non-remediation next step when no action is safe."""
+    if account.get("recommended_action") == "investigate_sign_in":
+        return dict(_SIGN_IN_INVESTIGATION_NEXT_STEP)
+    return None
+
+
 def _diagnose_verified_target(
     target_upn: str,
     tool_context: ToolContext,
@@ -505,6 +519,7 @@ def _diagnose_verified_target(
         verification,
         getattr(tool_context, "invocation_id", None),
     )
+    next_step = _next_step(status["account"])
     return {
         "status": "ok",
         "account": status["account"],
@@ -518,6 +533,7 @@ def _diagnose_verified_target(
             if offer
             else None
         ),
+        "next_step": next_step,
     }
 
 
