@@ -76,7 +76,7 @@ def _workspace_context(
 
 def _metrics(**values):
     result = {
-        spec["key"]: workspaces._metric_unavailable(spec["statistic"])
+        spec["key"]: workspaces._metric_unavailable(spec, lookback_minutes=30)
         for spec in workspaces._METRIC_SPECS.values()
     }
     units = {spec["key"]: spec["unit"] for spec in workspaces._METRIC_SPECS.values()}
@@ -90,6 +90,14 @@ def _metrics(**values):
             "timestamp": "2026-01-01T10:00:00Z",
             "statistic": statistics[key],
             "unit": units[key],
+            "aggregation": next(
+                spec["aggregation"]
+                for spec in workspaces._METRIC_SPECS.values()
+                if spec["key"] == key
+            ),
+            "period_seconds": 300,
+            "lookback_minutes": 30,
+            "datapoints_used": 1,
         }
     return result
 
@@ -183,6 +191,54 @@ def test_mapping_uses_explicit_workspace_username_without_upn_stripping(
         "workspace_username": "DirectoryUser42",
     }
     assert mapping["workspace_username"] != "person"
+
+
+@pytest.mark.parametrize("directory_id", ["d-abcdef12", "wsd-abc12345"])
+def test_mapping_accepts_current_workspaces_directory_id_forms(
+    tmp_path, monkeypatch, directory_id
+):
+    path = tmp_path / "mapping.json"
+    path.write_text(
+        json.dumps(
+            {
+                CALLER_UPN: {
+                    "region": "us-east-1",
+                    "directory_id": directory_id,
+                    "workspace_username": "u" * 63,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("AWS_WORKSPACES_USER_MAP_PATH", str(path))
+
+    mapping, error = workspaces._load_mapping(CALLER_UPN)
+
+    assert error is None
+    assert mapping["directory_id"] == directory_id
+    assert len(mapping["workspace_username"]) == 63
+
+
+def test_mapping_rejects_workspace_username_over_63_characters(tmp_path, monkeypatch):
+    path = tmp_path / "mapping.json"
+    path.write_text(
+        json.dumps(
+            {
+                CALLER_UPN: {
+                    "region": "us-east-1",
+                    "directory_id": "d-abcdef1234",
+                    "workspace_username": "u" * 64,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("AWS_WORKSPACES_USER_MAP_PATH", str(path))
+
+    mapping, error = workspaces._load_mapping(CALLER_UPN)
+
+    assert mapping is None
+    assert error["code"] == "AWS_WORKSPACES_MAPPING_MALFORMED"
 
 
 @pytest.mark.parametrize(
@@ -412,7 +468,7 @@ def test_registration_mismatch_is_normalized_without_returning_code(monkeypatch)
     monkeypatch.setattr(workspaces.win_tool, "execute_winrm_ps", remote)
 
     result = workspaces._registration_check(
-        "aws", context, _context(), "client.example"
+        "aws", context, _context(), "client.example", CALLER_UPN
     )
 
     assert result["status"] == "fail"
@@ -420,6 +476,55 @@ def test_registration_mismatch_is_normalized_without_returning_code(monkeypatch)
     assert "SENSITIVE-REGISTRATION-CODE" not in json.dumps(result)
     remote.assert_called_once()
     assert remote.call_args.args[0] == "client.example"
+
+
+def test_registration_inspection_uses_only_correlated_interactive_local_profile():
+    script = workspaces._registration_inspection_script(
+        "SENSITIVE-REGISTRATION-CODE", CALLER_UPN
+    )
+
+    assert "Win32_ComputerSystem" in script
+    assert "UserName" in script
+    assert "IdentityType]::Sid" in script
+    assert "UserPrincipalName" in script
+    assert "Win32_UserProfile" in script
+    assert "$_.Loaded" in script
+    assert "$_.Special" in script
+    assert "AppData\\Local\\Amazon Web Services\\Amazon WorkSpaces" in script
+    assert "Join-Path $configRoot 'UserSettings.json'" in script
+    assert "Join-Path $configRoot 'RegistrationList.json'" in script
+    assert "$env:LOCALAPPDATA" not in script
+    assert "$env:APPDATA" not in script
+    assert "if ($readFailed) { Write-NotVerifiable }" in script
+
+
+def test_registration_is_not_verifiable_when_profile_correlation_fails(monkeypatch):
+    context = _workspace_context()
+    context["registration_code"] = "SENSITIVE-REGISTRATION-CODE"
+    monkeypatch.setattr(
+        workspaces.aad_tool.aad_get_my_devices,
+        "func",
+        Mock(return_value={"ok": True, "allowed_hosts": ["client.example"]}),
+    )
+    monkeypatch.setattr(
+        workspaces,
+        "check_list",
+        Mock(return_value={"status": "ok", "details": {}}),
+    )
+    remote = Mock(
+        return_value={"status": "success", "stdout": "NOT_VERIFIABLE", "stderr": ""}
+    )
+    monkeypatch.setattr(workspaces.win_tool, "execute_winrm_ps", remote)
+
+    result = workspaces._registration_check(
+        "aws", context, _context(), "client.example", CALLER_UPN
+    )
+
+    assert result["status"] == "not_verifiable"
+    script = remote.call_args.args[1]
+    assert CALLER_UPN in script
+    assert "MISMATCH" in script
+    assert script.index("UserPrincipalName") < script.index("MISMATCH")
 
 
 def test_registration_not_verifiable_without_single_authorized_client(monkeypatch):
@@ -438,7 +543,9 @@ def test_registration_not_verifiable_without_single_authorized_client(monkeypatc
     remote = Mock()
     monkeypatch.setattr(workspaces.win_tool, "execute_winrm_ps", remote)
 
-    result = workspaces._registration_check("aws", context, _context(), "")
+    result = workspaces._registration_check(
+        "aws", context, _context(), "", CALLER_UPN
+    )
 
     assert result["status"] == "not_verifiable"
     assert result["selection_required"] is True
@@ -459,7 +566,9 @@ def test_arbitrary_registration_endpoint_is_never_used(monkeypatch):
     monkeypatch.setattr(workspaces, "check_list", policy)
     monkeypatch.setattr(workspaces.win_tool, "execute_winrm_ps", remote)
 
-    result = workspaces._registration_check("aws", context, _context(), "attacker-host")
+    result = workspaces._registration_check(
+        "aws", context, _context(), "attacker-host", CALLER_UPN
+    )
 
     assert result["status"] == "not_verifiable"
     policy.assert_not_called()
@@ -772,9 +881,95 @@ def test_cloudwatch_get_metric_data_queries_all_required_metrics(monkeypatch):
         == [{"Name": "WorkspaceId", "Value": "ws-1234567890"}]
         for query in call["MetricDataQueries"]
     )
+    assert all(
+        query["MetricStat"]["Period"] == 300
+        for query in call["MetricDataQueries"]
+    )
     assert metrics["in_session_latency_ms"]["value"] == 243.0
+    assert metrics["in_session_latency_ms"]["aggregation"] == "latest_datapoint"
+    assert metrics["in_session_latency_ms"]["datapoints_used"] == 1
     assert metrics["memory_usage_percent"]["status"] == "unavailable"
     assert metrics["memory_usage_percent"]["value"] is None
+
+
+def test_cloudwatch_uses_latest_points_and_aggregates_all_count_buckets(monkeypatch):
+    first = datetime(2026, 1, 1, 10, 0, tzinfo=timezone.utc)
+    second = datetime(2026, 1, 1, 10, 5, tzinfo=timezone.utc)
+    latest = datetime(2026, 1, 1, 10, 10, tzinfo=timezone.utc)
+    client = _FakeCloudWatchClient(
+        [
+            {
+                "Id": "m0",
+                "Values": [100.0, 243.0, 150.0],
+                "Timestamps": [first, latest, second],
+            },
+            {
+                "Id": "m5",
+                "Values": [1.0, 2.0, 3.0],
+                "Timestamps": [latest, second, first],
+            },
+            {"Id": "m6", "Values": [1.0, 1.0], "Timestamps": [latest, second]},
+            {"Id": "m7", "Values": [2.0, 1.0], "Timestamps": [latest, second]},
+            {
+                "Id": "m9",
+                "Values": [1.0, 1.0, 1.0],
+                "Timestamps": [latest, second, first],
+            },
+        ]
+    )
+    monkeypatch.setattr(workspaces, "_boto3_client", lambda service, region: client)
+
+    metrics, error = workspaces._query_cloudwatch_metrics(
+        "us-east-1", "ws-1234567890"
+    )
+
+    assert error is None
+    latency = metrics["in_session_latency_ms"]
+    assert latency["value"] == 243.0
+    assert latency["timestamp"] == "2026-01-01T10:10:00Z"
+    assert latency["aggregation"] == "latest_datapoint"
+    assert latency["datapoints_used"] == 1
+
+    expected_counts = {
+        "connection_attempt_count": (6.0, 3),
+        "connection_success_count": (2.0, 2),
+        "connection_failure_count": (3.0, 2),
+        "session_disconnect_count": (3.0, 3),
+    }
+    for key, (expected_value, expected_points) in expected_counts.items():
+        metric = metrics[key]
+        assert metric["value"] == expected_value
+        assert metric["timestamp"] is None
+        assert metric["aggregation"] == "lookback_window_sum"
+        assert metric["lookback_minutes"] == 30
+        assert metric["period_seconds"] == 300
+        assert metric["datapoints_used"] == expected_points
+        assert metric["window_start"] is not None
+        assert metric["window_end"] is not None
+        assert metric["latest_datapoint_timestamp"] == "2026-01-01T10:10:00Z"
+
+
+def test_only_window_count_metrics_use_lookback_aggregation():
+    count_metrics = {
+        name
+        for name, spec in workspaces._METRIC_SPECS.items()
+        if spec["aggregation"] == "lookback_window_sum"
+    }
+
+    assert count_metrics == {
+        "ConnectionAttempt",
+        "ConnectionSuccess",
+        "ConnectionFailure",
+        "SessionDisconnect",
+    }
+    assert (
+        workspaces._METRIC_SPECS["UserConnected"]["aggregation"]
+        == "latest_datapoint"
+    )
+    assert (
+        workspaces._METRIC_SPECS["SessionLaunchTime"]["aggregation"]
+        == "latest_datapoint"
+    )
 
 
 @pytest.mark.parametrize(

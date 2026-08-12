@@ -40,73 +40,90 @@ VALID_REPORTED_ERROR_CATEGORIES = {
 KB_LATENCY_THRESHOLD_MS = 200.0
 
 _REGION_RE = re.compile(r"^[a-z]{2}(?:-gov)?-[a-z]+-\d$")
-_DIRECTORY_ID_RE = re.compile(r"^d-[A-Za-z0-9-]{6,}$")
+_DIRECTORY_ID_RE = re.compile(r"^(?:d-[0-9a-f]{8,63}|wsd-[0-9a-z]{8,63})$")
+
+_METRIC_PERIOD_SECONDS = 300
+_LATEST_DATAPOINT = "latest_datapoint"
+_LOOKBACK_WINDOW_SUM = "lookback_window_sum"
 
 _METRIC_SPECS: Dict[str, Dict[str, str]] = {
     "InSessionLatency": {
         "key": "in_session_latency_ms",
         "statistic": "Average",
         "unit": "Milliseconds",
+        "aggregation": _LATEST_DATAPOINT,
     },
     "CPUUsage": {
         "key": "cpu_usage_percent",
         "statistic": "Average",
         "unit": "Percent",
+        "aggregation": _LATEST_DATAPOINT,
     },
     "MemoryUsage": {
         "key": "memory_usage_percent",
         "statistic": "Average",
         "unit": "Percent",
+        "aggregation": _LATEST_DATAPOINT,
     },
     "RootVolumeDiskUsage": {
         "key": "root_disk_usage_percent",
         "statistic": "Average",
         "unit": "Percent",
+        "aggregation": _LATEST_DATAPOINT,
     },
     "UserVolumeDiskUsage": {
         "key": "user_disk_usage_percent",
         "statistic": "Average",
         "unit": "Percent",
+        "aggregation": _LATEST_DATAPOINT,
     },
     "ConnectionAttempt": {
         "key": "connection_attempt_count",
         "statistic": "Sum",
         "unit": "Count",
+        "aggregation": _LOOKBACK_WINDOW_SUM,
     },
     "ConnectionSuccess": {
         "key": "connection_success_count",
         "statistic": "Sum",
         "unit": "Count",
+        "aggregation": _LOOKBACK_WINDOW_SUM,
     },
     "ConnectionFailure": {
         "key": "connection_failure_count",
         "statistic": "Sum",
         "unit": "Count",
+        "aggregation": _LOOKBACK_WINDOW_SUM,
     },
     "SessionLaunchTime": {
         "key": "session_launch_time",
         "statistic": "Average",
         "unit": "Seconds",
+        "aggregation": _LATEST_DATAPOINT,
     },
     "SessionDisconnect": {
         "key": "session_disconnect_count",
         "statistic": "Sum",
         "unit": "Count",
+        "aggregation": _LOOKBACK_WINDOW_SUM,
     },
     "UserConnected": {
         "key": "user_connected",
         "statistic": "Maximum",
         "unit": "Count",
+        "aggregation": _LATEST_DATAPOINT,
     },
     "UDPPacketLossRate": {
         "key": "udp_packet_loss_rate",
         "statistic": "Average",
         "unit": "Percent",
+        "aggregation": _LATEST_DATAPOINT,
     },
     "TCPRetransmissionRate": {
         "key": "tcp_retransmission_rate",
         "statistic": "Average",
         "unit": "Percent",
+        "aggregation": _LATEST_DATAPOINT,
     },
 }
 
@@ -156,14 +173,30 @@ def _check(status: str, source: str, evidence: str) -> Dict[str, str]:
     return {"status": status, "source": source, "evidence": evidence}
 
 
-def _metric_unavailable(statistic: str) -> Dict[str, Any]:
-    return {
+def _metric_unavailable(
+    spec: Dict[str, str],
+    *,
+    lookback_minutes: Optional[int] = None,
+    window_start: Optional[datetime] = None,
+    window_end: Optional[datetime] = None,
+) -> Dict[str, Any]:
+    metric = {
         "status": "unavailable",
         "value": None,
         "timestamp": None,
-        "statistic": statistic,
+        "statistic": spec["statistic"],
         "unit": None,
+        "aggregation": spec["aggregation"],
+        "period_seconds": _METRIC_PERIOD_SECONDS,
+        "datapoints_used": 0,
     }
+    if lookback_minutes is not None:
+        metric["lookback_minutes"] = lookback_minutes
+    if spec["aggregation"] == _LOOKBACK_WINDOW_SUM:
+        metric["window_start"] = _iso(window_start)
+        metric["window_end"] = _iso(window_end)
+        metric["latest_datapoint_timestamp"] = None
+    return metric
 
 
 def _lookback_minutes() -> int:
@@ -287,8 +320,9 @@ def _load_mapping(
     if (
         not _REGION_RE.fullmatch(region)
         or not _DIRECTORY_ID_RE.fullmatch(directory_id)
+        or len(directory_id) > 65
         or not workspace_username
-        or len(workspace_username) > 256
+        or len(workspace_username) > 63
         or any(ord(char) < 32 for char in workspace_username)
     ):
         return None, _error(
@@ -621,11 +655,99 @@ def _phase_b_account_checks(
     }
 
 
+def _registration_inspection_script(expected_code: str, caller_upn: str) -> str:
+    escaped_code = expected_code.replace("'", "''")
+    escaped_caller_upn = caller_upn.replace("'", "''")
+    return rf"""
+$expected = '{escaped_code}'
+$expectedCallerUpn = '{escaped_caller_upn}'
+function Write-NotVerifiable {{ Write-Output 'NOT_VERIFIABLE'; exit 0 }}
+
+try {{
+  $computerSystem = Get-CimInstance -ClassName Win32_ComputerSystem -ErrorAction Stop
+  $interactiveAccount = [string]$computerSystem.UserName
+  if ([string]::IsNullOrWhiteSpace($interactiveAccount)) {{ Write-NotVerifiable }}
+
+  $ntAccount = New-Object `
+    -TypeName System.Security.Principal.NTAccount `
+    -ArgumentList $interactiveAccount
+  $sidObject = $ntAccount.Translate([System.Security.Principal.SecurityIdentifier])
+  $sid = [string]$sidObject.Value
+  if ([string]::IsNullOrWhiteSpace($sid)) {{ Write-NotVerifiable }}
+
+  Add-Type -AssemblyName System.DirectoryServices.AccountManagement -ErrorAction Stop
+  $domainContext = New-Object `
+    -TypeName System.DirectoryServices.AccountManagement.PrincipalContext `
+    -ArgumentList ([System.DirectoryServices.AccountManagement.ContextType]::Domain)
+  try {{
+    $principal = [System.DirectoryServices.AccountManagement.UserPrincipal]::FindByIdentity(
+      $domainContext,
+      [System.DirectoryServices.AccountManagement.IdentityType]::Sid,
+      $sid
+    )
+    if ($null -eq $principal -or [string]::IsNullOrWhiteSpace($principal.UserPrincipalName)) {{
+      Write-NotVerifiable
+    }}
+    if (-not [string]::Equals(
+      [string]$principal.UserPrincipalName,
+      $expectedCallerUpn,
+      [System.StringComparison]::OrdinalIgnoreCase
+    )) {{
+      Write-NotVerifiable
+    }}
+  }} finally {{
+    if ($null -ne $principal) {{ $principal.Dispose() }}
+    if ($null -ne $domainContext) {{ $domainContext.Dispose() }}
+  }}
+
+  $profiles = @(
+    Get-CimInstance -ClassName Win32_UserProfile -ErrorAction Stop |
+      Where-Object {{ $_.SID -eq $sid -and $_.Loaded -and -not $_.Special }}
+  )
+  if ($profiles.Count -ne 1) {{ Write-NotVerifiable }}
+  $profileRoot = [string]$profiles[0].LocalPath
+  if ([string]::IsNullOrWhiteSpace($profileRoot)) {{ Write-NotVerifiable }}
+  $profileRoot = [System.IO.Path]::GetFullPath($profileRoot)
+  if (-not (Test-Path -LiteralPath $profileRoot -PathType Container)) {{
+    Write-NotVerifiable
+  }}
+
+  $configRoot = Join-Path $profileRoot 'AppData\Local\Amazon Web Services\Amazon WorkSpaces'
+  $paths = @(
+    (Join-Path $configRoot 'UserSettings.json'),
+    (Join-Path $configRoot 'RegistrationList.json')
+  )
+  $found = $false
+  $matched = $false
+  $readFailed = $false
+  foreach ($path in $paths) {{
+    if (Test-Path -LiteralPath $path -PathType Leaf) {{
+      $found = $true
+      try {{
+        $content = Get-Content -LiteralPath $path -Raw -ErrorAction Stop
+        if ($content.Contains($expected)) {{ $matched = $true }}
+      }} catch {{
+        $readFailed = $true
+      }}
+    }}
+  }}
+  if (-not $found) {{ Write-NotVerifiable }}
+  if ($matched) {{ Write-Output 'VALID'; exit 0 }}
+  if ($readFailed) {{ Write-NotVerifiable }}
+  Write-Output 'MISMATCH'
+  exit 0
+}} catch {{
+  Write-NotVerifiable
+}}
+"""
+
+
 def _registration_check(
     mode: str,
     context: Dict[str, Any],
     tool_context: ToolContext,
     client_endpoint: str,
+    caller_upn: str,
 ) -> Dict[str, Any]:
     workspace = context["workspace"]
     if not workspace.get("assigned"):
@@ -700,29 +822,7 @@ def _registration_check(
             "The authorized client endpoint is not currently reachable and verifiable as Windows.",
         )
 
-    escaped_code = expected_code.replace("'", "''")
-    script = rf"""
-$expected = '{escaped_code}'
-$paths = @(
-  (Join-Path $env:LOCALAPPDATA 'Amazon Web Services\Amazon WorkSpaces\UserSettings.json'),
-  (Join-Path $env:APPDATA 'Amazon Web Services\Amazon WorkSpaces\RegistrationList.json')
-)
-$found = $false
-$matched = $false
-foreach ($path in $paths) {{
-  if (Test-Path -LiteralPath $path) {{
-    $found = $true
-    try {{
-      $content = Get-Content -LiteralPath $path -Raw -ErrorAction Stop
-      if ($content.Contains($expected)) {{ $matched = $true }}
-    }} catch {{}}
-  }}
-}}
-if (-not $found) {{ Write-Output 'NOT_VERIFIABLE'; exit 0 }}
-if ($matched) {{ Write-Output 'VALID'; exit 0 }}
-Write-Output 'MISMATCH'
-exit 0
-"""
+    script = _registration_inspection_script(expected_code, _norm_upn(caller_upn))
     inspected = win_tool.execute_winrm_ps(selected, script)
     output = str(inspected.get("stdout") or "").strip().upper()
     if inspected.get("status") != "success" or output not in {
@@ -936,8 +1036,16 @@ def _query_cloudwatch_metrics(
     region: str,
     workspace_id: str,
 ) -> Tuple[Dict[str, Dict[str, Any]], Optional[Dict[str, str]]]:
+    lookback_minutes = _lookback_minutes()
+    end_time = datetime.now(timezone.utc)
+    start_time = end_time - timedelta(minutes=lookback_minutes)
     metrics = {
-        spec["key"]: _metric_unavailable(spec["statistic"])
+        spec["key"]: _metric_unavailable(
+            spec,
+            lookback_minutes=lookback_minutes,
+            window_start=start_time,
+            window_end=end_time,
+        )
         for spec in _METRIC_SPECS.values()
     }
     try:
@@ -958,14 +1066,12 @@ def _query_cloudwatch_metrics(
                                 {"Name": "WorkspaceId", "Value": workspace_id}
                             ],
                         },
-                        "Period": 300,
+                        "Period": _METRIC_PERIOD_SECONDS,
                         "Stat": spec["statistic"],
                     },
                     "ReturnData": True,
                 }
             )
-        end_time = datetime.now(timezone.utc)
-        start_time = end_time - timedelta(minutes=_lookback_minutes())
         response = _call_aws(
             client,
             "get_metric_data",
@@ -988,19 +1094,45 @@ def _query_cloudwatch_metrics(
             timestamps = result.get("Timestamps") or []
             if not isinstance(values, list) or not isinstance(timestamps, list):
                 continue
-            if not values or not timestamps or isinstance(values[0], bool):
+            points: List[Tuple[float, Any]] = []
+            for raw_value, timestamp in zip(values, timestamps):
+                if isinstance(raw_value, bool) or timestamp is None:
+                    continue
+                try:
+                    points.append((float(raw_value), timestamp))
+                except (TypeError, ValueError):
+                    continue
+            if not points:
                 continue
-            try:
-                value = float(values[0])
-            except (TypeError, ValueError):
-                continue
-            metrics[spec["key"]] = {
+            latest_point = max(points, key=lambda point: _iso(point[1]) or "")
+            metric = {
                 "status": "available",
-                "value": value,
-                "timestamp": _iso(timestamps[0]),
                 "statistic": spec["statistic"],
                 "unit": spec["unit"],
+                "aggregation": spec["aggregation"],
+                "period_seconds": _METRIC_PERIOD_SECONDS,
+                "lookback_minutes": lookback_minutes,
             }
+            if spec["aggregation"] == _LOOKBACK_WINDOW_SUM:
+                metric.update(
+                    {
+                        "value": sum(point[0] for point in points),
+                        "timestamp": None,
+                        "window_start": _iso(start_time),
+                        "window_end": _iso(end_time),
+                        "latest_datapoint_timestamp": _iso(latest_point[1]),
+                        "datapoints_used": len(points),
+                    }
+                )
+            else:
+                metric.update(
+                    {
+                        "value": latest_point[0],
+                        "timestamp": _iso(latest_point[1]),
+                        "datapoints_used": 1,
+                    }
+                )
+            metrics[spec["key"]] = metric
         return metrics, None
     except _AwsCallError as exc:
         return metrics, {
@@ -1013,10 +1145,13 @@ def _demo_metrics(context: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
     raw_metrics = context.get("metrics")
     raw_metrics = raw_metrics if isinstance(raw_metrics, dict) else {}
     metrics: Dict[str, Dict[str, Any]] = {}
+    lookback_minutes = _lookback_minutes()
     for metric_name, spec in _METRIC_SPECS.items():
         raw = raw_metrics.get(metric_name)
         if not isinstance(raw, dict) or raw.get("value") is None:
-            metrics[spec["key"]] = _metric_unavailable(spec["statistic"])
+            metrics[spec["key"]] = _metric_unavailable(
+                spec, lookback_minutes=lookback_minutes
+            )
             continue
         value = raw.get("value")
         if isinstance(value, bool):
@@ -1025,13 +1160,34 @@ def _demo_metrics(context: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
             normalized_value = float(value)
         except (TypeError, ValueError) as exc:
             raise _AwsCallError("AWS_WORKSPACES_DEMO_FIXTURE_MALFORMED") from exc
-        metrics[spec["key"]] = {
+        try:
+            datapoints_used = int(raw.get("datapoints_used") or 1)
+        except (TypeError, ValueError) as exc:
+            raise _AwsCallError("AWS_WORKSPACES_DEMO_FIXTURE_MALFORMED") from exc
+        if datapoints_used < 1:
+            raise _AwsCallError("AWS_WORKSPACES_DEMO_FIXTURE_MALFORMED")
+        metric = {
             "status": "available",
             "value": normalized_value,
-            "timestamp": _iso(raw.get("timestamp")),
             "statistic": spec["statistic"],
             "unit": spec["unit"],
+            "aggregation": spec["aggregation"],
+            "period_seconds": _METRIC_PERIOD_SECONDS,
+            "lookback_minutes": lookback_minutes,
+            "datapoints_used": datapoints_used,
         }
+        if spec["aggregation"] == _LOOKBACK_WINDOW_SUM:
+            metric.update(
+                {
+                    "timestamp": None,
+                    "window_start": _iso(raw.get("window_start")),
+                    "window_end": _iso(raw.get("window_end")),
+                    "latest_datapoint_timestamp": _iso(raw.get("timestamp")),
+                }
+            )
+        else:
+            metric["timestamp"] = _iso(raw.get("timestamp"))
+        metrics[spec["key"]] = metric
     return metrics
 
 
@@ -1112,13 +1268,13 @@ def aws_diagnose_workspace_login(
     category = _normalize_reported_error_category(reported_error_category)
     if category == "not_authorized":
         registration_check = _registration_check(
-            mode, context, tool_context, client_endpoint
+            mode, context, tool_context, client_endpoint, target
         )
         account_checks = _phase_b_account_checks(target, tool_context)
     else:
         account_checks = _phase_b_account_checks(target, tool_context)
         registration_check = _registration_check(
-            mode, context, tool_context, client_endpoint
+            mode, context, tool_context, client_endpoint, target
         )
     workspace_assigned = _check(
         "pass" if workspace.get("assigned") else "fail",
@@ -1185,8 +1341,11 @@ def aws_diagnose_workspace_performance(
         connection = context["connection"]
         metric_error: Optional[Dict[str, str]] = None
         if not workspace.get("assigned"):
+            lookback_minutes = _lookback_minutes()
             metrics = {
-                spec["key"]: _metric_unavailable(spec["statistic"])
+                spec["key"]: _metric_unavailable(
+                    spec, lookback_minutes=lookback_minutes
+                )
                 for spec in _METRIC_SPECS.values()
             }
         elif mode == "demo":
