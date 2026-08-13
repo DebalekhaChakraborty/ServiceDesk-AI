@@ -432,6 +432,36 @@ def test_missing_rdp_telemetry_is_not_zero(monkeypatch):
     assert diagnosis["finding_code"] == "NO_RECENT_RDP_TELEMETRY"
 
 
+def test_inactive_rdp_session_is_distinct_from_missing_telemetry():
+    mapping = {
+        "project_id": "fake-vdi-project",
+        "zone": "us-central1-b",
+        "instance_name": "fake-assigned-vdi",
+        "windows_username": "fakeuser",
+    }
+    snapshot = gcp_tool._load_demo_snapshot(mapping)
+    snapshot["rdp_telemetry"] = {
+        "status": "unavailable",
+        "value": None,
+        "timestamp": "2030-01-01T00:02:00Z",
+        "session_active": False,
+        "session_count": 0,
+        "counter_available": True,
+        "source": "windows_user_input_delay",
+        "reason": "no_active_rdp_session",
+    }
+
+    diagnosis = gcp_tool._performance_diagnosis(
+        "demo", CALLER_UPN, mapping, snapshot
+    )["diagnosis"]
+    telemetry = diagnosis["metrics"]["rdp_user_input_delay_ms"]
+
+    assert telemetry["status"] == "unavailable"
+    assert telemetry["value"] is None
+    assert telemetry["reason"] == "no_active_rdp_session"
+    assert diagnosis["finding_code"] == "NO_ACTIVE_RDP_SESSION"
+
+
 def test_inactive_real_session_zero_is_unavailable_and_preserves_record_time(
     monkeypatch,
 ):

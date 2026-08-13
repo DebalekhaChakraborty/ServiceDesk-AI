@@ -1194,6 +1194,12 @@ def _performance_diagnosis(
     elif disconnect_count >= 2:
         finding = "RDP_RECENT_DISCONNECTS"
         message = "Repeated recent Remote Desktop session disconnects were detected."
+    elif telemetry.get("reason") == "no_active_rdp_session":
+        finding = "NO_ACTIVE_RDP_SESSION"
+        message = (
+            "No active Remote Desktop session is present, so RDP User Input Delay "
+            "cannot be measured."
+        )
     elif telemetry.get("status") != "available":
         finding = "NO_RECENT_RDP_TELEMETRY"
         message = "Recent RDP User Input Delay telemetry is unavailable; it was not treated as zero."
