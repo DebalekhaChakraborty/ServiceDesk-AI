@@ -7,8 +7,10 @@ chat input can never select an arbitrary Compute Engine resource.
 
 from __future__ import annotations
 
-import json
+import asyncio
 import hashlib
+import inspect
+import json
 import os
 import re
 import time
@@ -22,10 +24,9 @@ from urllib.parse import unquote
 from google.adk.tools import FunctionTool, ToolContext
 
 from ..planner.reasoning_composer import propose_plan as _propose_plan
+from .gcp_virtual_desktop_cleanup import execute_system_file_cleanup
 from .policy_tool import check_list as _check_list
 from .sop_retriever import sop_retriever as _sop_retriever
-from .gcp_virtual_desktop_cleanup import execute_system_file_cleanup
-
 
 SUPPORTED_MODES = {"off", "demo", "gcp"}
 IAP_TCP_SOURCE_RANGE = "35.235.240.0/20"
@@ -111,7 +112,7 @@ _ORCHESTRATION_SPECS = {
         "action_id": "gcp.virtual_desktop.system_file_cleanup",
         "tool": "gcp_virtual_desktop_tool",
         "action": "confirm_virtual_desktop_system_file_cleanup",
-        "step": "Run the ServiceDesk GCP shared-workstation System File Cleanup profile after confirmed high session RTT",
+        "step": "Run the ServiceDesk GCP shared-workstation System File Cleanup after confirmed high session RTT",
         "sop_query": "KB screenshot-visible GCP shared-workstation System File Cleanup profile 9144",
     },
 }
@@ -1195,13 +1196,21 @@ def _cleanup_result_public(cleanup: Mapping[str, Any]) -> Dict[str, Any]:
         "backend",
         "transport",
         "selected_categories",
+        "categories",
         "command_exit_code",
         "free_disk_bytes_before",
         "free_disk_bytes_after",
         "bytes_reclaimed",
         "started_at",
         "completed_at",
+        "elapsed_seconds",
+        "interactive_session_id",
+        "worker_pid",
+        "task_logon_type",
+        "task_run_level",
+        "task_run_flags",
         "verification",
+        "message",
     )
     public = {
         field: cleanup.get(field)
@@ -1527,7 +1536,7 @@ def _fresh_performance_diagnosis(
     return _performance_diagnosis(backend, caller_upn, mapping, snapshot)
 
 
-def gcp_confirm_virtual_desktop_system_file_cleanup(
+async def gcp_confirm_virtual_desktop_system_file_cleanup(
     tool_context: ToolContext,
 ) -> Dict[str, Any]:
     """Execute only the retained, confirmed GCP VDI lab-cleanup offer."""
@@ -1604,19 +1613,34 @@ def gcp_confirm_virtual_desktop_system_file_cleanup(
         return orchestration_error
     assert orchestration is not None
 
-    cleanup = execute_system_file_cleanup(mapping, _mode())
+    cleanup_call = execute_system_file_cleanup(
+        mapping,
+        _mode(),
+        str(offer.get("offer_id") or ""),
+    )
+    cleanup = (
+        await cleanup_call if inspect.isawaitable(cleanup_call) else cleanup_call
+    )
     if cleanup.get("status") != "ok":
         state[GCP_VDI_CLEANUP_OFFER_STATE_KEY] = {**offer, "phase": "failed"}
         return {
             "status": "error",
             "code": "GCP_VDI_CLEANUP_FAILED",
-            "message": "The approved lab cleanup did not complete; no performance resolution was claimed.",
+            "message": str(
+                cleanup.get("message")
+                or "System File Cleanup did not complete; no performance resolution was claimed."
+            ),
             "cleanup": _cleanup_result_public(cleanup),
             "orchestration": orchestration,
             "offer_id": offer.get("offer_id"),
         }
 
-    post = _fresh_performance_diagnosis(caller_upn, mapping, _mode())
+    post = await asyncio.to_thread(
+        _fresh_performance_diagnosis,
+        caller_upn,
+        mapping,
+        _mode(),
+    )
     state[GCP_VDI_CLEANUP_OFFER_STATE_KEY] = {
         **offer,
         "phase": "executed",
@@ -1634,13 +1658,18 @@ def gcp_confirm_virtual_desktop_system_file_cleanup(
         },
         "post_cleanup_diagnosis": post,
     }
+    completion_message = (
+        "System File Cleanup completed successfully for the approved cleanup categories."
+    )
     if post.get("status") != "ok":
         response["message"] = (
-            "System File Cleanup completed, but fresh performance telemetry is not available yet."
+            completion_message
+            + " Fresh performance telemetry is not available yet."
         )
     elif post.get("diagnosis", {}).get("finding_code") == "HIGH_SESSION_RTT":
         response["message"] = (
-            "System File Cleanup completed successfully, but the measured RDP round-trip time remains above the 200 ms threshold. The remaining evidence is consistent with a network-path condition, so the next troubleshooting step is to investigate the network/ISP path."
+            completion_message
+            + " The fresh RDP TCP round-trip measurement remains above the 200 ms threshold. This separate observation does not establish that cleanup changed the RTT."
         )
     elif (
         post.get("diagnosis", {})
@@ -1650,11 +1679,13 @@ def gcp_confirm_virtual_desktop_system_file_cleanup(
         != "available"
     ):
         response["message"] = (
-            "System File Cleanup completed, but fresh RDP round-trip telemetry is unavailable; no performance resolution was claimed."
+            completion_message
+            + " Fresh RDP TCP round-trip telemetry is unavailable; no performance resolution was claimed."
         )
     else:
         response["message"] = (
-            "System File Cleanup completed; current RDP round-trip time is no longer above the 200 ms threshold."
+            completion_message
+            + " The fresh RDP TCP round-trip measurement is not above the 200 ms threshold. This separate observation does not establish that cleanup changed the RTT."
         )
     return response
 

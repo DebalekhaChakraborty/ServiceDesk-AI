@@ -12,7 +12,9 @@ $CollectorPath = Join-Path $ServiceDeskRoot "Collect-RdpUserInputDelay.ps1"
 $CounterProbePath = Join-Path $ServiceDeskRoot "Measure-RdpUserInputDelay.ps1"
 $TaskRunnerPath = Join-Path $ServiceDeskRoot "Invoke-RdpTelemetryCollector.ps1"
 $SupervisorPath = Join-Path $ServiceDeskRoot "Run-RdpTelemetryCollector.ps1"
-$CleanupPath = Join-Path $ServiceDeskRoot "Invoke-ServiceDeskVdiLabCleanup.ps1"
+$CleanupPath = Join-Path $ServiceDeskRoot "run_cleanup_9144.ps1"
+$CleanupWorkerSourcePath = Join-Path $ServiceDeskRoot "ServiceDeskFixedCleanup.cs"
+$CleanupWorkerPath = Join-Path $ServiceDeskRoot "ServiceDeskFixedCleanup.exe"
 $CollectorAuditPath = Join-Path $ServiceDeskRoot "rdp_collector_audit.jsonl"
 $CapabilityPath = Join-Path $ServiceDeskRoot "capabilities.json"
 $SetupStatusPath = Join-Path $ServiceDeskRoot "setup_status.json"
@@ -29,10 +31,19 @@ New-Item -Path $ServiceDeskRoot -ItemType Directory -Force | Out-Null
 # user-supplied categories, paths, or commands. The ServiceDesk backend invokes
 # it only through its retained GCP offer controller and the existing private
 # ServiceDesk WinRM HTTPS transport.
-$CleanupScript = @'
+$LegacyCleanupScript = @'
+param(
+    [Parameter(Mandatory = $true)]
+    [string]$InvocationId,
+    [switch]$Controller,
+    [string]$ExpectedUser
+)
+
 $ErrorActionPreference = "Stop"
 $ProfileName = "KB screenshot-visible PoC cleanup profile"
 $ProfileId = 9144
+$WorkerTimeoutMilliseconds = 180000
+$ServiceDeskRoot = "C:\ProgramData\ServiceDeskVDI"
 $VolumeCachesRoot = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\VolumeCaches"
 $StateFlagName = "StateFlags9144"
 $AllowedCategories = @(
@@ -40,14 +51,254 @@ $AllowedCategories = @(
     "Temporary Internet Files"
 )
 
+if ($InvocationId -notmatch "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$") {
+    throw "Invalid controller invocation identifier."
+}
+$ResultPath = Join-Path $ServiceDeskRoot ("cleanup_9144_{0}.json" -f $InvocationId)
+$TaskName = "SystemFileCleanup9144-$InvocationId"
+
+if ($Controller) {
+    function Write-ControllerResult {
+        param([string]$Status, [string]$Code, [string]$Message, $Data)
+        $record = [ordered]@{status=$Status; code=$Code; message=$Message}
+        if ($null -ne $Data) {
+            foreach ($property in $Data.PSObject.Properties) {
+                $record[$property.Name] = $property.Value
+            }
+        }
+        $record | ConvertTo-Json -Compress -Depth 5 | Write-Output
+    }
+    try {
+        if ($ExpectedUser -notmatch "^[A-Za-z0-9_.-]{1,20}$") {
+            Write-ControllerResult "error" "GCP_VDI_CLEANUP_MAPPING_INVALID" "The mapped Windows user is invalid." $null
+            exit 0
+        }
+        $native = @"
+using System;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+public static class ServiceDeskInteractiveSession {
+  enum WTS_CONNECTSTATE_CLASS { Active, Connected, ConnectQuery, Shadow, Disconnected, Idle, Listen, Reset, Down, Init }
+  [StructLayout(LayoutKind.Sequential)] struct WTS_SESSION_INFO { public Int32 SessionID; public IntPtr pWinStationName; public WTS_CONNECTSTATE_CLASS State; }
+  [DllImport("wtsapi32.dll")] static extern bool WTSEnumerateSessions(IntPtr server, int reserved, int version, out IntPtr sessions, out int count);
+  [DllImport("wtsapi32.dll", CharSet=CharSet.Unicode)] static extern bool WTSQuerySessionInformation(IntPtr server, int sessionId, int infoClass, out IntPtr buffer, out int bytes);
+  [DllImport("wtsapi32.dll")] static extern void WTSFreeMemory(IntPtr memory);
+  [DllImport("kernel32.dll")] static extern IntPtr OpenProcess(uint access, bool inherit, int processId);
+  [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr handle);
+  [DllImport("advapi32.dll")] static extern bool OpenProcessToken(IntPtr process, uint access, out IntPtr token);
+  [DllImport("advapi32.dll")] static extern bool GetTokenInformation(IntPtr token, int tokenClass, out int value, int length, out int returned);
+  static string Query(int sessionId, int infoClass) {
+    IntPtr buffer; int bytes;
+    if (!WTSQuerySessionInformation(IntPtr.Zero, sessionId, infoClass, out buffer, out bytes) || buffer == IntPtr.Zero) return "";
+    try { return Marshal.PtrToStringUni(buffer) ?? ""; } finally { WTSFreeMemory(buffer); }
+  }
+  public static string[] ActiveSessions() {
+    IntPtr buffer; int count;
+    if (!WTSEnumerateSessions(IntPtr.Zero, 0, 1, out buffer, out count)) throw new InvalidOperationException("WTSEnumerateSessions failed");
+    var result = new List<string>(); int size = Marshal.SizeOf(typeof(WTS_SESSION_INFO));
+    try {
+      for (int i=0; i<count; i++) {
+        var item = (WTS_SESSION_INFO)Marshal.PtrToStructure(IntPtr.Add(buffer, i*size), typeof(WTS_SESSION_INFO));
+        if (item.State == WTS_CONNECTSTATE_CLASS.Active && item.SessionID > 0) result.Add(item.SessionID + "|" + Query(item.SessionID, 7) + "|" + Query(item.SessionID, 5));
+      }
+    } finally { WTSFreeMemory(buffer); }
+    return result.ToArray();
+  }
+  public static int ElevationType(int processId) {
+    IntPtr process = OpenProcess(0x1000, false, processId); if (process == IntPtr.Zero) return 0;
+    IntPtr token = IntPtr.Zero;
+    try {
+      if (!OpenProcessToken(process, 0x0008, out token)) return 0;
+      int value, returned; return GetTokenInformation(token, 18, out value, 4, out returned) ? value : 0;
+    } finally { if (token != IntPtr.Zero) CloseHandle(token); CloseHandle(process); }
+  }
+}
+"@
+        Add-Type -TypeDefinition $native -Language CSharp
+        $matches = @()
+        foreach ($row in [ServiceDeskInteractiveSession]::ActiveSessions()) {
+            $parts = @($row -split '\|', 3)
+            if ($parts.Count -eq 3 -and $parts[2] -ieq $ExpectedUser) {
+                $matches += [pscustomobject]@{session_id=[int]$parts[0]; domain=$parts[1]; username=$parts[2]}
+            }
+        }
+        if ($matches.Count -eq 0) {
+            Write-ControllerResult "error" "ACTIVE_RDP_SESSION_REQUIRED" "No active Remote Desktop session exists for the mapped user." $null
+            exit 0
+        }
+        if ($matches.Count -ne 1) {
+            Write-ControllerResult "error" "ACTIVE_RDP_SESSION_REQUIRED" "The active mapped user session could not be selected uniquely." $null
+            exit 0
+        }
+        $session = $matches[0]
+        $explorers = @(Get-CimInstance Win32_Process -Filter "Name='explorer.exe'" | Where-Object { $_.SessionId -eq $session.session_id })
+        $ownedExplorer = @($explorers | Where-Object {
+            $owner = Invoke-CimMethod -InputObject $_ -MethodName GetOwner -ErrorAction SilentlyContinue
+            $null -ne $owner -and $owner.ReturnValue -eq 0 -and $owner.User -ieq $ExpectedUser
+        })
+        if ($ownedExplorer.Count -ne 1) {
+            Write-ControllerResult "error" "ACTIVE_RDP_SESSION_REQUIRED" "The mapped user's active interactive shell could not be uniquely verified." $null
+            exit 0
+        }
+        $elevationType = [ServiceDeskInteractiveSession]::ElevationType([int]$ownedExplorer[0].ProcessId)
+        if ($elevationType -ne 2 -and $elevationType -ne 3) {
+            Write-ControllerResult "error" "GCP_VDI_CLEANUP_ACTIVE_USER_PRIVILEGE_REQUIRED" "The active mapped user cannot run System File Cleanup with sufficient privilege." $null
+            exit 0
+        }
+        $principal = if ($session.domain) { "$($session.domain)\$($session.username)" } else { $session.username }
+        $scheduler = New-Object -ComObject "Schedule.Service"
+        $scheduler.Connect()
+        $TaskFolder = "\ServiceDeskVDI"
+        try { $folder = $scheduler.GetFolder($TaskFolder) } catch {
+            $root = $scheduler.GetFolder("\")
+            try { $folder = $root.CreateFolder("ServiceDeskVDI", $null) } catch { $folder = $scheduler.GetFolder($TaskFolder) }
+        }
+        $definition = $scheduler.NewTask(0)
+        $definition.RegistrationInfo.Description = "Fixed ServiceDesk System File Cleanup 9144"
+        $definition.Principal.UserId = $principal
+        $definition.Principal.LogonType = 3
+        $definition.Principal.RunLevel = 1
+        $definition.Settings.Enabled = $true
+        $definition.Settings.AllowDemandStart = $true
+        $definition.Settings.DisallowStartIfOnBatteries = $false
+        $definition.Settings.StopIfGoingOnBatteries = $false
+        $definition.Settings.ExecutionTimeLimit = "PT4M"
+        $action = $definition.Actions.Create(0)
+        $action.Path = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
+        $action.Arguments = '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "C:\ProgramData\ServiceDeskVDI\run_cleanup_9144.ps1" -InvocationId "' + $InvocationId + '"'
+        try {
+            $registered = $folder.RegisterTaskDefinition($TaskName, $definition, 6, $principal, $null, 3, $null)
+        } catch {
+            Write-ControllerResult "error" "CLEANUP_TASK_START_FAILED" "The approved interactive cleanup task could not be registered." $null
+            exit 0
+        }
+        try {
+            $running = $registered.RunEx($null, 4, [int]$session.session_id, $null)
+        } catch {
+            try { $folder.DeleteTask($TaskName, 0) } catch {}
+            Write-ControllerResult "error" "CLEANUP_TASK_START_FAILED" "System File Cleanup could not start in the active mapped user session." $null
+            exit 0
+        }
+        Write-ControllerResult "ok" "GCP_VDI_CLEANUP_TASK_STARTED" "System File Cleanup started." ([pscustomobject]@{
+            invocation_id=$InvocationId
+            task_name=$TaskName
+            task_path=($TaskFolder + "\" + $TaskName)
+            session_id=[int]$session.session_id
+            principal=$principal
+            privilege_available=$true
+            highest_available=$true
+            logon_type=3
+            run_level=1
+            run_flags=4
+            task_instance_guid=[string]$running.InstanceGuid
+            elevation_type=$elevationType
+        })
+    } catch {
+        Write-ControllerResult "error" "GCP_VDI_CLEANUP_CONTROLLER_FAILED" "The interactive cleanup controller failed safely before completion." $null
+    }
+    exit 0
+}
+
 function Get-FreeDiskBytes {
     $drive = Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='C:'" -ErrorAction Stop
     return [int64]$drive.FreeSpace
 }
 
-function Write-CleanupResult {
-    param([hashtable]$Result)
-    $Result | ConvertTo-Json -Compress -Depth 4 | Write-Output
+function Write-CleanupStatus {
+    param([System.Collections.IDictionary]$Result)
+    $temporary = "$ResultPath.tmp.$PID"
+    $Result | ConvertTo-Json -Compress -Depth 6 | Set-Content -LiteralPath $temporary -Encoding UTF8
+    Move-Item -LiteralPath $temporary -Destination $ResultPath -Force
+}
+
+function Get-DescendantProcessIds {
+    param([int]$RootProcessId)
+    $all = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue)
+    $pending = New-Object System.Collections.Generic.Queue[int]
+    $pending.Enqueue($RootProcessId)
+    $found = @()
+    while ($pending.Count -gt 0) {
+        $parent = $pending.Dequeue()
+        foreach ($child in @($all | Where-Object { $_.ParentProcessId -eq $parent })) {
+            $childId = [int]$child.ProcessId
+            if ($found -notcontains $childId) {
+                $found += $childId
+                $pending.Enqueue($childId)
+            }
+        }
+    }
+    return $found
+}
+
+function Stop-CleanupProcessTree {
+    param([int]$RootProcessId)
+    $descendants = @(Get-DescendantProcessIds -RootProcessId $RootProcessId)
+    for ($index = $descendants.Count - 1; $index -ge 0; $index--) {
+        Stop-Process -Id ([int]$descendants[$index]) -Force -ErrorAction SilentlyContinue
+    }
+    Stop-Process -Id $RootProcessId -Force -ErrorAction SilentlyContinue
+}
+
+function Invoke-CompletedCleanmgrUiNudge {
+    param([System.Diagnostics.Process]$Process)
+    try {
+        $Process.Refresh()
+        $windowHandle = $Process.MainWindowHandle
+        if ($windowHandle -eq [IntPtr]::Zero) {
+            return $false
+        }
+        $root = [System.Windows.Automation.AutomationElement]::FromHandle($windowHandle)
+        if ($null -eq $root) {
+            return $false
+        }
+        $condition = New-Object System.Windows.Automation.PropertyCondition(
+            [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+            [System.Windows.Automation.ControlType]::ProgressBar
+        )
+        $bars = $root.FindAll(
+            [System.Windows.Automation.TreeScope]::Descendants,
+            $condition
+        )
+        foreach ($bar in $bars) {
+            $pattern = $null
+            if ($bar.TryGetCurrentPattern(
+                [System.Windows.Automation.RangeValuePattern]::Pattern,
+                [ref]$pattern
+            )) {
+                $current = $pattern.Current
+                if ($current.Maximum -gt $current.Minimum -and $current.Value -ge $current.Maximum) {
+                    [ServiceDeskWindowMessage]::PostMouseMove($windowHandle) | Out-Null
+                    $childHandle = [IntPtr]$bar.Current.NativeWindowHandle
+                    if ($childHandle -ne [IntPtr]::Zero) {
+                        [ServiceDeskWindowMessage]::PostMouseMove($childHandle) | Out-Null
+                    }
+                    return $true
+                }
+            }
+        }
+    }
+    catch {
+        return $false
+    }
+    return $false
+}
+
+function Invoke-CleanmgrThreadNudge {
+    param([System.Diagnostics.Process]$Process)
+    try {
+        $posted = $false
+        $Process.Refresh()
+        foreach ($thread in @($Process.Threads)) {
+            if ([ServiceDeskWindowMessage]::PostThreadMouseMove([uint32]$thread.Id)) {
+                $posted = $true
+            }
+        }
+        [ServiceDeskWindowMessage]::PulseMouseWithoutMovement()
+        return $true
+    }
+    catch {
+        return $false
+    }
 }
 
 $startedAt = (Get-Date).ToUniversalTime().ToString("o")
@@ -55,30 +306,91 @@ $before = $null
 $after = $null
 $selected = @()
 $previousFlags = @()
-$result = @{
-    status = "error"
+$cleanupProcess = $null
+$stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+$uiCompletionNudge = $false
+$uiAutomationAvailable = $false
+$windowMessageAvailable = $false
+$cleanupChildObserved = $false
+$cleanupChildIds = @()
+$idleWindowStartedAt = $null
+$idleWindowCpuSeconds = $null
+$result = [ordered]@{
+    status = "running"
+    phase = "started"
+    code = "SYSTEM_FILE_CLEANUP_STARTING"
+    message = "System File Cleanup is starting."
+    invocation_id = $InvocationId
+    task_name = $TaskName
     profile = $ProfileName
     profile_id = $ProfileId
+    interactive_session_id = [System.Diagnostics.Process]::GetCurrentProcess().SessionId
+    run_as = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+    worker_pid = $PID
+    cleanup_pid = $null
+    cleanup_started_at = $null
+    completion_ui_nudge = $false
+    completion_idle_cpu_rate = $null
+    window_message_available = $false
+    ui_automation_available = $false
+    cleanup_child_observed = $false
+    cleanup_child_pids = @()
     selected_categories = @()
     command_exit_code = $null
     free_disk_bytes_before = $null
     free_disk_bytes_after = $null
     bytes_reclaimed = $null
+    elapsed_seconds = $null
     started_at = $startedAt
     completed_at = $null
+    flags_restored = $false
     verification = "not_completed"
 }
+Write-CleanupStatus $result
 
 try {
+    if ([int]$result.interactive_session_id -le 0) {
+        $result.code = "GCP_VDI_CLEANUP_INTERACTIVE_SESSION_REQUIRED"
+        $result.message = "System File Cleanup was not started in an interactive user session."
+        throw "interactive_session_required"
+    }
     $cleanmgr = Join-Path $env:SystemRoot "System32\cleanmgr.exe"
-    if (-not (Test-Path -LiteralPath $cleanmgr)) {
+    if (-not (Test-Path -LiteralPath $cleanmgr -PathType Leaf)) {
+        $result.code = "GCP_VDI_CLEANUP_NATIVE_TOOL_UNAVAILABLE"
+        $result.message = "Windows Disk Cleanup is not available on the shared workstation."
         $result.verification = "native_disk_cleanup_unavailable"
         throw "native_disk_cleanup_unavailable"
     }
+    try {
+        Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+public static class ServiceDeskWindowMessage {
+  [DllImport("user32.dll", SetLastError=true)] static extern bool PostMessage(IntPtr window, uint message, IntPtr wParam, IntPtr lParam);
+  [DllImport("user32.dll", SetLastError=true)] static extern bool PostThreadMessage(uint threadId, uint message, IntPtr wParam, IntPtr lParam);
+  [DllImport("user32.dll")] static extern void mouse_event(uint flags, uint dx, uint dy, uint data, UIntPtr extraInfo);
+  public static bool PostMouseMove(IntPtr window) { return PostMessage(window, 0x0200, IntPtr.Zero, new IntPtr(0x00010001)); }
+  public static bool PostThreadMouseMove(uint threadId) { return PostThreadMessage(threadId, 0x0200, IntPtr.Zero, new IntPtr(0x00010001)); }
+  public static void PulseMouseWithoutMovement() { mouse_event(0x0001, 0, 0, 0, UIntPtr.Zero); }
+}
+"@ -Language CSharp -ErrorAction Stop
+        $windowMessageAvailable = $true
+        $result.window_message_available = $true
+    }
+    catch {
+        $windowMessageAvailable = $false
+    }
+    try {
+        Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes -ErrorAction Stop
+        $uiAutomationAvailable = $true
+        $result.ui_automation_available = $true
+    }
+    catch {
+        $uiAutomationAvailable = $false
+    }
     $before = Get-FreeDiskBytes
-    # Profile 9144 is ServiceDesk-owned. Snapshot and clear its flag from every
-    # installed handler first so an unrelated pre-existing handler cannot be
-    # selected accidentally. Other StateFlags profiles are never touched.
+    # Profile 9144 is ServiceDesk-owned. Snapshot and clear only this profile's
+    # flag from every installed handler before selecting the fixed allowlist.
     foreach ($handler in @(Get-ChildItem -LiteralPath $VolumeCachesRoot -ErrorAction Stop)) {
         $path = $handler.PSPath
         $existing = Get-ItemProperty -LiteralPath $path -Name $StateFlagName -ErrorAction SilentlyContinue
@@ -94,53 +406,172 @@ try {
         }
     }
     if ($selected.Count -eq 0) {
+        $result.code = "GCP_VDI_CLEANUP_NO_APPROVED_CATEGORY_AVAILABLE"
+        $result.message = "No approved Windows Disk Cleanup category is available on the shared workstation."
         $result.verification = "no_approved_native_categories_available"
         throw "no_approved_native_categories_available"
     }
-    $process = Start-Process -FilePath $cleanmgr -ArgumentList "/sagerun:9144" -PassThru
-    if (-not $process.WaitForExit(600000)) {
-        Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+    $result.selected_categories = @($selected)
+    $result.free_disk_bytes_before = $before
+    $cleanupProcess = Start-Process -FilePath $cleanmgr -ArgumentList "/sagerun:9144" -PassThru
+    $result.cleanup_pid = [int]$cleanupProcess.Id
+    $result.cleanup_started_at = (Get-Date).ToUniversalTime().ToString("o")
+    $result.phase = "running"
+    $result.code = "SYSTEM_FILE_CLEANUP_RUNNING"
+    $result.message = "System File Cleanup is running."
+    Write-CleanupStatus $result
+    $cleanupProcess.Refresh()
+    $idleWindowStartedAt = (Get-Date).ToUniversalTime()
+    $idleWindowCpuSeconds = $cleanupProcess.TotalProcessorTime.TotalSeconds
+    $cleanupDeadline = (Get-Date).ToUniversalTime().AddMilliseconds($WorkerTimeoutMilliseconds)
+    while (-not $cleanupProcess.HasExited -and (Get-Date).ToUniversalTime() -lt $cleanupDeadline) {
+        $currentChildIds = @(Get-DescendantProcessIds -RootProcessId ([int]$cleanupProcess.Id))
+        if ($currentChildIds.Count -gt 0) {
+            $cleanupChildObserved = $true
+            foreach ($childId in $currentChildIds) {
+                if ($cleanupChildIds -notcontains [int]$childId) {
+                    $cleanupChildIds += [int]$childId
+                }
+            }
+            $result.cleanup_child_observed = $true
+            $result.cleanup_child_pids = @($cleanupChildIds)
+        }
+        $cleanupProcess.Refresh()
+        $currentCpuSeconds = $cleanupProcess.TotalProcessorTime.TotalSeconds
+        $now = (Get-Date).ToUniversalTime()
+        if ($currentChildIds.Count -gt 0) {
+            $idleWindowStartedAt = $now
+            $idleWindowCpuSeconds = $currentCpuSeconds
+        }
+        if ($uiAutomationAvailable -and -not $uiCompletionNudge) {
+            $uiCompletionNudge = Invoke-CompletedCleanmgrUiNudge -Process $cleanupProcess
+            if ($uiCompletionNudge) {
+                $result.completion_ui_nudge = $true
+                Write-CleanupStatus $result
+            }
+        }
+        $childCompleted = $cleanupChildObserved -and $currentChildIds.Count -eq 0
+        $idleCompletionCandidate = $false
+        $idleWindowSeconds = ($now - $idleWindowStartedAt).TotalSeconds
+        if ($currentChildIds.Count -eq 0 -and $stopwatch.Elapsed.TotalSeconds -ge 15 -and $idleWindowSeconds -ge 5) {
+            $cpuRate = ($currentCpuSeconds - $idleWindowCpuSeconds) / $idleWindowSeconds
+            $result.completion_idle_cpu_rate = [math]::Round($cpuRate, 4)
+            $idleCompletionCandidate = $cpuRate -le 0.05
+            $idleWindowStartedAt = $now
+            $idleWindowCpuSeconds = $currentCpuSeconds
+        }
+        if ($windowMessageAvailable -and -not $uiCompletionNudge -and ($childCompleted -or $idleCompletionCandidate)) {
+            $uiCompletionNudge = Invoke-CleanmgrThreadNudge -Process $cleanupProcess
+            if ($uiCompletionNudge) {
+                $result.completion_ui_nudge = $true
+                Write-CleanupStatus $result
+            }
+        }
+        if (-not $cleanupProcess.HasExited) {
+            Start-Sleep -Milliseconds 500
+            $cleanupProcess.Refresh()
+        }
+    }
+    if (-not $cleanupProcess.HasExited) {
+        Stop-CleanupProcessTree -RootProcessId ([int]$cleanupProcess.Id)
+        $result.status = "error"
+        $result.phase = "timed_out"
+        $result.code = "SYSTEM_FILE_CLEANUP_TIMED_OUT"
+        $result.message = "System File Cleanup exceeded its safe execution time and was stopped."
         $result.verification = "native_disk_cleanup_timeout"
         throw "native_disk_cleanup_timeout"
     }
-    $result.command_exit_code = [int]$process.ExitCode
-    if ($process.ExitCode -ne 0) {
+    $result.command_exit_code = [int]$cleanupProcess.ExitCode
+    if ($cleanupProcess.ExitCode -ne 0) {
+        $result.code = "SYSTEM_FILE_CLEANUP_FAILED"
+        $result.message = "Windows Disk Cleanup returned an error."
         $result.verification = "native_disk_cleanup_failed"
         throw "native_disk_cleanup_failed"
     }
     $after = Get-FreeDiskBytes
     $result.status = "ok"
-    $result.selected_categories = $selected
-    $result.free_disk_bytes_before = $before
+    $result.phase = "completed"
+    $result.code = "SYSTEM_FILE_CLEANUP_COMPLETED"
+    $result.message = "System File Cleanup completed successfully."
     $result.free_disk_bytes_after = $after
     $result.bytes_reclaimed = [int64]($after - $before)
     $result.verification = "native_disk_cleanup_completed"
 }
 catch {
+    if ($result.phase -ne "timed_out") {
+        $result.status = "error"
+        $result.phase = "failed"
+    }
     if ($result.verification -eq "not_completed") {
+        $result.code = "SYSTEM_FILE_CLEANUP_FAILED"
+        $result.message = "System File Cleanup failed safely before completion."
         $result.verification = "native_disk_cleanup_error"
     }
 }
 finally {
+    $restoreSucceeded = $true
     foreach ($previous in $previousFlags) {
-        if ($previous.exists) {
-            New-ItemProperty -LiteralPath $previous.path -Name $StateFlagName -PropertyType DWord -Value ([int]$previous.value) -Force | Out-Null
+        try {
+            if ($previous.exists) {
+                New-ItemProperty -LiteralPath $previous.path -Name $StateFlagName -PropertyType DWord -Value ([int]$previous.value) -Force | Out-Null
+            }
+            else {
+                Remove-ItemProperty -LiteralPath $previous.path -Name $StateFlagName -ErrorAction SilentlyContinue
+            }
         }
-        else {
-            Remove-ItemProperty -LiteralPath $previous.path -Name $StateFlagName -ErrorAction SilentlyContinue
+        catch {
+            $restoreSucceeded = $false
         }
     }
-    $result.selected_categories = $selected
+    $result.flags_restored = $restoreSucceeded
+    if (-not $restoreSucceeded) {
+        $result.status = "error"
+        $result.phase = "failed"
+        $result.code = "GCP_VDI_CLEANUP_PROFILE_RESTORE_FAILED"
+        $result.message = "System File Cleanup finished, but its temporary profile flags could not be fully restored."
+        $result.verification = "cleanup_profile_restore_failed"
+    }
+    $result.selected_categories = @($selected)
     $result.free_disk_bytes_before = $before
+    if ($null -ne $before -and $null -eq $after) {
+        try { $after = Get-FreeDiskBytes } catch {}
+    }
     $result.free_disk_bytes_after = $after
     if ($null -ne $before -and $null -ne $after) {
         $result.bytes_reclaimed = [int64]($after - $before)
     }
     $result.completed_at = (Get-Date).ToUniversalTime().ToString("o")
-    Write-CleanupResult $result
+    $stopwatch.Stop()
+    $result.elapsed_seconds = [math]::Round($stopwatch.Elapsed.TotalSeconds, 3)
+    Write-CleanupStatus $result
 }
 '@
-Set-Content -Path $CleanupPath -Value $CleanupScript -Encoding UTF8
+# The legacy cleanmgr-based prototype above is intentionally not installed or
+# invoked. The active deterministic worker is maintained as reviewed repository
+# assets so the model can never supply a URL, path, filter, command, or category.
+$CleanupControllerAsset = Join-Path $PSScriptRoot "run_cleanup_9144.ps1"
+$CleanupWorkerAsset = Join-Path $PSScriptRoot "ServiceDeskFixedCleanup.cs"
+if (-not (Test-Path -LiteralPath $CleanupControllerAsset -PathType Leaf) -or
+    -not (Test-Path -LiteralPath $CleanupWorkerAsset -PathType Leaf)) {
+    throw "Fixed System File Cleanup assets are unavailable."
+}
+Set-Content -Path $CleanupPath -Value (Get-Content -LiteralPath $CleanupControllerAsset -Raw) -Encoding UTF8
+Set-Content -Path $CleanupWorkerSourcePath -Value (Get-Content -LiteralPath $CleanupWorkerAsset -Raw) -Encoding UTF8
+$CompilerPath = Join-Path $env:WINDIR "Microsoft.NET\Framework64\v4.0.30319\csc.exe"
+if (-not (Test-Path -LiteralPath $CompilerPath -PathType Leaf)) {
+    throw "The fixed System File Cleanup compiler is unavailable."
+}
+$Compiler = Start-Process -FilePath $CompilerPath -ArgumentList @(
+    "/nologo",
+    "/target:exe",
+    "/platform:x64",
+    "/optimize+",
+    "/out:`"$CleanupWorkerPath`"",
+    "`"$CleanupWorkerSourcePath`""
+) -Wait -PassThru -NoNewWindow
+if ($Compiler.ExitCode -ne 0 -or -not (Test-Path -LiteralPath $CleanupWorkerPath -PathType Leaf)) {
+    throw "The fixed System File Cleanup worker could not be compiled."
+}
 
 function Write-SetupStatus {
     param(

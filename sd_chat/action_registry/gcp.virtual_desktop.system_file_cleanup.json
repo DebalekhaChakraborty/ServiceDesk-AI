@@ -1,7 +1,7 @@
 {
   "id": "gcp.virtual_desktop.system_file_cleanup",
-  "title": "Run the ServiceDesk GCP shared-workstation System File Cleanup profile after confirmed high session RTT",
-  "description": "Run the KB screenshot-visible PoC cleanup profile only for the authenticated caller's bound shared workstation after a retained HIGH_SESSION_RTT offer is confirmed.",
+  "title": "Run the ServiceDesk GCP shared-workstation System File Cleanup after confirmed high session RTT",
+  "description": "Clean only Downloaded Program Files and Temporary Internet Files for the authenticated caller's bound shared workstation after a retained HIGH_SESSION_RTT offer is confirmed.",
   "inputs": [],
   "outputs": ["cleanup.status", "cleanup.verification"],
   "preconditions": ["shared_workstation_cleanup_is_authorized"],

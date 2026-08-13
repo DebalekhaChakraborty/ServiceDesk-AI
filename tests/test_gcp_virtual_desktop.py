@@ -1,12 +1,13 @@
+import asyncio
 import inspect
 import json
 import os
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
-
 
 os.environ.setdefault("WINRM_PORT", "5986")
 
@@ -15,7 +16,6 @@ from sd_chat.planner import reasoning_composer
 from sd_chat.tools import gcp_virtual_desktop_cleanup as cleanup_tool
 from sd_chat.tools import gcp_virtual_desktop_tool as gcp_tool
 from sd_chat.tools import policy_tool
-
 
 CALLER_UPN = "fake.caller@example.test"
 
@@ -137,7 +137,9 @@ def _performance(tool_context=None):
 
 
 def _cleanup(tool_context):
-    return gcp_tool.gcp_confirm_virtual_desktop_system_file_cleanup.func(tool_context)
+    return asyncio.run(
+        gcp_tool.gcp_confirm_virtual_desktop_system_file_cleanup.func(tool_context)
+    )
 
 
 @pytest.mark.parametrize(
@@ -503,14 +505,14 @@ def test_public_cleanup_result_hides_internal_profile_name_and_id():
             "profile": "internal KB profile name",
             "profile_id": 9144,
             "command_exit_code": 0,
-            "verification": "native_disk_cleanup_completed",
+            "verification": "deterministic_fixed_cleanup_completed",
         }
     )
 
     assert public == {
         "status": "ok",
         "command_exit_code": 0,
-        "verification": "native_disk_cleanup_completed",
+        "verification": "deterministic_fixed_cleanup_completed",
         "action": "System File Cleanup",
     }
     assert "KB" not in json.dumps(public)
@@ -533,6 +535,10 @@ def test_cleanup_requires_later_confirmation_and_checks_policy_once(monkeypatch)
     result = _cleanup(context)
 
     assert result["status"] == "ok"
+    assert result["message"].startswith(
+        "System File Cleanup completed successfully for the approved cleanup categories."
+    )
+    assert "does not establish that cleanup changed the RTT" in result["message"]
     cleanup.assert_called_once()
     assert policy.call_count == 1
     assert policy.call_args.kwargs["preconditions"] == [
@@ -697,45 +703,106 @@ def test_cleanup_failure_and_missing_post_telemetry_never_claim_resolution(monke
 def test_real_cleanup_reuses_existing_winrm_with_controller_owned_private_host(
     monkeypatch,
 ):
+    offer_id = "35a621ba-198b-4f4e-a448-8684fc1f1b22"
     mapping = {
         "project_id": "fake-vdi-project",
         "zone": "us-central1-b",
         "instance_name": "fake-assigned-vdi",
+        "windows_username": "fakeuser",
     }
     monkeypatch.setattr(
         cleanup_tool,
         "_resolve_private_target",
         lambda value: "10.0.0.8",
     )
-    execute = Mock(
-        return_value={
+    monkeypatch.setattr(cleanup_tool, "_POLL_INTERVAL_SECONDS", 0)
+
+    def execute(_host, script):
+        if "-Controller" in script:
+            payload = {
+                "status": "ok",
+                "code": "GCP_VDI_CLEANUP_TASK_STARTED",
+                "invocation_id": offer_id,
+                "task_name": f"SystemFileCleanup9144-{offer_id}",
+                "session_id": 2,
+                "principal": r"LAB\fakeuser",
+                "privilege_available": True,
+                "highest_available": True,
+                "logon_type": 3,
+                "run_level": 1,
+                "run_flags": 4,
+            }
+        elif "$record = $null" in script:
+            payload = {
+                "status": "ok",
+                "code": "GCP_VDI_CLEANUP_STATUS",
+                "invocation_id": offer_id,
+                "record": {
+                    "status": "ok",
+                    "phase": "completed",
+                    "code": "SYSTEM_FILE_CLEANUP_COMPLETED",
+                    "invocation_id": offer_id,
+                    "task_name": f"SystemFileCleanup9144-{offer_id}",
+                    "interactive_session_id": 2,
+                    "run_as": r"LAB\fakeuser",
+                    "worker_pid": 4242,
+                    "selected_categories": [
+                        "Downloaded Program Files",
+                        "Temporary Internet Files",
+                    ],
+                    "categories": {
+                        "Downloaded Program Files": {
+                            "status": "COMPLETED_NO_ELIGIBLE_ITEMS",
+                            "before_count": 0,
+                            "before_bytes": 0,
+                            "deleted_count": 0,
+                            "failed_or_locked_count": 0,
+                            "remaining_target_count": 0,
+                        },
+                        "Temporary Internet Files": {
+                            "status": "COMPLETED",
+                            "before_count": 4,
+                            "before_bytes": 822,
+                            "deleted_count": 4,
+                            "failed_or_locked_count": 0,
+                            "remaining_target_count": 0,
+                            "cookies_deleted": 0,
+                            "history_deleted": 0,
+                        },
+                    },
+                    "command_exit_code": 0,
+                    "verification": "deterministic_fixed_cleanup_completed",
+                },
+            }
+        else:
+            payload = {
+                "status": "ok",
+                "code": "GCP_VDI_CLEANUP_TASK_REMOVED",
+            }
+        return {
             "status": "success",
             "code": 0,
-            "stdout": json.dumps(
-                    {
-                        "status": "ok",
-                        "profile": "KB screenshot-visible PoC cleanup profile",
-                        "profile_id": 9144,
-                        "selected_categories": ["Temporary Internet Files"],
-                        "command_exit_code": 0,
-                        "verification": "native_disk_cleanup_completed",
-                }
-            ),
+            "stdout": json.dumps(payload),
             "stderr": "",
         }
-    )
+
+    execute = Mock(side_effect=execute)
     monkeypatch.setattr(cleanup_tool.win_tool, "execute_winrm_ps", execute)
 
-    result = cleanup_tool.execute_system_file_cleanup(mapping, "gcp")
+    result = asyncio.run(
+        cleanup_tool.execute_system_file_cleanup(mapping, "gcp", offer_id)
+    )
 
     assert result["status"] == "ok"
     assert result["transport"] == "private_winrm"
-    assert result["profile_id"] == 9144
-    execute.assert_called_once()
-    target_host, script = execute.call_args.args
-    assert target_host == "10.0.0.8"
-    assert "Invoke-ServiceDeskVdiLabCleanup.ps1" in script
-    assert "gcloud" not in script.lower()
+    assert result["categories"]["Temporary Internet Files"]["deleted_count"] == 4
+    assert execute.call_count == 3
+    assert {call.args[0] for call in execute.call_args_list} == {"10.0.0.8"}
+    prepare_script = execute.call_args_list[0].args[1]
+    assert "run_cleanup_9144.ps1" in prepare_script
+    assert "-Controller" in prepare_script
+    assert len(prepare_script.encode()) < 2048
+    assert "gcloud" not in prepare_script.lower()
 
 
 def test_cleanup_transport_has_no_second_remote_execution_framework():
@@ -746,6 +813,194 @@ def test_cleanup_transport_has_no_second_remote_execution_framework():
     assert "tunnel-through-iap" not in source
     assert "metadata" not in source.lower()
     assert "scheduled remediation" not in source.lower()
+
+
+def test_cleanup_task_is_bound_to_one_windows_discovered_active_session():
+    script = Path("scripts/run_cleanup_9144.ps1").read_text(
+        encoding="utf-8"
+    )
+
+    assert "WTSEnumerateSessions" in script
+    assert "WTS_CONNECTSTATE_CLASS.Active" in script
+    assert "item.SessionID > 0" in script
+    assert '$parts[2] -ieq $ExpectedUser' in script
+    assert "$matches.Count -ne 1" in script
+    assert script.count('"ACTIVE_RDP_SESSION_REQUIRED"') == 2
+    assert "GetOwner" in script
+    assert "$owner.User -ieq $ExpectedUser" in script
+    assert "ElevationType" in script
+    assert "GCP_VDI_CLEANUP_ACTIVE_USER_PRIVILEGE_REQUIRED" in script
+
+
+def test_cleanup_task_has_only_fixed_interactive_action_and_internal_session_id():
+    offer_id = "35a621ba-198b-4f4e-a448-8684fc1f1b22"
+    script = Path("scripts/run_cleanup_9144.ps1").read_text(
+        encoding="utf-8"
+    )
+    prepare_script = cleanup_tool._prepare_task_script(offer_id, "fakeuser")
+
+    assert f'InvocationId "{offer_id}"' in prepare_script
+    assert cleanup_tool._GUEST_SCRIPT in prepare_script
+    assert "-Controller" in prepare_script
+    assert "RunEx" not in prepare_script
+    assert "SystemFileCleanup9144-$InvocationId" in script
+    assert '"ServiceDeskFixedCleanup.exe"' in script
+    assert "$definition.Principal.LogonType = 3" in script
+    assert "$definition.Principal.RunLevel = 1" in script
+    assert '$definition.Settings.ExecutionTimeLimit = "PT2M"' in script
+    assert "$definition.Triggers.Create" not in script
+    assert "$registered.RunEx($null, 4, [int]$session.session_id, $null)" in script
+    assert '$action.Path = $CleanupWorkerPath' in script
+    assert "--invocation" in script
+    assert "--result" in script
+    assert "--url" not in script
+    assert "--path" not in script
+    assert "--filter" not in script
+    assert "session_id" not in inspect.signature(
+        cleanup_tool.execute_system_file_cleanup
+    ).parameters
+    assert "command" not in inspect.signature(
+        cleanup_tool.execute_system_file_cleanup
+    ).parameters
+
+
+def test_cleanup_rejects_untrusted_inputs_before_winrm(monkeypatch):
+    execute = Mock()
+    monkeypatch.setattr(cleanup_tool.win_tool, "execute_winrm_ps", execute)
+    mapping = {
+        "project_id": "fake-vdi-project",
+        "zone": "us-central1-b",
+        "instance_name": "fake-assigned-vdi",
+        "windows_username": "fakeuser; Invoke-Expression bad",
+    }
+
+    bad_user = asyncio.run(
+        cleanup_tool.execute_system_file_cleanup(
+            mapping, "gcp", "35a621ba-198b-4f4e-a448-8684fc1f1b22"
+        )
+    )
+    bad_offer = asyncio.run(
+        cleanup_tool.execute_system_file_cleanup(
+            {**mapping, "windows_username": "fakeuser"}, "gcp", "chat-supplied-task"
+        )
+    )
+
+    assert bad_user["code"] == "GCP_VDI_CLEANUP_MAPPING_INVALID"
+    assert bad_offer["code"] == "GCP_VDI_CLEANUP_OFFER_INVALID"
+    execute.assert_not_called()
+
+
+def test_cleanup_failure_is_structured_and_temporary_task_is_deleted(monkeypatch):
+    offer_id = "35a621ba-198b-4f4e-a448-8684fc1f1b22"
+    mapping = {
+        "project_id": "fake-vdi-project",
+        "zone": "us-central1-b",
+        "instance_name": "fake-assigned-vdi",
+        "windows_username": "fakeuser",
+    }
+    monkeypatch.setattr(cleanup_tool, "_resolve_private_target", lambda _: "10.0.0.8")
+    monkeypatch.setattr(cleanup_tool, "_POLL_INTERVAL_SECONDS", 0)
+    calls = []
+
+    def execute(_host, script):
+        calls.append(script)
+        if "-Controller" in script:
+            payload = {
+                "status": "ok",
+                "invocation_id": offer_id,
+                "task_name": f"SystemFileCleanup9144-{offer_id}",
+                "session_id": 2,
+                "privilege_available": True,
+                "highest_available": True,
+                "logon_type": 3,
+                "run_level": 1,
+                "run_flags": 4,
+            }
+        elif "$record = $null" in script:
+            payload = {
+                "status": "ok",
+                "invocation_id": offer_id,
+                "record": {
+                    "invocation_id": offer_id,
+                    "phase": "failed",
+                    "code": "SYSTEM_FILE_CLEANUP_FAILED",
+                    "message": "Windows Disk Cleanup returned an error.",
+                },
+            }
+        else:
+            payload = {"status": "ok"}
+        return {"status": "success", "stdout": json.dumps(payload), "stderr": ""}
+
+    monkeypatch.setattr(cleanup_tool.win_tool, "execute_winrm_ps", execute)
+    result = asyncio.run(
+        cleanup_tool.execute_system_file_cleanup(mapping, "gcp", offer_id)
+    )
+
+    assert result == {
+        "status": "error",
+        "code": "SYSTEM_FILE_CLEANUP_FAILED",
+        "message": "Windows Disk Cleanup returned an error.",
+    }
+    assert 'DeleteTask($TaskName, 0)' in calls[-1]
+    assert "$Cancel = $false" in calls[-1]
+
+
+def test_cleanup_controller_timeout_is_bounded_and_cancels_only_bound_task(
+    monkeypatch,
+):
+    offer_id = "35a621ba-198b-4f4e-a448-8684fc1f1b22"
+    mapping = {
+        "project_id": "fake-vdi-project",
+        "zone": "us-central1-b",
+        "instance_name": "fake-assigned-vdi",
+        "windows_username": "fakeuser",
+    }
+    monkeypatch.setattr(cleanup_tool, "_resolve_private_target", lambda _: "10.0.0.8")
+    monotonic = Mock(side_effect=[0.0, 211.0])
+    monkeypatch.setattr(cleanup_tool, "_monotonic", monotonic)
+    calls = []
+
+    def execute(_host, script):
+        calls.append(script)
+        payload = {
+            "status": "ok",
+            "invocation_id": offer_id,
+            "task_name": f"SystemFileCleanup9144-{offer_id}",
+            "session_id": 2,
+            "privilege_available": True,
+            "highest_available": True,
+            "logon_type": 3,
+            "run_level": 1,
+            "run_flags": 4,
+        }
+        return {"status": "success", "stdout": json.dumps(payload), "stderr": ""}
+
+    monkeypatch.setattr(cleanup_tool.win_tool, "execute_winrm_ps", execute)
+    result = asyncio.run(
+        cleanup_tool.execute_system_file_cleanup(mapping, "gcp", offer_id)
+    )
+
+    assert result["code"] == "SYSTEM_FILE_CLEANUP_TIMED_OUT"
+    assert "$Cancel = $true" in calls[-1]
+    assert f'$TaskName = "SystemFileCleanup9144-{offer_id}"' in calls[-1]
+    assert 'DeleteTask($TaskName, 0)' in calls[-1]
+
+
+def test_private_winrm_call_does_not_block_async_controller(monkeypatch):
+    def blocking_call(_host, _script):
+        time.sleep(0.08)
+        return {"status": "success", "stdout": ""}
+
+    monkeypatch.setattr(cleanup_tool.win_tool, "execute_winrm_ps", blocking_call)
+
+    async def exercise():
+        running = asyncio.create_task(cleanup_tool._winrm_call("10.0.0.8", "fixed"))
+        await asyncio.sleep(0.01)
+        responsive_while_running = not running.done()
+        await running
+        return responsive_while_running
+
+    assert asyncio.run(exercise()) is True
 
 
 @pytest.mark.parametrize("address", ["203.0.113.8", "127.0.0.1", "169.254.1.2"])
@@ -1604,20 +1859,41 @@ def test_windows_bootstrap_proves_one_window_and_registers_recurring_task():
     assert "ScheduledSampleDeadline" not in script
 
 
-def test_windows_cleanup_uses_only_customer_visible_profile_9144_categories():
-    script = Path("scripts/configure_gcp_vdi_windows.ps1").read_text(encoding="utf-8")
-    cleanup_script = script.split("$CleanupScript = @'", 1)[1].split("'@", 1)[0]
+def test_windows_cleanup_uses_only_two_fixed_customer_visible_categories():
+    controller = Path("scripts/run_cleanup_9144.ps1").read_text(encoding="utf-8")
+    worker = Path("scripts/ServiceDeskFixedCleanup.cs").read_text(encoding="utf-8")
+    bootstrap = Path("scripts/configure_gcp_vdi_windows.ps1").read_text(
+        encoding="utf-8"
+    )
 
-    assert '$ProfileName = "KB screenshot-visible PoC cleanup profile"' in cleanup_script
-    assert "$ProfileId = 9144" in cleanup_script
-    assert '$StateFlagName = "StateFlags9144"' in cleanup_script
-    assert '"Downloaded Program Files"' in cleanup_script
-    assert '"Temporary Internet Files"' in cleanup_script
-    assert '"Delivery Optimization Files"' not in cleanup_script
-    assert '"DirectX Shader Cache"' not in cleanup_script
-    assert 'ArgumentList "/sagerun:9144"' in cleanup_script
-    assert "StateFlags0017" not in cleanup_script
-    assert "/sagerun:19144" not in cleanup_script
+    assert '"Downloaded Program Files"' in worker
+    assert '"Temporary Internet Files"' in worker
+    assert "Path.Combine(windows, DownloadedProgramFilesCategory)" in worker
+    assert "SearchOption.TopDirectoryOnly" in worker
+    assert "DownloadedProgramExtensions" in worker
+    assert "FindFirstUrlCacheEntryW" in worker
+    assert "FindNextUrlCacheEntryW" in worker
+    assert "DeleteUrlCacheEntryW" in worker
+    assert "NormalCacheEntry" in worker
+    assert "CookieCacheEntry" in worker
+    assert "UrlHistoryCacheEntry" in worker
+    assert "StickyCacheEntry" in worker
+    assert "EditedCacheEntry" in worker
+    assert '"cookies_deleted\\\":0' in worker
+    assert '"history_deleted\\\":0' in worker
+    assert "COMPLETED_NO_ELIGIBLE_ITEMS" in worker
+    assert "ServiceDeskFixedCleanup.exe" in controller
+    assert "$CleanupWorkerAsset" in bootstrap
+    assert "$CompilerPath" in bootstrap
+    for forbidden in (
+        "cleanmgr.exe",
+        "DISM.exe",
+        "DismHost",
+        "IEmptyVolumeCache",
+        "IEmptyVolumeCache2",
+    ):
+        assert forbidden not in controller
+        assert forbidden not in worker
 
 
 def test_windows_bootstrap_captures_existing_task_truth_before_replacement():

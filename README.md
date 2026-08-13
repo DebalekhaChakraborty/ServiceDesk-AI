@@ -187,25 +187,28 @@ that diagnosis is read-only, an inactive RDP session has no User Input Delay val
 and inconclusive evidence requires escalation rather than automatic password reset
 or infrastructure remediation.
 
-### KB screenshot-visible PoC cleanup
+### Governed System File Cleanup
 
 When genuine RDP TCP RTT is strictly greater than 200 ms, the performance
-controller creates a ten-minute, caller- and mapping-bound offer for the
-**KB screenshot-visible PoC cleanup profile**. A later confirmation invokes one
+controller creates a ten-minute, caller- and mapping-bound System File Cleanup
+offer. A later confirmation invokes one
 GCP-specific controller; it revalidates the mapping, retrieves its SOP, requires
 the exact `gcp.virtual_desktop.system_file_cleanup` planner action, runs
 `check_list` once, and collects fresh evidence. It never uses generic
 `cleanup_temp_files`.
 
-The guest script uses native Windows Disk Cleanup only when it is installed and
-only with profile ID `9144`, using `StateFlags9144` and `/sagerun:9144`. The only
-authorized categories are `Downloaded Program Files` and `Temporary Internet
-Files`; all other handlers have profile 9144 cleared during execution and their
-prior profile-9144 values are restored afterward. It is not
-the customer's complete production cleanup policy. It never targets user folders,
+The fixed guest worker runs in the mapped user's verified interactive session and
+accepts only its controller-owned invocation and result paths. Its customer-visible
+scope is exactly `Downloaded Program Files` and `Temporary Internet Files`.
+Temporary Internet Files cleanup enumerates WinINet content entries and deletes
+only eligible `NORMAL_CACHE_ENTRY` URLs; cookie, history, sticky, and edited cache
+entries are excluded. Downloaded Program Files inspection is non-recursive and
+limited to legacy ActiveX/Java payloads in the dedicated Windows folder. No eligible
+items is a successful category result. The worker does not invoke Disk Cleanup,
+DISM, or the `IEmptyVolumeCache` COM interfaces. It never targets user folders,
 browser profiles, Outlook data, SCCM content, networking, domain membership, or
 Windows services. The controller resolves the mapped VM's Compute Engine private
-IP and invokes the fixed script through the existing ServiceDesk
+IP and invokes the fixed controller through the existing ServiceDesk
 `win_tool.execute_winrm_ps` transport and `WINRM_*` runtime identity. The model
 supplies neither the host nor PowerShell. No second transport, public IP, public
 RDP, or public WinRM is added.
