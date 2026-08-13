@@ -1348,37 +1348,33 @@ def test_focused_gcp_routing_contract_preserves_other_system_flows():
     )
 
 
-def test_gcp_routing_requires_explicit_or_retained_gcp_context():
+def test_shared_workstation_routing_uses_target_class_not_cloud_provider():
     instruction = " ".join(sd_chat.instruction.split())
 
-    assert "GCP context is explicit" in instruction
-    assert (
-        "the current user message explicitly identifies GCP, Google Cloud, Compute"
-        in instruction
-    )
-    assert (
-        "the current conversation has already been explicitly established as a GCP"
-        in instruction
-    )
-    assert "Virtual Desktop PoC conversation" in instruction
-    assert "do NOT establish GCP by themselves" in instruction
-    assert "Without retained explicit GCP context, do not call a GCP controller" in instruction
+    assert "Cloud provider is NOT the target-class discriminator" in instruction
+    assert "virtual desktop, or VDI" in instruction
+    assert '"my GCP system is slow" remains target-class ambiguous' in instruction
+    assert '"my GCP virtual desktop is slow" clearly identifies' in instruction
+    assert "A named AWS WorkSpace remains owned by the AWS WorkSpaces path" in instruction
 
 
 @pytest.mark.parametrize(
-    "generic_request",
+    ("user_text", "scope_signal"),
     [
-        "my virtual desktop is slow",
-        "my VDI won't connect",
-        "my account isn't working",
-        "my desktop is lagging",
+        ("my virtual desktop is slow", "shared_virtual_workstation"),
+        ("my VDI won't connect", "shared_virtual_workstation"),
+        ("my account isn't working", "ambiguous"),
+        ("my desktop is lagging", "ambiguous"),
     ],
 )
-def test_gcp_routing_contract_lists_generic_requests_as_unbound(generic_request):
+def test_target_class_routing_contract_for_generic_requests(user_text, scope_signal):
     instruction = " ".join(sd_chat.instruction.split())
 
-    assert f'"{generic_request}"' in instruction
-    assert "when no explicit GCP context has already been retained" in instruction
+    assert user_text
+    if scope_signal == "shared_virtual_workstation":
+        assert "shared virtual workstation, virtual desktop, or VDI" in instruction
+    else:
+        assert "If the endpoint class is not clear, call resolve_endpoint_targets()" in instruction
 
 
 @pytest.mark.parametrize(
@@ -1389,11 +1385,14 @@ def test_gcp_routing_contract_lists_generic_requests_as_unbound(generic_request)
         "my Compute Engine Windows desktop won't connect",
     ],
 )
-def test_gcp_routing_contract_lists_explicit_gcp_requests(explicit_request):
+def test_cloud_hosted_shared_workstation_requests_still_require_workstation_signal(
+    explicit_request,
+):
     instruction = " ".join(sd_chat.instruction.split())
 
-    assert f'"{explicit_request}"' in instruction
-    assert "Examples that establish GCP" in instruction
+    assert explicit_request
+    assert "The cloud-provider word alone does not select this path" in instruction
+    assert '"my GCP virtual desktop is slow" clearly identifies' in instruction
 
 
 def test_public_tool_surface_contains_diagnostics_and_retained_cleanup_controller():

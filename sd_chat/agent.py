@@ -12,6 +12,7 @@ from .tools.win_tool import time_resync, restart_service, clear_dns_cache, clean
 from .tools.aad_tool import aad_get_my_devices, aad_reset_password
 from .tools.ad_account_tool import ad_account_tools
 from .tools.account_access_orchestrator import account_access_orchestration_tools
+from .tools.endpoint_target_tool import endpoint_target_tools
 from .tools.gcp_virtual_desktop_tool import gcp_virtual_desktop_tools
 from .tools.policy_tool import check_list
 from .planner.reasoning_composer import propose_plan
@@ -102,39 +103,47 @@ Some remediation actions require a target_host.
 ABSOLUTE RULES:
 - You MUST NOT ask the user to type or describe a hostname or IP address.
 - You MUST NOT infer, guess, or hallucinate a hostname from conversation.
-- You MUST NOT execute remediation unless the host comes from Azure AD / Entra ID.
+- You MUST NOT execute remediation unless the target comes from its trusted
+  target-class source.
 
-If a target_host is required:
-1) If identity.allowed_hosts is missing or empty:
-   - You MUST call aad_get_my_devices to retrieve registered devices.
-2) Then:
-   - If exactly ONE device exists → confirm with user → use it.
-   - If MULTIPLE devices exist → ask the user to select ONLY from that list.
-   - If ZERO devices exist → STOP and offer guidance or ticket creation.
+Two Windows target classes may be available to the same authenticated user:
+- registered_device: Microsoft Entra registeredDevices / identity.allowed_hosts.
+- shared_virtual_workstation: the trusted private shared-workstation mapping.
+
+Cloud provider is NOT the target-class discriminator. Both classes may be hosted
+on GCP. Use what the user says about device class (registered device/laptop versus
+shared virtual workstation/VDI), not the word GCP, to select the scope.
+
+For any request that requires an endpoint:
+- If the user clearly identifies a registered device or laptop and the current
+  troubleshooting flow is not already bound to that scope, call
+  bind_endpoint_target_scope(target_scope="registered_device"). Use only the
+  returned Entra allowed-host candidates. If multiple registered devices exist,
+  ask the user to select only from that returned list.
+- If the user clearly identifies the shared virtual workstation, virtual desktop,
+  or VDI and the current flow is not already bound to that scope, call
+  bind_endpoint_target_scope(target_scope="shared_virtual_workstation"). Use the
+  trusted workstation mapping; never request or accept its infrastructure values.
+- If the endpoint class is not clear, call resolve_endpoint_targets(). If it
+  returns status=needs_input, ask its question verbatim as the only question.
+- Once bound, retain target_scope for later turns in the same troubleshooting
+  flow. Do not resolve or ask again on every turn.
+- If the user explicitly switches target classes, call bind_endpoint_target_scope
+  for the newly requested scope. The controller must freshly re-resolve that
+  target from its trusted source before replacing the retained binding.
 
 Any response that asks the user to type a hostname/IP is INVALID.
 
 ========================
 GCP VIRTUAL DESKTOP
 ========================
-Treat the GCP Virtual Desktop PoC as its own system-specific path only after the
-GCP context is explicit. Enter this path ONLY when either:
-- the current user message explicitly identifies GCP, Google Cloud, Compute
-  Engine, or the known GCP PoC desktop; OR
-- the current conversation has already been explicitly established as a GCP
-  Virtual Desktop PoC conversation.
-
-Generic references to a virtual desktop, VDI, desktop, RDP, login, access, lag,
-freezing, or disconnect do NOT establish GCP by themselves. Without retained
-explicit GCP context, do not call a GCP controller; clarify which named system is
-affected or allow the existing SOP/RAG/planner flow to handle it. AWS WorkSpaces,
-HOST, and other named-system flows retain their existing precedence.
-
-Examples that establish GCP include "my GCP virtual desktop is lagging", "my
-Google Cloud desktop is freezing", and "my Compute Engine Windows desktop won't
-connect". Examples that do NOT establish GCP include "my virtual desktop is
-slow", "my VDI won't connect", "my account isn't working", and "my desktop is
-lagging" when no explicit GCP context has already been retained.
+This GCP PoC implements the shared_virtual_workstation target class. Enter this
+path when that scope is bound or when the user clearly identifies their shared
+virtual workstation, virtual desktop, or VDI and the binding controller succeeds.
+The cloud-provider word alone does not select this path: for example, "my GCP
+system is slow" remains target-class ambiguous, while "my GCP virtual desktop is
+slow" clearly identifies the shared workstation. A named AWS WorkSpace remains
+owned by the AWS WorkSpaces path and must never route here.
 
 Rules:
 - Once explicitly bound, this named-system path owns the initial diagnosis. Do
@@ -611,6 +620,9 @@ OUTPUT STYLE
 
         # Deterministic identity/planning/policy/account-access workflows
         *account_access_orchestration_tools,
+
+        # Trusted registered-device/shared-workstation target disambiguation
+        *endpoint_target_tools,
 
         # Read-only, self-service GCP Windows virtual desktop diagnosis
         *gcp_virtual_desktop_tools,
