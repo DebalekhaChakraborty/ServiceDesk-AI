@@ -476,6 +476,9 @@ def test_cleanup_offer_is_created_only_for_high_session_rtt(
 
     assert bool(result["cleanup_offer"]) is has_offer
     if has_offer:
+        assert result["cleanup_offer"]["action"] == "System File Cleanup"
+        assert "profile" not in result["cleanup_offer"]
+        assert "KB" not in json.dumps(result["cleanup_offer"])
         offer = context.state[gcp_tool.GCP_VDI_CLEANUP_OFFER_STATE_KEY]
         assert offer["caller_upn"] == CALLER_UPN
         assert offer["target_scope"] == "shared_virtual_workstation"
@@ -491,6 +494,26 @@ def test_cleanup_offer_is_created_only_for_high_session_rtt(
         assert offer["evidence_timestamp"]
         assert offer["expires_at"] - offer["created_at"] == 600
         assert offer["offer_id"]
+
+
+def test_public_cleanup_result_hides_internal_profile_name_and_id():
+    public = gcp_tool._cleanup_result_public(
+        {
+            "status": "ok",
+            "profile": "internal KB profile name",
+            "profile_id": 9144,
+            "command_exit_code": 0,
+            "verification": "native_disk_cleanup_completed",
+        }
+    )
+
+    assert public == {
+        "status": "ok",
+        "command_exit_code": 0,
+        "verification": "native_disk_cleanup_completed",
+        "action": "System File Cleanup",
+    }
+    assert "KB" not in json.dumps(public)
 
 
 def test_cleanup_requires_later_confirmation_and_checks_policy_once(monkeypatch):

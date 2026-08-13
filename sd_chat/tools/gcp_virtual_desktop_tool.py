@@ -1183,8 +1183,33 @@ def _cleanup_offer_public(offer: Mapping[str, Any]) -> Dict[str, Any]:
         "offer_id": offer.get("offer_id"),
         "action_id": offer.get("action_id"),
         "expires_at": offer.get("expires_at"),
-        "profile": "KB screenshot-visible PoC cleanup profile",
+        "action": "System File Cleanup",
     }
+
+
+def _cleanup_result_public(cleanup: Mapping[str, Any]) -> Dict[str, Any]:
+    """Return bounded cleanup evidence without exposing its internal profile label."""
+    allowed_fields = (
+        "status",
+        "code",
+        "backend",
+        "transport",
+        "selected_categories",
+        "command_exit_code",
+        "free_disk_bytes_before",
+        "free_disk_bytes_after",
+        "bytes_reclaimed",
+        "started_at",
+        "completed_at",
+        "verification",
+    )
+    public = {
+        field: cleanup.get(field)
+        for field in allowed_fields
+        if field in cleanup
+    }
+    public["action"] = "System File Cleanup"
+    return public
 
 
 def _create_cleanup_offer(
@@ -1586,7 +1611,7 @@ def gcp_confirm_virtual_desktop_system_file_cleanup(
             "status": "error",
             "code": "GCP_VDI_CLEANUP_FAILED",
             "message": "The approved lab cleanup did not complete; no performance resolution was claimed.",
-            "cleanup": cleanup,
+            "cleanup": _cleanup_result_public(cleanup),
             "orchestration": orchestration,
             "offer_id": offer.get("offer_id"),
         }
@@ -1599,7 +1624,7 @@ def gcp_confirm_virtual_desktop_system_file_cleanup(
     }
     response: Dict[str, Any] = {
         "status": "ok",
-        "cleanup": cleanup,
+        "cleanup": _cleanup_result_public(cleanup),
         "orchestration": orchestration,
         "offer_id": offer.get("offer_id"),
         "pre_cleanup_evidence": {

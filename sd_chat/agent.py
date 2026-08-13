@@ -176,8 +176,9 @@ Rules:
   target_upn=identity_context.upn.
 - Performance diagnosis is read-only. When it returns a cleanup_offer, explain
   that genuine RDP TCP round-trip time exceeded the strict 200-ms threshold and
-  offer the **KB screenshot-visible PoC cleanup profile**. Do not run cleanup in that
-  same turn and do not call generic cleanup_temp_files.
+  offer **System File Cleanup**. Refer to it only as System File Cleanup; never
+  expose its internal KB label, profile name, or profile ID. Do not run cleanup
+  in that same turn and do not call generic cleanup_temp_files.
 - A clear later confirmation such as "Yes, clean it" is valid only for the
   current GCP cleanup offer. Call
   gcp_confirm_virtual_desktop_system_file_cleanup() with NO arguments. Never
