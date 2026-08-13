@@ -99,36 +99,46 @@ never falls back to demo success.
 
 ### Evidence and threshold
 
-Host CPU, memory, disk, and network are observations from Cloud Monitoring. VM
-running duration is calculated from Compute Engine's `last_start_timestamp`, not
+Host CPU, memory, disk, and network are observations from Cloud Monitoring. The
+Compute Engine received/sent byte counters are DELTA metrics: the result labels
+them `aggregation=latest_delta`, includes their observed 60-second period, and
+does not call them bandwidth, throughput, or a lookback-window total. VM running
+duration is calculated from Compute Engine's `last_start_timestamp`, not
 misreported from a latest 60-second uptime-delta bucket.
 Windows and RDP session events plus `servicedesk_rdp_telemetry` come from Cloud
 Logging through Google Ops Agent. Missing evidence remains unavailable rather than
 becoming zero.
 
-After startup, a one-minute repeating scheduled task runs one bounded 30-second
-collector window and then exits. `IgnoreNew` prevents parallel collectors. The
-task is registered only after a synchronous one-window validation completes, so
-its first trigger cannot overlap startup validation. Windows may defer scheduled
-work until metadata startup exits, so recurring cycles are verified afterward in
-the identity-free Cloud Logging audit rather than from inside the startup job. The
-first run is scheduled 30 seconds after registration and repeats every minute. The
-trigger and VM have a three-hour safety boundary, and every collector child is
-independently capped at 45 seconds. This does not depend on a new Windows logon,
-so reconnecting an existing RDP session remains observable. With no active session,
-the collector publishes capability/session state without querying the session
-counter; the real counter is sampled at one-second resolution only while a session
-is active. Each native session/counter read runs in its own 2.5-second bounded child
-and is terminated as a process tree if Windows session query or PDH stalls. The probe
-emits only a session count and numeric delay. Counter-set discovery occurs once during
-startup; recurring collectors read the validated capability flag instead of repeating
-an unbounded native discovery.
+The bootstrap validates one bounded 30-second collector window synchronously and
+then registers a one-minute repeating task. `IgnoreNew` is intended to prevent
+parallel collectors, and every collector child is capped at 45 seconds. The task's
+first trigger is scheduled 30 seconds after registration and its repetition plus
+the VM have a three-hour safety boundary.
+
+**Recurring scheduled User Input Delay collection is not yet live-validated.**
+Real validation has proved the synchronous startup sample and task registration,
+but it has not yet proved a later scheduled execution. Registration and unit tests
+are not evidence that recurring collection is working. Until a post-registration
+task run, successful/understood `LastTaskResult`, corresponding audit cycle, fresh
+Cloud Logging record, and active-session counter value are all observed, recurring
+User Input Delay must be treated as unavailable.
+
+With no active session, the collector publishes capability/session state without
+querying the session counter. Each native session/counter read runs in its own
+2.5-second bounded child and is terminated as a process tree if Windows session
+query or PDH stalls. Wildcard counter-set discovery occurs only once during
+bootstrap; the validated `User Input Delay per Session` path is persisted locally
+and reused by the child probes. A probe identifies active `rdp-tcp` session IDs
+from Windows session state and selects only matching numeric counter instances.
+Those IDs are used only in process memory and are never written to telemetry or
+audit output. The probe emits no user or session identity.
 The collector records only timestamp, active-session count, counter availability, and
 maximum **RDP User Input Delay**. It does not record usernames, keystrokes, clipboard
 content, credentials, or user input. User Input Delay is queued Windows application
 input responsiveness, not network RTT or AWS WorkSpaces `InSessionLatency`.
-The collector's bounded execution audit records only timestamps, start/completion
-phase, and exit code; it contains no user or session identity.
+The collector's bounded execution audit records timestamps, phases, exit codes,
+and sanitized ServiceDesk task metadata. Unexpected action/principal values are
+redacted. It contains no user or session identity.
 
 The only explicit PoC performance boundary is:
 
@@ -146,6 +156,11 @@ The PoC bootstrap must not modify domain membership, SCCM services/configuration
 endpoint-management policy, DNS, Windows firewall, registered devices, or existing
 test data. Its in-guest footprint is limited to Google Ops Agent configuration and
 the separate `C:\ProgramData\ServiceDeskVDI` telemetry collector/scheduled task.
+Before the bootstrap first changes Ops Agent user configuration, it makes a
+rollback-safe backup. It updates the file only when it is empty, exactly matches
+the legacy ServiceDesk configuration, or exactly matches the ServiceDesk-owned
+snapshot. An unrelated or subsequently modified user configuration is preserved
+and causes a safe stop requiring an explicit merge; it is never overwritten.
 
 ### Cost and lifecycle
 

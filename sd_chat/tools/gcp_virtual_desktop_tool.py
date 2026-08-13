@@ -55,9 +55,13 @@ _METRIC_SPECS = {
     },
     "network_received_bytes": {
         "type": "compute.googleapis.com/instance/network/received_bytes_count",
+        "aggregation": "latest_delta",
+        "observation_period_seconds": 60,
     },
     "network_sent_bytes": {
         "type": "compute.googleapis.com/instance/network/sent_bytes_count",
+        "aggregation": "latest_delta",
+        "observation_period_seconds": 60,
     },
 }
 
@@ -65,6 +69,9 @@ _AUTH_FAILURE_EVENT_IDS = {4625}
 _DISCONNECT_EVENT_IDS = {24, 40, 4779}
 _SESSION_EVENT_IDS = {21, 22, 23, 24, 25, 40, 1149, 4778, 4779}
 _SESSION_ACTIVE_EVENT_IDS = {21, 22, 25, 4778}
+_SESSION_STATE_EVENT_IDS = _SESSION_ACTIVE_EVENT_IDS | _DISCONNECT_EVENT_IDS
+_DISCONNECT_CORRELATION_WINDOW_SECONDS = 5.0
+_DISCONNECT_FALLBACK_WINDOW_SECONDS = 2.0
 _SECURITY_CHANNEL = "Security"
 _LSM_CHANNEL = "Microsoft-Windows-TerminalServices-LocalSessionManager/Operational"
 _RCM_CHANNEL = "Microsoft-Windows-TerminalServices-RemoteConnectionManager/Operational"
@@ -394,7 +401,7 @@ def _metric_observation(
     monitoring_client: Any,
     project_id: str,
     instance_id: str,
-    spec: Mapping[str, str],
+    spec: Mapping[str, Any],
     start_time: datetime,
     end_time: datetime,
 ) -> Dict[str, Any]:
@@ -413,28 +420,58 @@ def _metric_observation(
         "interval": {"start_time": start_time, "end_time": end_time},
         "view": 0,
     }
-    candidates: List[Tuple[float, Optional[str]]] = []
+    candidates: List[Tuple[float, Optional[str], Optional[float]]] = []
     for series in monitoring_client.list_time_series(request=request):
         for point in list(getattr(series, "points", []) or [])[:1]:
             value = _point_value(point)
-            timestamp = _iso_timestamp(
-                getattr(getattr(point, "interval", None), "end_time", None)
-            )
+            interval = getattr(point, "interval", None)
+            timestamp = _iso_timestamp(getattr(interval, "end_time", None))
+            interval_start = _parse_timestamp(getattr(interval, "start_time", None))
+            interval_end = _parse_timestamp(getattr(interval, "end_time", None))
+            observation_period_seconds = None
+            if interval_start is not None and interval_end is not None:
+                interval_seconds = (interval_end - interval_start).total_seconds()
+                if interval_seconds > 0:
+                    observation_period_seconds = interval_seconds
             if value is not None:
-                candidates.append((value, timestamp))
+                candidates.append((value, timestamp, observation_period_seconds))
 
     if not candidates:
         return _unavailable()
     if spec.get("select") == "max":
-        value, timestamp = max(candidates, key=lambda candidate: candidate[0])
+        value, timestamp, observation_period_seconds = max(
+            candidates, key=lambda candidate: candidate[0]
+        )
     else:
-        value, timestamp = candidates[0]
-    return {
+        value, timestamp, observation_period_seconds = max(
+            candidates,
+            key=lambda candidate: (
+                _parse_timestamp(candidate[1])
+                or datetime.min.replace(tzinfo=timezone.utc)
+            ),
+        )
+    observation = {
         "status": "available",
         "value": value,
         "timestamp": timestamp,
         "metric_type": metric_type,
     }
+    if spec.get("aggregation") == "latest_delta":
+        documented_period = int(spec.get("observation_period_seconds", 60))
+        if (
+            observation_period_seconds is None
+            or abs(observation_period_seconds - documented_period) < 1.0
+        ):
+            observation_period_seconds = documented_period
+        observation.update(
+            {
+                "aggregation": "latest_delta",
+                "observation_period_seconds": observation_period_seconds
+                or documented_period,
+                "unit": "bytes",
+            }
+        )
+    return observation
 
 
 def _collect_metrics(
@@ -566,6 +603,102 @@ def _is_relevant_rdp_event(event_id: int, channel: str) -> bool:
             normalized_channel == _RCM_CHANNEL.casefold()
             and event_id in _RCM_RDP_EVENT_IDS
         )
+    )
+
+
+def _event_correlation_key(payload: Any) -> Optional[str]:
+    for name in ("activityid", "relatedactivityid"):
+        value = _find_payload_value(payload, {name})
+        normalized = str(value or "").strip().casefold()
+        if normalized and normalized not in {
+            "00000000-0000-0000-0000-000000000000",
+            "{00000000-0000-0000-0000-000000000000}",
+        }:
+            return normalized
+    return None
+
+
+def _disconnect_episode_count(events: Iterable[Mapping[str, Any]]) -> int:
+    disconnects = []
+    for event in events:
+        if event.get("category") != "disconnect":
+            continue
+        event_time = _parse_timestamp(event.get("timestamp"))
+        if event_time is None:
+            continue
+        disconnects.append((event_time, event))
+    disconnects.sort(key=lambda item: item[0])
+
+    episodes: List[Dict[str, Any]] = []
+    for event_time, event in disconnects:
+        correlation = str(event.get("_correlation") or "")
+        event_id = _as_int(event.get("event_id"))
+        matched = None
+        for episode in reversed(episodes):
+            elapsed = (event_time - episode["last_time"]).total_seconds()
+            if elapsed > _DISCONNECT_CORRELATION_WINDOW_SECONDS:
+                break
+            same_correlation = bool(
+                correlation and correlation in episode["correlations"]
+            )
+            cross_event_fallback = (
+                (not correlation or not episode["correlations"])
+                and elapsed <= _DISCONNECT_FALLBACK_WINDOW_SECONDS
+                and event_id is not None
+                and event_id not in episode["event_ids"]
+            )
+            if same_correlation or cross_event_fallback:
+                matched = episode
+                break
+        if matched is None:
+            matched = {
+                "last_time": event_time,
+                "correlations": set(),
+                "event_ids": set(),
+            }
+            episodes.append(matched)
+        matched["last_time"] = event_time
+        if correlation:
+            matched["correlations"].add(correlation)
+        if event_id is not None:
+            matched["event_ids"].add(event_id)
+    return len(episodes)
+
+
+def _reconcile_telemetry_session_state(
+    telemetry: Dict[str, Any],
+    events: Iterable[Mapping[str, Any]],
+) -> None:
+    telemetry_observed_at = _parse_timestamp(telemetry.get("timestamp"))
+    if telemetry_observed_at is None:
+        return
+    subsequent_state_events = [
+        (event_time, event)
+        for event in events
+        if event.get("event_id") in _SESSION_STATE_EVENT_IDS
+        and (event_time := _parse_timestamp(event.get("timestamp"))) is not None
+        and event_time > telemetry_observed_at
+    ]
+    if not subsequent_state_events:
+        return
+
+    # Telemetry intentionally contains no session identifier, so it cannot be
+    # correlated safely after any newer per-session state transition. The latest
+    # event is folded only to establish that the sample was superseded; it is not
+    # used to claim a global active/inactive state on a potentially multi-session
+    # host.
+    latest_category = str(
+        max(subsequent_state_events, key=lambda item: item[0])[1].get("category")
+        or "unknown"
+    )
+    telemetry.update(
+        {
+            "status": "unavailable",
+            "value": None,
+            "session_active": None,
+            "session_count": None,
+            "reason": f"session_state_changed_after_sample_latest_{latest_category}",
+        }
     )
 
 
@@ -721,31 +854,12 @@ def _collect_logs(
                     "event_id": event_id,
                     "channel": channel,
                     "category": category,
+                    "_correlation": _event_correlation_key(payload),
                 }
             )
     except Exception:
         errors.append("rdp_event_query_failed")
-
-    telemetry_observed_at = _parse_timestamp(telemetry.get("timestamp"))
-    if (
-        telemetry.get("reason") == "no_active_rdp_session"
-        and telemetry_observed_at is not None
-        and any(
-            event.get("event_id") in _SESSION_ACTIVE_EVENT_IDS
-            and (event_time := _parse_timestamp(event.get("timestamp"))) is not None
-            and event_time > telemetry_observed_at
-            for event in events
-        )
-    ):
-        telemetry.update(
-            {
-                "status": "unavailable",
-                "value": None,
-                "session_active": None,
-                "session_count": None,
-                "reason": "negative_session_sample_superseded_by_newer_rdp_event",
-            }
-        )
+    _reconcile_telemetry_session_state(telemetry, events)
     return telemetry, events, errors
 
 
@@ -973,11 +1087,14 @@ def _login_diagnosis(
         if isinstance(snapshot.get("instance"), Mapping)
         else {}
     )
+    raw_events = [
+        event for event in (snapshot.get("events") or []) if isinstance(event, Mapping)
+    ]
     events = _safe_events(snapshot)
     auth_failures = [
         event for event in events if event.get("category") == "authentication_failure"
     ]
-    disconnects = [event for event in events if event.get("category") == "disconnect"]
+    disconnect_count = _disconnect_episode_count(raw_events)
     telemetry = snapshot.get("rdp_telemetry")
     telemetry = telemetry if isinstance(telemetry, Mapping) else _unavailable()
     rdp_evidence_available = bool(events or telemetry.get("timestamp"))
@@ -991,7 +1108,7 @@ def _login_diagnosis(
     elif auth_failures:
         finding = "RDP_AUTH_FAILURE_DETECTED"
         message = "A recent Remote Desktop authentication failure was detected."
-    elif disconnects:
+    elif disconnect_count:
         finding = "RDP_RECENT_DISCONNECT"
         message = "A recent Remote Desktop session disconnect was detected."
     elif not rdp_evidence_available:
@@ -1008,7 +1125,7 @@ def _login_diagnosis(
             "rdp_telemetry": dict(telemetry),
             "recent_rdp_events": events,
             "recent_auth_failure_count": len(auth_failures),
-            "recent_disconnect_count": len(disconnects),
+            "recent_disconnect_count": disconnect_count,
             "telemetry_latest_timestamp": _latest_timestamp(snapshot),
             "access": snapshot.get("network_access") or {"status": "unavailable"},
             "collection_limitations": list(snapshot.get("collection_errors") or []),
@@ -1031,8 +1148,11 @@ def _performance_diagnosis(
         if isinstance(snapshot.get("instance"), Mapping)
         else {}
     )
+    raw_events = [
+        event for event in (snapshot.get("events") or []) if isinstance(event, Mapping)
+    ]
     events = _safe_events(snapshot)
-    disconnects = [event for event in events if event.get("category") == "disconnect"]
+    disconnect_count = _disconnect_episode_count(raw_events)
     telemetry = snapshot.get("rdp_telemetry")
     telemetry = dict(telemetry) if isinstance(telemetry, Mapping) else _unavailable()
     metrics = dict(snapshot.get("metrics") or {})
@@ -1051,7 +1171,7 @@ def _performance_diagnosis(
     ):
         finding = "RDP_USER_INPUT_DELAY_ELEVATED"
         message = "RDP User Input Delay is above the PoC responsiveness threshold."
-    elif len(disconnects) >= 2:
+    elif disconnect_count >= 2:
         finding = "RDP_RECENT_DISCONNECTS"
         message = "Repeated recent Remote Desktop session disconnects were detected."
     elif telemetry.get("status") != "available":
@@ -1067,7 +1187,7 @@ def _performance_diagnosis(
         {
             "metrics": metrics,
             "recent_rdp_events": events,
-            "recent_disconnect_count": len(disconnects),
+            "recent_disconnect_count": disconnect_count,
             "telemetry_latest_timestamp": _latest_timestamp(snapshot),
             "collection_limitations": list(snapshot.get("collection_errors") or []),
             "finding_code": finding,

@@ -495,8 +495,7 @@ def test_newer_rdp_connection_event_supersedes_negative_session_sample(monkeypat
         payload={
             "EventID": 25,
             "Channel": (
-                "Microsoft-Windows-TerminalServices-"
-                "LocalSessionManager/Operational"
+                "Microsoft-Windows-TerminalServices-LocalSessionManager/Operational"
             ),
         },
         timestamp="2030-01-01T00:03:00Z",
@@ -512,12 +511,41 @@ def test_newer_rdp_connection_event_supersedes_negative_session_sample(monkeypat
     assert telemetry["value"] is None
     assert telemetry["session_active"] is None
     assert telemetry["session_count"] is None
-    assert (
-        telemetry["reason"]
-        == "negative_session_sample_superseded_by_newer_rdp_event"
-    )
+    assert telemetry["reason"] == "session_state_changed_after_sample_latest_session"
     assert events[0]["category"] == "session"
     assert errors == []
+
+
+def test_latest_disconnect_after_reconnect_keeps_superseded_sample_unknown():
+    telemetry = {
+        "status": "unavailable",
+        "value": None,
+        "timestamp": "2030-01-01T00:02:00Z",
+        "session_active": False,
+        "session_count": 0,
+        "reason": "no_active_rdp_session",
+    }
+    events = [
+        {
+            "timestamp": "2030-01-01T00:03:00Z",
+            "event_id": 25,
+            "category": "session",
+        },
+        {
+            "timestamp": "2030-01-01T00:04:00Z",
+            "event_id": 24,
+            "category": "disconnect",
+        },
+    ]
+
+    gcp_tool._reconcile_telemetry_session_state(telemetry, events)
+
+    assert telemetry["session_active"] is None
+    assert telemetry["session_count"] is None
+    assert telemetry["value"] is None
+    assert telemetry["reason"] == (
+        "session_state_changed_after_sample_latest_disconnect"
+    )
 
 
 @pytest.mark.parametrize(
@@ -593,6 +621,146 @@ def test_performance_surfaces_disconnects_and_preserves_timestamp(monkeypatch):
     )
 
 
+def test_correlated_disconnect_event_ids_count_as_one_episode():
+    events = [
+        {
+            "timestamp": "2030-01-01T00:00:00Z",
+            "event_id": 40,
+            "category": "disconnect",
+            "_correlation": "activity-a",
+        },
+        {
+            "timestamp": "2030-01-01T00:00:01Z",
+            "event_id": 24,
+            "category": "disconnect",
+            "_correlation": "activity-a",
+        },
+        {
+            "timestamp": "2030-01-01T00:00:02Z",
+            "event_id": 40,
+            "category": "disconnect",
+            "_correlation": "activity-a",
+        },
+    ]
+
+    assert gcp_tool._disconnect_episode_count(events) == 1
+    assert all(
+        "_correlation" not in event
+        for event in gcp_tool._safe_events({"events": events})
+    )
+
+
+def test_distinct_correlation_ids_are_not_collapsed_by_time_alone():
+    events = [
+        {
+            "timestamp": "2030-01-01T00:00:00Z",
+            "event_id": 40,
+            "category": "disconnect",
+            "_correlation": "activity-a",
+        },
+        {
+            "timestamp": "2030-01-01T00:00:01Z",
+            "event_id": 24,
+            "category": "disconnect",
+            "_correlation": "activity-b",
+        },
+    ]
+
+    assert gcp_tool._disconnect_episode_count(events) == 2
+
+
+def test_diagnosis_uses_private_correlation_but_never_returns_it():
+    snapshot = {
+        "instance": {"exists": True, "id": "123", "status": "RUNNING"},
+        "metrics": {},
+        "rdp_telemetry": {"status": "unavailable", "value": None},
+        "events": [
+            {
+                "timestamp": "2030-01-01T00:00:00Z",
+                "event_id": 40,
+                "channel": "fake",
+                "category": "disconnect",
+                "_correlation": "activity-a",
+            },
+            {
+                "timestamp": "2030-01-01T00:00:01Z",
+                "event_id": 24,
+                "channel": "fake",
+                "category": "disconnect",
+                "_correlation": "activity-b",
+            },
+        ],
+        "collection_errors": [],
+    }
+
+    diagnosis = gcp_tool._performance_diagnosis(
+        "demo",
+        CALLER_UPN,
+        {
+            "project_id": "fake-vdi-project",
+            "zone": "us-central1-b",
+            "instance_name": "fake-assigned-vdi",
+        },
+        snapshot,
+    )["diagnosis"]
+
+    assert diagnosis["recent_disconnect_count"] == 2
+    assert diagnosis["finding_code"] == "RDP_RECENT_DISCONNECTS"
+    assert "activity-a" not in json.dumps(diagnosis)
+    assert "activity-b" not in json.dumps(diagnosis)
+
+
+def test_two_separate_disconnect_episodes_trigger_repeated_finding(monkeypatch):
+    snapshot = gcp_tool._load_demo_snapshot(
+        {
+            "project_id": "fake-vdi-project",
+            "zone": "us-central1-b",
+            "instance_name": "fake-assigned-vdi",
+            "windows_username": "fakeuser",
+        }
+    )
+    snapshot["events"] = [
+        {
+            "timestamp": "2030-01-01T00:00:00Z",
+            "event_id": 40,
+            "category": "disconnect",
+            "_correlation": "activity-a",
+        },
+        {
+            "timestamp": "2030-01-01T00:00:01Z",
+            "event_id": 24,
+            "category": "disconnect",
+            "_correlation": "activity-a",
+        },
+        {
+            "timestamp": "2030-01-01T00:01:00Z",
+            "event_id": 40,
+            "category": "disconnect",
+            "_correlation": "activity-a",
+        },
+        {
+            "timestamp": "2030-01-01T00:01:01Z",
+            "event_id": 24,
+            "category": "disconnect",
+            "_correlation": "activity-a",
+        },
+    ]
+
+    diagnosis = gcp_tool._performance_diagnosis(
+        "demo",
+        CALLER_UPN,
+        {
+            "project_id": "fake-vdi-project",
+            "zone": "us-central1-b",
+            "instance_name": "fake-assigned-vdi",
+        },
+        snapshot,
+    )["diagnosis"]
+
+    assert diagnosis["recent_disconnect_count"] == 2
+    assert diagnosis["finding_code"] == "RDP_RECENT_DISCONNECTS"
+
+
 def test_gcp_contract_contains_no_aws_metric_terminology():
     serialized = json.dumps(_performance()).lower()
 
@@ -619,6 +787,41 @@ def test_metric_map_uses_confirmed_google_metric_types():
         spec["type"] != "compute.googleapis.com/instance/uptime"
         for spec in gcp_tool._METRIC_SPECS.values()
     )
+    for name in ("network_received_bytes", "network_sent_bytes"):
+        assert gcp_tool._METRIC_SPECS[name]["aggregation"] == "latest_delta"
+        assert gcp_tool._METRIC_SPECS[name]["observation_period_seconds"] == 60
+
+
+def test_network_metric_is_labeled_as_latest_60_second_delta():
+    value = SimpleNamespace(int64_value=1234)
+    value._pb = SimpleNamespace(WhichOneof=lambda _: "int64_value")
+    point = SimpleNamespace(
+        value=value,
+        interval=SimpleNamespace(
+            start_time=gcp_tool.datetime(
+                2030, 1, 1, 0, 0, 0, tzinfo=gcp_tool.timezone.utc
+            ),
+            end_time=gcp_tool.datetime(
+                2030, 1, 1, 0, 1, 0, tzinfo=gcp_tool.timezone.utc
+            ),
+        ),
+    )
+    client = Mock()
+    client.list_time_series.return_value = [SimpleNamespace(points=[point])]
+
+    observation = gcp_tool._metric_observation(
+        client,
+        "fake-vdi-project",
+        "123",
+        gcp_tool._METRIC_SPECS["network_received_bytes"],
+        gcp_tool.datetime(2029, 12, 31, tzinfo=gcp_tool.timezone.utc),
+        gcp_tool.datetime(2030, 1, 2, tzinfo=gcp_tool.timezone.utc),
+    )
+
+    assert observation["value"] == 1234
+    assert observation["aggregation"] == "latest_delta"
+    assert observation["observation_period_seconds"] == 60
+    assert observation["unit"] == "bytes"
 
 
 def test_uptime_uses_compute_instance_last_start_not_latest_delta_bucket():
@@ -735,6 +938,8 @@ def test_focused_gcp_routing_contract_preserves_other_system_flows():
     )
     assert "INVALID if it omits an available metric or its" in instruction
     assert "assigns severity without an approved threshold" in instruction
+    assert "aggregation=latest_delta" in instruction
+    assert "Never call it bandwidth, throughput" in instruction
     assert "root_agent = sd_chat" in Path("sd_chat/agent.py").read_text(
         encoding="utf-8"
     )
@@ -747,12 +952,41 @@ def test_public_tool_surface_is_exactly_two_cohesive_diagnostics():
     ]
 
 
+def test_readme_is_truthful_about_unvalidated_recurring_collection():
+    readme = Path("README.md").read_text(encoding="utf-8")
+    normalized_readme = " ".join(readme.split())
+
+    assert (
+        "Recurring scheduled User Input Delay collection is not yet live-validated."
+        in readme
+    )
+    assert "autonomous scheduled cycles verified" not in readme
+    assert "Registration and unit tests are not evidence" in normalized_readme
+    assert "aggregation=latest_delta" in readme
+
+
 def test_windows_bootstrap_writes_ops_agent_yaml_without_utf8_bom():
     script = Path("scripts/configure_gcp_vdi_windows.ps1").read_text(encoding="utf-8")
 
     assert "System.Text.UTF8Encoding($false)" in script
-    assert "[System.IO.File]::WriteAllText($OpsAgentConfigPath" in script
+    assert "[System.IO.File]::WriteAllText($OpsAgentTempPath" in script
+    assert (
+        "Move-Item -Path $OpsAgentTempPath -Destination $OpsAgentConfigPath" in script
+    )
     assert "Set-Content -Path $OpsAgentConfigPath" not in script
+
+
+def test_windows_bootstrap_preserves_unowned_ops_agent_user_config():
+    script = Path("scripts/configure_gcp_vdi_windows.ps1").read_text(encoding="utf-8")
+
+    assert 'OpsAgentOwnershipMarker = "# managed-by: ServiceDeskVDI"' in script
+    assert "config.pre-servicedesk.bak" in script
+    assert "ops_agent_servicedesk_config.yaml" in script
+    assert "ManagedSnapshotMatches" in script
+    assert "LegacyServiceDeskConfigMatches" in script
+    assert "not ServiceDesk-owned; it was preserved" in script
+    assert "Copy-Item -Path $OpsAgentConfigPath" in script
+    assert "ServiceDesk Ops Agent rendered config" not in script
 
 
 def test_windows_bootstrap_boundedly_waits_for_all_ops_agent_services():
@@ -777,6 +1011,32 @@ def test_windows_bootstrap_proves_one_window_and_registers_recurring_task():
     assert "bounded scheduled supervisor" in script
     assert 'Phase "scheduled_task_validation"' not in script
     assert "ScheduledSampleDeadline" not in script
+
+
+def test_windows_bootstrap_captures_existing_task_truth_before_replacement():
+    script = Path("scripts/configure_gcp_vdi_windows.ps1").read_text(encoding="utf-8")
+
+    assert "Write-ExistingTaskDiagnostic" in script
+    assert script.index("Write-ExistingTaskDiagnostic\n") < script.index(
+        "Stop-ScheduledTask -TaskName $TaskName"
+    )
+    for field in (
+        "last_run_time",
+        "next_run_time",
+        "last_task_result",
+        "missed_runs",
+        "action_execute",
+        "action_arguments",
+        "trigger_start_boundary",
+        "repetition_interval",
+        "repetition_duration",
+        "principal_logon_type",
+        "principal_run_level",
+    ):
+        assert field in script
+    assert 'LogName = "Microsoft-Windows-TaskScheduler/Operational"' in script
+    assert 'phase = "existing_task_scheduler_event"' in script
+    assert '"unexpected_redacted"' in script
 
 
 def test_windows_collector_is_one_shot_under_a_repeating_bounded_task():
@@ -824,12 +1084,17 @@ def test_windows_collector_is_one_shot_under_a_repeating_bounded_task():
     assert '"-ResultToken", $PID' in collector
     assert "Measure-RdpUserInputDelay.ps1" in script
     assert "qwinsta.exe" in counter_probe
+    assert "Get-Counter -ListSet *" not in counter_probe
+    assert script.count("Get-Counter -ListSet *") == 1
+    assert "user_input_delay_counter_paths" in counter_probe
+    assert 'SessionName -match "^rdp-tcp' in counter_probe
+    assert "$ActiveRdpSessionIds -contains [string]$_.InstanceName" in counter_probe
     assert '$ResultToken -notmatch "^\\d+$"' in counter_probe
     assert "Join-Path $ServiceDeskRoot" in counter_probe
-    assert "session_count = $ActiveSessions" in counter_probe
+    assert "session_count = $ActiveRdpSessionIds.Count" in counter_probe
     assert "counter_value = $null" in counter_probe
     assert "username" not in counter_probe.casefold()
-    assert "session_id" not in counter_probe.casefold()
+    assert "session_id =" not in counter_probe.casefold()
     assert "taskkill.exe" in script
     assert "/PID $CollectorProcess.Id" in script
     assert "/T `" in script

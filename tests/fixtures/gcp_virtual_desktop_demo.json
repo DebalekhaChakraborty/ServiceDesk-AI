@@ -8,8 +8,8 @@
         "cpu": {"status": "available", "value": 0.24, "timestamp": "2030-01-01T00:00:00Z"},
         "memory_percent_used": {"status": "available", "value": 48.0, "timestamp": "2030-01-01T00:00:00Z"},
         "disk_percent_used": {"status": "available", "value": 37.0, "timestamp": "2030-01-01T00:00:00Z"},
-        "network_received_bytes": {"status": "available", "value": 1200.0, "timestamp": "2030-01-01T00:00:00Z"},
-        "network_sent_bytes": {"status": "available", "value": 800.0, "timestamp": "2030-01-01T00:00:00Z"},
+        "network_received_bytes": {"status": "available", "value": 1200.0, "timestamp": "2030-01-01T00:00:00Z", "aggregation": "latest_delta", "observation_period_seconds": 60, "unit": "bytes"},
+        "network_sent_bytes": {"status": "available", "value": 800.0, "timestamp": "2030-01-01T00:00:00Z", "aggregation": "latest_delta", "observation_period_seconds": 60, "unit": "bytes"},
         "uptime_seconds": {"status": "available", "value": 3600.0, "timestamp": "2030-01-01T00:00:00Z"}
       },
       "rdp_telemetry": {"status": "available", "value": 86.0, "timestamp": "2030-01-01T00:00:00Z", "session_active": true, "session_count": 1, "source": "windows_user_input_delay"},

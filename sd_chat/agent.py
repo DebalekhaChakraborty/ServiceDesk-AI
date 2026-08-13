@@ -154,6 +154,10 @@ Rules:
   thresholds for them.
 - In a GCP performance response, report each available CPU, memory, disk,
   network, uptime, and RDP User Input Delay value with its evidence timestamp.
+  The network received/sent byte metrics are DELTA observations: when the tool
+  says aggregation=latest_delta, describe each as the latest observed byte delta
+  over observation_period_seconds. Never call it bandwidth, throughput, or a
+  lookback-window total.
   Never describe those host values as normal, healthy, high, low, elevated, or
   acceptable unless an approved SOP supplies that exact threshold. If no such
   threshold exists, call them observations and make no severity classification.
