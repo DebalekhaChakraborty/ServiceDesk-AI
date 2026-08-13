@@ -1047,7 +1047,7 @@ def test_windows_collector_is_one_shot_under_a_repeating_bounded_task():
     assert "while ($true)" not in collector
     assert "$TaskTrigger = New-ScheduledTaskTrigger `" in script
     assert "-Once `" in script
-    assert "$TaskStartTime = (Get-Date).AddSeconds(30)" in script
+    assert "$TaskStartTime = (Get-Date).AddMinutes(2)" in script
     assert "-RepetitionInterval (New-TimeSpan -Minutes 1) `" in script
     assert "-RepetitionDuration (New-TimeSpan -Hours 3)" in script
     assert "New-ScheduledTaskTrigger -AtLogOn" not in script
@@ -1072,6 +1072,8 @@ def test_windows_collector_is_one_shot_under_a_repeating_bounded_task():
     assert 'Phase "supervisor_started"' in script
     assert 'phase = "task_registered"' in script
     assert "next_run_time" in script
+    assert "$TaskRegistrationCheckedAt = Get-Date" in script
+    assert "$CollectorTaskInfo.NextRunTime -gt $TaskRegistrationCheckedAt" in script
     assert 'Phase "collector_launch_failed"' in script
     assert "qwinsta.exe" not in collector
     assert "capabilities.json" in collector

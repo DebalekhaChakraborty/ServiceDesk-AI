@@ -578,7 +578,11 @@ $ChannelYaml
     $TaskAction = New-ScheduledTaskAction `
         -Execute "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" `
         -Argument "-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $SupervisorPath -MaximumIterations 1"
-    $TaskStartTime = (Get-Date).AddSeconds(30)
+    # Keep the first boundary comfortably after registration and the Ops Agent
+    # restart below. A missed StartWhenAvailable boundary can be queued with a
+    # substantial scheduler delay, so it is not a substitute for a future
+    # boundary during bootstrap.
+    $TaskStartTime = (Get-Date).AddMinutes(2)
     $TaskTrigger = New-ScheduledTaskTrigger `
         -Once `
         -At $TaskStartTime `
@@ -602,6 +606,7 @@ $ChannelYaml
 
     $CollectorTask = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
     $CollectorTaskInfo = Get-ScheduledTaskInfo -TaskName $TaskName -ErrorAction SilentlyContinue
+    $TaskRegistrationCheckedAt = Get-Date
     try {
         [ordered]@{
             timestamp = (Get-Date).ToUniversalTime().ToString("o")
@@ -616,7 +621,8 @@ $ChannelYaml
     }
     $CollectorReady = $null -ne $CollectorTask -and
         $CollectorTask.State -eq "Ready" -and
-        $null -ne $CollectorTaskInfo
+        $null -ne $CollectorTaskInfo -and
+        $CollectorTaskInfo.NextRunTime -gt $TaskRegistrationCheckedAt
     if (-not $CollectorReady) {
         $TaskResult = if ($null -ne $CollectorTaskInfo) { $CollectorTaskInfo.LastTaskResult } else { "unavailable" }
         throw "The RDP telemetry collector did not validate or register its bounded scheduled supervisor task (task result: $TaskResult)."
