@@ -92,7 +92,7 @@ def test_registered_device_selection_binds_only_fresh_entra_candidates(monkeypat
     shared.assert_not_called()
 
 
-def test_shared_workstation_selection_binds_mapping_without_exposing_infrastructure(
+def test_shared_workstation_selection_returns_trusted_name_without_sensitive_infrastructure(
     monkeypatch,
 ):
     registered, shared = _install_candidates(monkeypatch, ["TEJA-LAPTOP"])
@@ -110,12 +110,15 @@ def test_shared_workstation_selection_binds_mapping_without_exposing_infrastruct
             "persisted": True,
             "source": "trusted_shared_workstation_mapping",
             "shared_virtual_workstation_available": True,
+            "shared_virtual_workstation_name": "fake-shared-workstation",
         },
     }
     assert "project_id" not in str(result)
-    assert "instance_name" not in str(result)
+    assert "zone" not in str(result)
+    assert "windows_username" not in str(result)
     binding = context.state[targets.ENDPOINT_TARGET_BINDING_STATE_KEY]
     assert binding["target_scope"] == "shared_virtual_workstation"
+    assert binding["shared_virtual_workstation_name"] == "fake-shared-workstation"
     assert binding.get("mapping_fingerprint")
     registered.assert_not_called()
     shared.assert_called_once_with(CALLER_UPN)
@@ -133,6 +136,10 @@ def test_bound_scope_is_retained_without_asking_again(monkeypatch):
     assert result["status"] == "ok"
     assert result["resolution"] == "retained_binding"
     assert result["binding"]["target_scope"] == "shared_virtual_workstation"
+    assert (
+        result["binding"]["shared_virtual_workstation_name"]
+        == "fake-shared-workstation"
+    )
     assert "question" not in result
 
 
@@ -174,3 +181,6 @@ def test_agent_registers_target_tools_and_keeps_root_agent():
     assert "Cloud provider is NOT the target-class discriminator" in instruction
     assert "Do not resolve or ask again on every turn" in instruction
     assert "never request or accept its infrastructure values" in instruction
+    assert '"which one is my shared virtual workstation?"' in instruction
+    assert "is explicit, NOT ambiguous" in instruction
+    assert "<shared_virtual_workstation_name>" in instruction

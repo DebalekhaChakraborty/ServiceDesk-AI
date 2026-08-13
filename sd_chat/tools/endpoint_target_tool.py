@@ -1,9 +1,10 @@
 """Trusted endpoint-class disambiguation for ServiceDesk conversations.
 
 The language model may select only a target *scope*. It can never provide a
-hostname, IP address, project, zone, or instance. Registered devices are read
-from Microsoft Graph; the shared workstation is read from the existing private
-UPN mapping. The selected scope is retained in ADK session state.
+hostname, IP address, project, zone, or instance as target input. Registered
+devices are read from Microsoft Graph; the shared workstation is read from the
+existing private UPN mapping. The selected scope is retained in ADK session
+state. A controller-resolved workstation name may be returned for display.
 """
 
 from __future__ import annotations
@@ -136,16 +137,19 @@ def _bind(
         )
     else:
         assert shared_mapping is not None
+        workstation_name = str(shared_mapping["instance_name"])
         binding.update(
             {
                 "source": "trusted_shared_workstation_mapping",
                 "mapping_fingerprint": _mapping_fingerprint(shared_mapping),
+                "shared_virtual_workstation_name": workstation_name,
             }
         )
         public.update(
             {
                 "source": "trusted_shared_workstation_mapping",
                 "shared_virtual_workstation_available": True,
+                "shared_virtual_workstation_name": workstation_name,
             }
         )
     state[ENDPOINT_TARGET_BINDING_STATE_KEY] = binding
@@ -258,7 +262,12 @@ def bind_endpoint_target_scope(
     target_scope: str,
     tool_context: ToolContext,
 ) -> Dict[str, Any]:
-    """Freshly resolve and persist one model-selected trusted target class."""
+    """Resolve and persist an explicitly selected trusted target class.
+
+    Use this tool when the user selects or asks to identify their registered
+    device or shared virtual workstation. For the shared scope, the result
+    includes the trusted controller-resolved workstation name for display.
+    """
     requested = str(target_scope or "").strip().lower()
     if requested not in _VALID_SCOPES:
         return _error(
