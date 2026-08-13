@@ -978,13 +978,17 @@ def test_realistic_planner_step_maps_to_one_gcp_action(
 
 def test_focused_gcp_routing_contract_preserves_other_system_flows():
     instruction = sd_chat.instruction
+    normalized_instruction = " ".join(instruction.split())
 
     assert root_agent is sd_chat
     assert "GCP VIRTUAL DESKTOP" in instruction
-    assert "This named-system path owns the initial diagnosis" in instruction
     assert (
-        "Do not route it to generic\n  Account Access, AWS WorkSpaces, HOST login"
-        in instruction
+        "Once explicitly bound, this named-system path owns the initial diagnosis"
+        in normalized_instruction
+    )
+    assert (
+        "Do not route it to generic Account Access, AWS WorkSpaces, HOST login"
+        in normalized_instruction
     )
     assert "call exactly one appropriate GCP diagnostic" in instruction
     assert (
@@ -1011,6 +1015,54 @@ def test_focused_gcp_routing_contract_preserves_other_system_flows():
     assert "root_agent = sd_chat" in Path("sd_chat/agent.py").read_text(
         encoding="utf-8"
     )
+
+
+def test_gcp_routing_requires_explicit_or_retained_gcp_context():
+    instruction = " ".join(sd_chat.instruction.split())
+
+    assert "GCP context is explicit" in instruction
+    assert (
+        "the current user message explicitly identifies GCP, Google Cloud, Compute"
+        in instruction
+    )
+    assert (
+        "the current conversation has already been explicitly established as a GCP"
+        in instruction
+    )
+    assert "Virtual Desktop PoC conversation" in instruction
+    assert "do NOT establish GCP by themselves" in instruction
+    assert "Without retained explicit GCP context, do not call a GCP controller" in instruction
+
+
+@pytest.mark.parametrize(
+    "generic_request",
+    [
+        "my virtual desktop is slow",
+        "my VDI won't connect",
+        "my account isn't working",
+        "my desktop is lagging",
+    ],
+)
+def test_gcp_routing_contract_lists_generic_requests_as_unbound(generic_request):
+    instruction = " ".join(sd_chat.instruction.split())
+
+    assert f'"{generic_request}"' in instruction
+    assert "when no explicit GCP context has already been retained" in instruction
+
+
+@pytest.mark.parametrize(
+    "explicit_request",
+    [
+        "my GCP virtual desktop is lagging",
+        "my Google Cloud desktop is freezing",
+        "my Compute Engine Windows desktop won't connect",
+    ],
+)
+def test_gcp_routing_contract_lists_explicit_gcp_requests(explicit_request):
+    instruction = " ".join(sd_chat.instruction.split())
+
+    assert f'"{explicit_request}"' in instruction
+    assert "Examples that establish GCP" in instruction
 
 
 def test_public_tool_surface_is_exactly_two_cohesive_diagnostics():
