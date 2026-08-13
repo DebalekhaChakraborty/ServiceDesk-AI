@@ -252,6 +252,7 @@ $CounterProbeOutputPath = Join-Path $ServiceDeskRoot ("rdp_input_delay_sample_{0
 $MaximumTelemetryFiles = 360
 $PublishIntervalSeconds = 30
 $MaximumCounterProbeMilliseconds = 2500
+$Utf8WithoutBom = New-Object System.Text.UTF8Encoding($false)
 
 New-Item -Path $ServiceDeskRoot -ItemType Directory -Force | Out-Null
 
@@ -346,7 +347,8 @@ try {
     ), $PID, ([guid]::NewGuid().ToString("N"))
     $TelemetryTempPath = Join-Path $ServiceDeskRoot ("rdp_telemetry_{0}.tmp" -f $RecordToken)
     $TelemetryPath = Join-Path $ServiceDeskRoot ("rdp_telemetry_{0}.jsonl" -f $RecordToken)
-    $Record | ConvertTo-Json -Compress | Set-Content -Path $TelemetryTempPath -Encoding UTF8
+    $TelemetryJson = $Record | ConvertTo-Json -Compress
+    [System.IO.File]::WriteAllText($TelemetryTempPath, $TelemetryJson, $Utf8WithoutBom)
     Move-Item -Path $TelemetryTempPath -Destination $TelemetryPath
     Get-ChildItem -Path $ServiceDeskRoot -Filter "rdp_telemetry_*.jsonl" -File -ErrorAction SilentlyContinue |
         Sort-Object LastWriteTimeUtc -Descending |
@@ -367,6 +369,7 @@ $ErrorActionPreference = "Continue"
 $CollectorPath = "C:\ProgramData\ServiceDeskVDI\Collect-RdpUserInputDelay.ps1"
 $ServiceDeskRoot = "C:\ProgramData\ServiceDeskVDI"
 $MaximumAuditFiles = 720
+$Utf8WithoutBom = New-Object System.Text.UTF8Encoding($false)
 
 function Write-CollectorAudit {
     param(
@@ -379,11 +382,12 @@ function Write-CollectorAudit {
         ), $PID, ([guid]::NewGuid().ToString("N"))
         $AuditTempPath = Join-Path $ServiceDeskRoot ("rdp_collector_audit_{0}.tmp" -f $AuditToken)
         $AuditPath = Join-Path $ServiceDeskRoot ("rdp_collector_audit_{0}.jsonl" -f $AuditToken)
-        [ordered]@{
+        $AuditJson = [ordered]@{
             timestamp = (Get-Date).ToUniversalTime().ToString("o")
             phase = $Phase
             exit_code = $ExitCode
-        } | ConvertTo-Json -Compress | Set-Content -Path $AuditTempPath -Encoding UTF8
+        } | ConvertTo-Json -Compress
+        [System.IO.File]::WriteAllText($AuditTempPath, $AuditJson, $Utf8WithoutBom)
         Move-Item -Path $AuditTempPath -Destination $AuditPath
         Get-ChildItem -Path $ServiceDeskRoot -Filter "rdp_collector_audit_*.jsonl" -File -ErrorAction SilentlyContinue |
             Sort-Object LastWriteTimeUtc -Descending |
@@ -420,6 +424,7 @@ $ErrorActionPreference = "Continue"
 $TaskRunnerPath = "C:\ProgramData\ServiceDeskVDI\Invoke-RdpTelemetryCollector.ps1"
 $ServiceDeskRoot = "C:\ProgramData\ServiceDeskVDI"
 $MaximumAuditFiles = 720
+$Utf8WithoutBom = New-Object System.Text.UTF8Encoding($false)
 $MaximumCollectorRuntimeMilliseconds = 45000
 $RestartDelaySeconds = 2
 $Iteration = 0
@@ -436,11 +441,12 @@ function Write-SupervisorAudit {
         ), $PID, ([guid]::NewGuid().ToString("N"))
         $AuditTempPath = Join-Path $ServiceDeskRoot ("rdp_collector_audit_{0}.tmp" -f $AuditToken)
         $AuditPath = Join-Path $ServiceDeskRoot ("rdp_collector_audit_{0}.jsonl" -f $AuditToken)
-        [ordered]@{
+        $AuditJson = [ordered]@{
             timestamp = (Get-Date).ToUniversalTime().ToString("o")
             phase = $Phase
             exit_code = $ExitCode
-        } | ConvertTo-Json -Compress | Set-Content -Path $AuditTempPath -Encoding UTF8
+        } | ConvertTo-Json -Compress
+        [System.IO.File]::WriteAllText($AuditTempPath, $AuditJson, $Utf8WithoutBom)
         Move-Item -Path $AuditTempPath -Destination $AuditPath
         Get-ChildItem -Path $ServiceDeskRoot -Filter "rdp_collector_audit_*.jsonl" -File -ErrorAction SilentlyContinue |
             Sort-Object LastWriteTimeUtc -Descending |

@@ -1123,6 +1123,8 @@ def test_windows_scheduled_collector_has_bounded_non_sensitive_execution_audit()
     assert 'rdp_collector_audit_{0}.tmp' in task_runner
     assert 'rdp_collector_audit_{0}.jsonl' in task_runner
     assert "Move-Item -Path $AuditTempPath -Destination $AuditPath" in task_runner
+    assert "System.Text.UTF8Encoding($false)" in task_runner
+    assert "[System.IO.File]::WriteAllText($AuditTempPath" in task_runner
     assert "username" not in task_runner.casefold()
     assert "credential" not in task_runner.casefold()
 
@@ -1135,6 +1137,8 @@ def test_windows_collector_atomically_publishes_bounded_telemetry_files():
     assert 'rdp_telemetry_{0}.tmp' in collector
     assert 'rdp_telemetry_{0}.jsonl' in collector
     assert "Move-Item -Path $TelemetryTempPath -Destination $TelemetryPath" in collector
+    assert "System.Text.UTF8Encoding($false)" in collector
+    assert "[System.IO.File]::WriteAllText($TelemetryTempPath" in collector
     assert 'Filter "rdp_telemetry_*.jsonl"' in collector
     assert "Select-Object -Skip $MaximumTelemetryFiles" in collector
     assert "rdp_telemetry_*.jsonl" in script
