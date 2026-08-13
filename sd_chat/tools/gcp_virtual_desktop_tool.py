@@ -64,6 +64,7 @@ _METRIC_SPECS = {
 _AUTH_FAILURE_EVENT_IDS = {4625}
 _DISCONNECT_EVENT_IDS = {24, 40, 4779}
 _SESSION_EVENT_IDS = {21, 22, 23, 24, 25, 40, 1149, 4778, 4779}
+_SESSION_ACTIVE_EVENT_IDS = {21, 22, 25, 4778}
 _SECURITY_CHANNEL = "Security"
 _LSM_CHANNEL = "Microsoft-Windows-TerminalServices-LocalSessionManager/Operational"
 _RCM_CHANNEL = "Microsoft-Windows-TerminalServices-RemoteConnectionManager/Operational"
@@ -355,6 +356,19 @@ def _iso_timestamp(value: Any) -> Optional[str]:
         except TypeError:
             return _iso_timestamp(to_datetime())
     return None
+
+
+def _parse_timestamp(value: Any) -> Optional[datetime]:
+    timestamp = _iso_timestamp(value)
+    if not timestamp:
+        return None
+    try:
+        parsed = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
 
 
 def _point_value(point: Any) -> Optional[float]:
@@ -711,6 +725,27 @@ def _collect_logs(
             )
     except Exception:
         errors.append("rdp_event_query_failed")
+
+    telemetry_observed_at = _parse_timestamp(telemetry.get("timestamp"))
+    if (
+        telemetry.get("reason") == "no_active_rdp_session"
+        and telemetry_observed_at is not None
+        and any(
+            event.get("event_id") in _SESSION_ACTIVE_EVENT_IDS
+            and (event_time := _parse_timestamp(event.get("timestamp"))) is not None
+            and event_time > telemetry_observed_at
+            for event in events
+        )
+    ):
+        telemetry.update(
+            {
+                "status": "unavailable",
+                "value": None,
+                "session_active": None,
+                "session_count": None,
+                "reason": "negative_session_sample_superseded_by_newer_rdp_event",
+            }
+        )
     return telemetry, events, errors
 
 

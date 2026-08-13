@@ -479,6 +479,47 @@ def test_inactive_real_session_zero_is_unavailable_and_preserves_record_time(
     assert telemetry_since > events_since
 
 
+def test_newer_rdp_connection_event_supersedes_negative_session_sample(monkeypatch):
+    telemetry_entry = SimpleNamespace(
+        payload={
+            "timestamp": "2030-01-01T00:02:00Z",
+            "session_active": False,
+            "session_count": 0,
+            "counter_available": True,
+            "max_user_input_delay_ms": None,
+        },
+        timestamp="2030-01-01T00:02:01Z",
+        log_name="projects/fake-vdi-project/logs/servicedesk_rdp_telemetry",
+    )
+    session_entry = SimpleNamespace(
+        payload={
+            "EventID": 25,
+            "Channel": (
+                "Microsoft-Windows-TerminalServices-"
+                "LocalSessionManager/Operational"
+            ),
+        },
+        timestamp="2030-01-01T00:03:00Z",
+        log_name="projects/fake-vdi-project/logs/windows_event_log",
+    )
+    client = Mock()
+    client.list_entries.side_effect = [[telemetry_entry], [session_entry]]
+    monkeypatch.setattr("google.cloud.logging_v2.Client", Mock(return_value=client))
+
+    telemetry, events, errors = gcp_tool._collect_logs("fake-vdi-project", "123")
+
+    assert telemetry["status"] == "unavailable"
+    assert telemetry["value"] is None
+    assert telemetry["session_active"] is None
+    assert telemetry["session_count"] is None
+    assert (
+        telemetry["reason"]
+        == "negative_session_sample_superseded_by_newer_rdp_event"
+    )
+    assert events[0]["category"] == "session"
+    assert errors == []
+
+
 @pytest.mark.parametrize(
     ("event_id", "channel", "expected"),
     [
