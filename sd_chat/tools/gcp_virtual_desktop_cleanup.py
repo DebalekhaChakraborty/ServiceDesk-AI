@@ -18,6 +18,12 @@ from . import win_tool
 
 _TRANSPORT = "private_winrm"
 _GUEST_SCRIPT = r"C:\ProgramData\ServiceDeskVDI\Invoke-ServiceDeskVdiLabCleanup.ps1"
+_PROFILE = "KB screenshot-visible PoC cleanup profile"
+_PROFILE_ID = 9144
+_APPROVED_CATEGORIES = {
+    "Downloaded Program Files",
+    "Temporary Internet Files",
+}
 _RFC1918_NETWORKS = tuple(
     ipaddress.ip_network(value)
     for value in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16")
@@ -34,8 +40,10 @@ def _demo_result() -> Dict[str, Any]:
         "status": "ok",
         "backend": "demo",
         "transport": "deterministic_demo",
-        "profile": "KB0019144-Compatible LAB Cleanup Profile",
-        "selected_categories": ["Demo-only simulated native Disk Cleanup"],
+        "profile": _PROFILE,
+        "profile_id": _PROFILE_ID,
+        "selected_categories": sorted(_APPROVED_CATEGORIES),
+        "command_exit_code": 0,
         "free_disk_bytes_before": None,
         "free_disk_bytes_after": None,
         "bytes_reclaimed": None,
@@ -54,14 +62,26 @@ def _parse_guest_result(stdout: str) -> Dict[str, Any]:
             continue
         if not isinstance(value, dict):
             continue
-        if value.get("profile") != "KB0019144-Compatible LAB Cleanup Profile":
+        selected = value.get("selected_categories")
+        if (
+            value.get("status") != "ok"
+            or value.get("profile") != _PROFILE
+            or value.get("profile_id") != _PROFILE_ID
+            or value.get("command_exit_code") != 0
+            or value.get("verification") != "native_disk_cleanup_completed"
+            or not isinstance(selected, list)
+            or not selected
+            or not set(selected).issubset(_APPROVED_CATEGORIES)
+        ):
             continue
         return {
-            "status": "ok" if value.get("status") == "ok" else "error",
+            "status": "ok",
             "backend": "gcp",
             "transport": _TRANSPORT,
             "profile": value["profile"],
-            "selected_categories": list(value.get("selected_categories") or []),
+            "profile_id": value["profile_id"],
+            "selected_categories": list(selected),
+            "command_exit_code": value["command_exit_code"],
             "free_disk_bytes_before": value.get("free_disk_bytes_before"),
             "free_disk_bytes_after": value.get("free_disk_bytes_after"),
             "bytes_reclaimed": value.get("bytes_reclaimed"),

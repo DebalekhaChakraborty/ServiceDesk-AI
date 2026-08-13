@@ -14,6 +14,7 @@ from sd_chat.agent import root_agent, sd_chat
 from sd_chat.planner import reasoning_composer
 from sd_chat.tools import gcp_virtual_desktop_cleanup as cleanup_tool
 from sd_chat.tools import gcp_virtual_desktop_tool as gcp_tool
+from sd_chat.tools import policy_tool
 
 
 CALLER_UPN = "fake.caller@example.test"
@@ -21,7 +22,25 @@ CALLER_UPN = "fake.caller@example.test"
 
 def _context(upn=CALLER_UPN):
     state = {} if upn is None else {"identity_context": {"upn": upn}}
+    if upn is not None:
+        try:
+            mapping = gcp_tool._mapping_for(upn)
+        except Exception:
+            mapping = None
+        if mapping is not None:
+            state[gcp_tool.ENDPOINT_TARGET_BINDING_STATE_KEY] = {
+                "target_scope": gcp_tool.SHARED_WORKSTATION_SCOPE,
+                "source": gcp_tool.SHARED_WORKSTATION_SOURCE,
+                "caller_upn": upn,
+                "mapping_fingerprint": gcp_tool._mapping_fingerprint(mapping),
+            }
     return SimpleNamespace(state=state)
+
+
+def _offer_context():
+    context = _context()
+    context.invocation_id = "offer-turn"
+    return context
 
 
 def _write_mapping(path: Path, payload=None):
@@ -44,7 +63,15 @@ def _safe_plan(issue_type="login", preconditions=None):
         "status": "ok",
         "plan": {
             "required_inputs": [],
-            "preconditions": list(preconditions or []),
+            "preconditions": list(
+                preconditions
+                if preconditions is not None
+                else (
+                    ["shared_workstation_cleanup_is_authorized"]
+                    if issue_type == "cleanup"
+                    else []
+                )
+            ),
             "tool_sequence": [
                 {
                     "tool": spec["tool"],
@@ -154,7 +181,9 @@ def test_controller_enforces_sop_plan_policy_before_backend(
     assert calls[1][1] == {
         "user_text": expected["step"],
         "ctx_vars": ["target_upn"],
-        "sop_texts": [expected["step"]],
+        "sop_texts": [
+            expected["step"] + "\n\nApproved SOP material:\nretrieved"
+        ],
     }
     assert calls[2][1]["preconditions"] == ["verbatim_policy_condition"]
     assert calls[2][1]["caller_upn"] == CALLER_UPN
@@ -384,7 +413,9 @@ def test_arbitrary_vm_cannot_be_selected_from_tool_arguments():
     ).parameters
 
     assert list(parameters) == ["target_upn", "tool_context"]
-    assert _login()["diagnosis"]["instance_name"] == "fake-assigned-vdi"
+    diagnosis = _login()["diagnosis"]
+    assert diagnosis["workstation"] == "Shared Virtual Workstation"
+    assert "fake-assigned-vdi" not in json.dumps(diagnosis)
 
 
 def test_gcp_failure_never_falls_back_to_demo(monkeypatch):
@@ -406,12 +437,12 @@ def test_gcp_failure_never_falls_back_to_demo(monkeypatch):
 @pytest.mark.parametrize(
     ("scenario", "value", "finding"),
     [
-        ("delay_below_200", 199.0, "NO_RDP_INPUT_DELAY_THRESHOLD_BREACH"),
-        ("delay_exactly_200", 200.0, "NO_RDP_INPUT_DELAY_THRESHOLD_BREACH"),
-        ("delay_above_200", 243.0, "RDP_USER_INPUT_DELAY_ELEVATED"),
+        ("delay_below_200", 199.0, "NO_HIGH_SESSION_RTT"),
+        ("delay_exactly_200", 200.0, "NO_HIGH_SESSION_RTT"),
+        ("delay_above_200", 201.0, "HIGH_SESSION_RTT"),
     ],
 )
-def test_user_input_delay_threshold_is_strictly_greater_than_200(
+def test_rdp_tcp_rtt_threshold_is_strictly_greater_than_200(
     monkeypatch,
     scenario,
     value,
@@ -421,9 +452,9 @@ def test_user_input_delay_threshold_is_strictly_greater_than_200(
 
     diagnosis = _performance()["diagnosis"]
 
-    assert diagnosis["metrics"]["rdp_user_input_delay_ms"]["value"] == value
+    assert diagnosis["metrics"]["rdp_tcp_rtt_ms"]["value"] == value
     assert diagnosis["finding_code"] == finding
-    assert diagnosis["threshold_rule"] == "RDP User Input Delay > 200 ms"
+    assert diagnosis["threshold_rule"] == "RDP TCP RTT > 200 ms"
 
 
 @pytest.mark.parametrize(
@@ -435,13 +466,11 @@ def test_user_input_delay_threshold_is_strictly_greater_than_200(
         ("delay_above_200", True),
     ],
 )
-def test_cleanup_offer_is_created_only_for_strictly_elevated_delay(
+def test_cleanup_offer_is_created_only_for_high_session_rtt(
     monkeypatch, scenario, has_offer
 ):
     monkeypatch.setenv("GCP_VDI_DEMO_SCENARIO", scenario)
-    context = SimpleNamespace(
-        state={"identity_context": {"upn": CALLER_UPN}}, invocation_id="offer-turn"
-    )
+    context = _offer_context()
 
     result = _performance(context)
 
@@ -449,18 +478,23 @@ def test_cleanup_offer_is_created_only_for_strictly_elevated_delay(
     if has_offer:
         offer = context.state[gcp_tool.GCP_VDI_CLEANUP_OFFER_STATE_KEY]
         assert offer["caller_upn"] == CALLER_UPN
+        assert offer["target_scope"] == "shared_virtual_workstation"
+        assert offer["mapping_fingerprint"]
         assert offer["target"] == {
             "project_id": "fake-vdi-project",
             "zone": "us-central1-b",
             "instance_name": "fake-assigned-vdi",
         }
         assert offer["action_id"] == "gcp.virtual_desktop.system_file_cleanup"
+        assert offer["finding_code"] == "HIGH_SESSION_RTT"
+        assert offer["rdp_tcp_rtt_ms"] == 201.0
+        assert offer["evidence_timestamp"]
+        assert offer["expires_at"] - offer["created_at"] == 600
+        assert offer["offer_id"]
 
 
 def test_cleanup_requires_later_confirmation_and_checks_policy_once(monkeypatch):
-    context = SimpleNamespace(
-        state={"identity_context": {"upn": CALLER_UPN}}, invocation_id="offer-turn"
-    )
+    context = _offer_context()
     monkeypatch.setenv("GCP_VDI_DEMO_SCENARIO", "delay_above_200")
     _performance(context)
     policy = Mock(return_value={"status": "ok", "details": {}})
@@ -478,10 +512,36 @@ def test_cleanup_requires_later_confirmation_and_checks_policy_once(monkeypatch)
     assert result["status"] == "ok"
     cleanup.assert_called_once()
     assert policy.call_count == 1
-    assert policy.call_args.kwargs["tool_context"] is None
+    assert policy.call_args.kwargs["preconditions"] == [
+        "shared_workstation_cleanup_is_authorized"
+    ]
+    policy_context = policy.call_args.kwargs["tool_context"]
+    assert policy_context is not context
+    assert set(policy_context.state) == {
+        gcp_tool.ENDPOINT_TARGET_BINDING_STATE_KEY,
+        gcp_tool.GCP_VDI_CLEANUP_OFFER_STATE_KEY,
+    }
     assert context.state[gcp_tool.GCP_VDI_CLEANUP_OFFER_STATE_KEY]["phase"] == "executed"
     second_attempt = _cleanup(context)
     assert second_attempt["code"] == "GCP_VDI_CLEANUP_OFFER_MISSING"
+
+
+def test_cleanup_real_isolated_policy_condition_accepts_only_bound_offer(monkeypatch):
+    context = _offer_context()
+    monkeypatch.setenv("GCP_VDI_DEMO_SCENARIO", "delay_above_200")
+    _performance(context)
+    context.invocation_id = "confirm-turn"
+    monkeypatch.setattr(gcp_tool, "_check_list", policy_tool.check_list)
+    monkeypatch.setattr(
+        gcp_tool,
+        "execute_system_file_cleanup",
+        Mock(return_value={"status": "ok", "backend": "demo"}),
+    )
+
+    result = _cleanup(context)
+
+    assert result["status"] == "ok"
+    assert "temp:account_access_authorization" not in context.state
 
 
 @pytest.mark.parametrize(
@@ -492,9 +552,7 @@ def test_cleanup_requires_later_confirmation_and_checks_policy_once(monkeypatch)
     ],
 )
 def test_cleanup_rejects_invalid_retained_offer(monkeypatch, mutation, expected_code):
-    context = SimpleNamespace(
-        state={"identity_context": {"upn": CALLER_UPN}}, invocation_id="offer-turn"
-    )
+    context = _offer_context()
     monkeypatch.setenv("GCP_VDI_DEMO_SCENARIO", "delay_above_200")
     _performance(context)
     context.state[gcp_tool.GCP_VDI_CLEANUP_OFFER_STATE_KEY].update(mutation)
@@ -506,9 +564,7 @@ def test_cleanup_rejects_invalid_retained_offer(monkeypatch, mutation, expected_
 
 
 def test_cleanup_rejects_changed_mapping_and_caller(monkeypatch):
-    context = SimpleNamespace(
-        state={"identity_context": {"upn": CALLER_UPN}}, invocation_id="offer-turn"
-    )
+    context = _offer_context()
     monkeypatch.setenv("GCP_VDI_DEMO_SCENARIO", "delay_above_200")
     _performance(context)
     context.invocation_id = "confirm-turn"
@@ -542,9 +598,7 @@ def test_cleanup_rejects_changed_mapping_and_caller(monkeypatch):
 def test_cleanup_unsafe_or_unexpected_plan_stops_before_policy_and_backend(
     monkeypatch, mutation
 ):
-    context = SimpleNamespace(
-        state={"identity_context": {"upn": CALLER_UPN}}, invocation_id="offer-turn"
-    )
+    context = _offer_context()
     monkeypatch.setenv("GCP_VDI_DEMO_SCENARIO", "delay_above_200")
     _performance(context)
     context.invocation_id = "confirm-turn"
@@ -564,9 +618,7 @@ def test_cleanup_unsafe_or_unexpected_plan_stops_before_policy_and_backend(
 
 
 def test_cleanup_policy_denial_stops_before_backend_and_account_access_state(monkeypatch):
-    context = SimpleNamespace(
-        state={"identity_context": {"upn": CALLER_UPN}}, invocation_id="offer-turn"
-    )
+    context = _offer_context()
     monkeypatch.setenv("GCP_VDI_DEMO_SCENARIO", "delay_above_200")
     _performance(context)
     context.invocation_id = "confirm-turn"
@@ -587,9 +639,7 @@ def test_cleanup_policy_denial_stops_before_backend_and_account_access_state(mon
 
 
 def test_cleanup_failure_and_missing_post_telemetry_never_claim_resolution(monkeypatch):
-    context = SimpleNamespace(
-        state={"identity_context": {"upn": CALLER_UPN}}, invocation_id="offer-turn"
-    )
+    context = _offer_context()
     monkeypatch.setenv("GCP_VDI_DEMO_SCENARIO", "delay_above_200")
     _performance(context)
     context.invocation_id = "confirm-turn"
@@ -639,11 +689,13 @@ def test_real_cleanup_reuses_existing_winrm_with_controller_owned_private_host(
             "status": "success",
             "code": 0,
             "stdout": json.dumps(
-                {
-                    "status": "ok",
-                    "profile": "KB0019144-Compatible LAB Cleanup Profile",
-                    "selected_categories": ["Delivery Optimization Files"],
-                    "verification": "native_disk_cleanup_completed",
+                    {
+                        "status": "ok",
+                        "profile": "KB screenshot-visible PoC cleanup profile",
+                        "profile_id": 9144,
+                        "selected_categories": ["Temporary Internet Files"],
+                        "command_exit_code": 0,
+                        "verification": "native_disk_cleanup_completed",
                 }
             ),
             "stderr": "",
@@ -655,6 +707,7 @@ def test_real_cleanup_reuses_existing_winrm_with_controller_owned_private_host(
 
     assert result["status"] == "ok"
     assert result["transport"] == "private_winrm"
+    assert result["profile_id"] == 9144
     execute.assert_called_once()
     target_host, script = execute.call_args.args
     assert target_host == "10.0.0.8"
@@ -705,7 +758,50 @@ def test_missing_rdp_telemetry_is_not_zero(monkeypatch):
 
     assert telemetry["status"] == "unavailable"
     assert telemetry["value"] is None
-    assert diagnosis["finding_code"] == "NO_RECENT_RDP_TELEMETRY"
+    assert diagnosis["finding_code"] == "RDP_TCP_RTT_UNAVAILABLE"
+
+
+def test_high_user_input_delay_with_unavailable_rtt_never_offers_cleanup(
+    monkeypatch,
+):
+    mapping = gcp_tool._mapping_for(CALLER_UPN)
+    snapshot = gcp_tool._load_demo_snapshot(mapping)
+    snapshot["rdp_telemetry"] = {
+        "status": "available",
+        "value": 350.0,
+        "timestamp": "2030-01-01T00:08:00Z",
+        "session_active": True,
+        "source": "windows_user_input_delay",
+    }
+    snapshot["rdp_tcp_rtt"] = {
+        "status": "unavailable",
+        "value": None,
+        "timestamp": "2030-01-01T00:08:00Z",
+        "session_active": True,
+        "reason": "counter_value_unavailable",
+    }
+    monkeypatch.setattr(gcp_tool, "_load_snapshot", lambda *_: snapshot)
+    context = _offer_context()
+
+    result = _performance(context)
+
+    assert result["diagnosis"]["finding_code"] == "RDP_TCP_RTT_UNAVAILABLE"
+    assert result["diagnosis"]["metrics"]["rdp_user_input_delay_ms"]["value"] == 350.0
+    assert result["cleanup_offer"] is None
+
+
+def test_registered_device_binding_is_rejected_by_shared_workstation_controller():
+    context = _context()
+    context.state[gcp_tool.ENDPOINT_TARGET_BINDING_STATE_KEY] = {
+        "target_scope": "registered_device",
+        "source": "entra",
+        "caller_upn": CALLER_UPN,
+        "trusted_device_id": "device-a",
+    }
+
+    result = _performance(context)
+
+    assert result["code"] == "GCP_VDI_SHARED_BINDING_REQUIRED"
 
 
 def test_inactive_rdp_session_is_distinct_from_missing_telemetry():
@@ -724,6 +820,13 @@ def test_inactive_rdp_session_is_distinct_from_missing_telemetry():
         "session_count": 0,
         "counter_available": True,
         "source": "windows_user_input_delay",
+        "reason": "no_active_rdp_session",
+    }
+    snapshot["rdp_tcp_rtt"] = {
+        "status": "unavailable",
+        "value": None,
+        "timestamp": "2030-01-01T00:02:00Z",
+        "session_active": False,
         "reason": "no_active_rdp_session",
     }
 
@@ -839,6 +942,9 @@ def test_application_event_telemetry_message_is_parsed(monkeypatch):
                     "session_count": 1,
                     "counter_available": True,
                     "max_user_input_delay_ms": 17.0,
+                    "rdp_tcp_rtt_counter_available": True,
+                    "rdp_tcp_rtt_ms": 216.0,
+                    "rdp_tcp_rtt_source": "windows_remotefx_network_current_tcp_rtt",
                 }
             ),
         },
@@ -856,6 +962,17 @@ def test_application_event_telemetry_message_is_parsed(monkeypatch):
     assert telemetry["session_active"] is True
     assert telemetry["session_count"] == 1
     assert telemetry["timestamp"] == "2030-01-01T00:02:00Z"
+    assert telemetry["rdp_tcp_rtt"] == {
+        "status": "available",
+        "value": 216.0,
+        "timestamp": "2030-01-01T00:02:00Z",
+        "session_active": True,
+        "session_count": 1,
+        "counter_available": True,
+        "source": "windows_remotefx_network_current_tcp_rtt",
+        "unit": "ms",
+        "reason": None,
+    }
     assert events == []
     assert errors == []
 
@@ -1406,18 +1523,11 @@ def test_public_tool_surface_contains_diagnostics_and_retained_cleanup_controlle
 def test_readme_reports_active_session_validation_without_fabrication():
     readme = Path("README.md").read_text(encoding="utf-8")
 
-    assert (
-        "Recurring scheduled collection, active-session User Input Delay, and production"
-        in readme
-    )
-    assert "diagnosis consumption are live-validated." in readme
-    assert "session_count=1" in readme
-    assert "genuine `0 ms` value" in readme
-    assert "inactive or unavailable evidence remains" in readme
-    assert (
-        "Portal conversational wording/routing still requires manual validation."
-        in readme
-    )
+    assert "One-time read-only live discovery validated" in readme
+    assert "RemoteFX Network(*)\\Current" in readme
+    assert "TCP RTT` counter with an active RDP session" in readme
+    assert "preserve unavailable values as null" in readme
+    assert "requires manual validation after deployment" in readme
     assert "autonomous scheduled cycles verified" not in readme
     assert "aggregation=latest_delta" in readme
 
@@ -1469,6 +1579,22 @@ def test_windows_bootstrap_proves_one_window_and_registers_recurring_task():
     assert "bounded scheduled supervisor" in script
     assert 'Phase "scheduled_task_validation"' not in script
     assert "ScheduledSampleDeadline" not in script
+
+
+def test_windows_cleanup_uses_only_customer_visible_profile_9144_categories():
+    script = Path("scripts/configure_gcp_vdi_windows.ps1").read_text(encoding="utf-8")
+    cleanup_script = script.split("$CleanupScript = @'", 1)[1].split("'@", 1)[0]
+
+    assert '$ProfileName = "KB screenshot-visible PoC cleanup profile"' in cleanup_script
+    assert "$ProfileId = 9144" in cleanup_script
+    assert '$StateFlagName = "StateFlags9144"' in cleanup_script
+    assert '"Downloaded Program Files"' in cleanup_script
+    assert '"Temporary Internet Files"' in cleanup_script
+    assert '"Delivery Optimization Files"' not in cleanup_script
+    assert '"DirectX Shader Cache"' not in cleanup_script
+    assert 'ArgumentList "/sagerun:9144"' in cleanup_script
+    assert "StateFlags0017" not in cleanup_script
+    assert "/sagerun:19144" not in cleanup_script
 
 
 def test_windows_bootstrap_captures_existing_task_truth_before_replacement():
@@ -1544,7 +1670,7 @@ def test_windows_collector_is_one_shot_under_a_repeating_bounded_task():
     assert "qwinsta.exe" not in collector
     assert "capabilities.json" in collector
     assert "Get-Counter -ListSet" not in collector
-    assert "$MaximumCounterProbeMilliseconds = 2500" in collector
+    assert "$MaximumCounterProbeMilliseconds = 5000" in collector
     assert (
         "$CounterProbeProcess.WaitForExit($MaximumCounterProbeMilliseconds)"
         in collector
@@ -1560,7 +1686,8 @@ def test_windows_collector_is_one_shot_under_a_repeating_bounded_task():
     assert '$ResultToken -notmatch "^\\d+$"' in counter_probe
     assert "Join-Path $ServiceDeskRoot" in counter_probe
     assert "session_count = $ActiveRdpSessionIds.Count" in counter_probe
-    assert "counter_value = $null" in counter_probe
+    assert "user_input_delay_value = $null" in counter_probe
+    assert "tcp_rtt_value = $null" in counter_probe
     assert "username" not in counter_probe.casefold()
     assert "session_id =" not in counter_probe.casefold()
     assert "taskkill.exe" in script

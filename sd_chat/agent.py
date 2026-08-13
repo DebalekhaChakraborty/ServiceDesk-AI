@@ -8,7 +8,7 @@ from .tools.language_tool import language_tools
 from .tools.vertex_rag_tool import vertex_rag_tool
 from .tools.snow_connector_tool import snow_incident_tools
 from .tools.catalog_tool import catalog_tool
-from .tools.win_tool import time_resync, restart_service, clear_dns_cache, cleanup_temp_files, install_software
+from .tools.win_tool import time_resync, restart_service, clear_dns_cache, cleanup_temp_files
 from .tools.aad_tool import aad_get_my_devices, aad_reset_password
 from .tools.ad_account_tool import ad_account_tools
 from .tools.account_access_orchestrator import account_access_orchestration_tools
@@ -118,8 +118,9 @@ For any request that requires an endpoint:
 - If the user clearly identifies a registered device or laptop and the current
   troubleshooting flow is not already bound to that scope, call
   bind_endpoint_target_scope(target_scope="registered_device"). Use only the
-  returned Entra allowed-host candidates. If multiple registered devices exist,
-  ask the user to select only from that returned list.
+  returned Entra candidates. If multiple registered devices exist, ask the user
+  to select only from that list, then call bind_endpoint_target_scope again with
+  that exact verified registered_device_name.
 - If the user clearly identifies the shared virtual workstation, virtual desktop,
   or VDI and the current flow is not already bound to that scope, call
   bind_endpoint_target_scope(target_scope="shared_virtual_workstation"). Use the
@@ -129,8 +130,8 @@ For any request that requires an endpoint:
   bind_endpoint_target_scope(target_scope="shared_virtual_workstation"); do NOT
   call resolve_endpoint_targets and do NOT repeat the registered-versus-shared
   question. On success answer: "Your shared virtual workstation is
-  '<shared_virtual_workstation_name>'. I'll use it for this troubleshooting flow."
-  Show only that controller-returned name; never show project, zone, private IP,
+  '<display_name>'. I'll use it for this troubleshooting flow."
+  Show only that controller-returned safe label; never show project, zone, private IP,
   or Windows username.
 - If the endpoint class is not clear, call resolve_endpoint_targets(). If it
   returns status=needs_input, ask its question verbatim as the only question.
@@ -174,8 +175,8 @@ Rules:
   gcp_diagnose_virtual_desktop_performance with
   target_upn=identity_context.upn.
 - Performance diagnosis is read-only. When it returns a cleanup_offer, explain
-  that RDP User Input Delay exceeded the strict 200-ms PoC threshold and offer
-  the **KB0019144-Compatible LAB Cleanup Profile**. Do not run cleanup in that
+  that genuine RDP TCP round-trip time exceeded the strict 200-ms threshold and
+  offer the **KB screenshot-visible PoC cleanup profile**. Do not run cleanup in that
   same turn and do not call generic cleanup_temp_files.
 - A clear later confirmation such as "Yes, clean it" is valid only for the
   current GCP cleanup offer. Call
@@ -194,13 +195,16 @@ Rules:
   Windows or AD password, or invoke a generic Windows remediation automatically.
 - Report unavailable evidence as unavailable, never as zero. Preserve actual
   timestamps and clearly identify whether the backend is gcp or demo.
-- RDP User Input Delay is Windows application/session responsiveness, not network
-  RTT, AWS WorkSpaces latency, or InSessionLatency. Only values greater than 200
-  ms trigger RDP_USER_INPUT_DELAY_ELEVATED; exactly 200 ms does not.
+- Genuine RDP TCP RTT is the customer signal. Only rdp_tcp_rtt_ms values strictly
+  greater than 200 ms trigger HIGH_SESSION_RTT; exactly 200 ms does not. Missing
+  RTT never qualifies cleanup and must not be treated as zero.
+- RDP User Input Delay is a separate supporting Windows application/session
+  responsiveness observation. It is never RTT, round-trip time, network latency,
+  AWS WorkSpaces latency, or InSessionLatency, and it never qualifies cleanup.
 - CPU, memory, disk, and network values are observations. Do not invent severity
   thresholds for them.
 - In a GCP performance response, report each available CPU, memory, disk,
-  network, uptime, and RDP User Input Delay value with its evidence timestamp.
+  network, uptime, RDP TCP RTT, and RDP User Input Delay value with its evidence timestamp.
   The network received/sent byte metrics are DELTA observations: when the tool
   says aggregation=latest_delta, describe each as the latest observed byte delta
   over observation_period_seconds. Never call it bandwidth, throughput, or a
@@ -213,6 +217,13 @@ Rules:
   assigns severity without an approved threshold.
 - If the GCP tool returns an error or inconclusive finding, explain the limitation
   and offer escalation. Do not substitute password reset or infrastructure change.
+
+For software installation on either endpoint class, complete the normal user
+confirmation first, then call install_software_on_bound_endpoint with only the
+approved software name. Never call install_software directly and never supply a
+host/IP; the adapter re-resolves the retained trusted target, retrieves the SOP,
+requires one exact existing win.install_software plan, checks policy once, and
+reuses the existing Windows installer internally.
 
 ========================
 SCREENSHOT / IMAGE UPLOAD HANDLING
@@ -615,7 +626,6 @@ OUTPUT STYLE
         restart_service,
         clear_dns_cache,
         cleanup_temp_files,
-        install_software,
 
         # Azure AD tools that are safe for the current requester. Other-user
         # Account Access lookup/manager reads are only available inside the

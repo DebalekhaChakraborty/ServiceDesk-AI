@@ -1,0 +1,9 @@
+{
+  "user@example.com": {
+    "display_name": "Shared Virtual Workstation",
+    "project_id": "example-project",
+    "zone": "us-central1-a",
+    "instance_name": "example-shared-workstation",
+    "windows_username": "example-user"
+  }
+}

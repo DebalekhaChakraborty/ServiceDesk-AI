@@ -1,10 +1,10 @@
 {
   "id": "gcp.virtual_desktop.system_file_cleanup",
-  "title": "Run KB0019144-compatible System File Cleanup on the authenticated caller's mapped GCP virtual desktop",
-  "description": "Run the approved PoC-only native Windows Disk Cleanup profile on the caller's privately mapped GCP virtual desktop after a retained elevated-responsiveness offer is confirmed.",
+  "title": "Run the ServiceDesk GCP shared-workstation System File Cleanup profile after confirmed high session RTT",
+  "description": "Run the KB screenshot-visible PoC cleanup profile only for the authenticated caller's bound shared workstation after a retained HIGH_SESSION_RTT offer is confirmed.",
   "inputs": [],
   "outputs": ["cleanup.status", "cleanup.verification"],
-  "preconditions": [],
+  "preconditions": ["shared_workstation_cleanup_is_authorized"],
   "effects": ["gcp_vdi_lab_system_file_cleanup_completed"],
   "tool": "gcp_virtual_desktop_tool",
   "action": "confirm_virtual_desktop_system_file_cleanup",

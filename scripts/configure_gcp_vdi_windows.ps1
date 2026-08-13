@@ -27,20 +27,17 @@ New-Item -Path $ServiceDeskRoot -ItemType Directory -Force | Out-Null
 # This fixed guest-side script is the PoC-only analogue of KB0019144's native
 # Disk Cleanup workflow. It is not a production cleanup policy and it accepts no
 # user-supplied categories, paths, or commands. The ServiceDesk backend invokes
-# it only through its retained GCP offer controller and secure IAP transport.
+# it only through its retained GCP offer controller and the existing private
+# ServiceDesk WinRM HTTPS transport.
 $CleanupScript = @'
 $ErrorActionPreference = "Stop"
-$ProfileName = "KB0019144-Compatible LAB Cleanup Profile"
+$ProfileName = "KB screenshot-visible PoC cleanup profile"
+$ProfileId = 9144
 $VolumeCachesRoot = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\VolumeCaches"
-$StateFlagName = "StateFlags0017"
+$StateFlagName = "StateFlags9144"
 $AllowedCategories = @(
     "Downloaded Program Files",
-    "Temporary Internet Files",
-    "Windows Error Reporting Files",
-    "Windows Error Reporting Archive Files",
-    "Windows Error Reporting Queue Files",
-    "DirectX Shader Cache",
-    "Delivery Optimization Files"
+    "Temporary Internet Files"
 )
 
 function Get-FreeDiskBytes {
@@ -61,7 +58,9 @@ $previousFlags = @()
 $result = @{
     status = "error"
     profile = $ProfileName
+    profile_id = $ProfileId
     selected_categories = @()
+    command_exit_code = $null
     free_disk_bytes_before = $null
     free_disk_bytes_after = $null
     bytes_reclaimed = $null
@@ -77,28 +76,34 @@ try {
         throw "native_disk_cleanup_unavailable"
     }
     $before = Get-FreeDiskBytes
-    foreach ($category in $AllowedCategories) {
-        $path = Join-Path $VolumeCachesRoot $category
-        if (-not (Test-Path -LiteralPath $path)) { continue }
+    # Profile 9144 is ServiceDesk-owned. Snapshot and clear its flag from every
+    # installed handler first so an unrelated pre-existing handler cannot be
+    # selected accidentally. Other StateFlags profiles are never touched.
+    foreach ($handler in @(Get-ChildItem -LiteralPath $VolumeCachesRoot -ErrorAction Stop)) {
+        $path = $handler.PSPath
         $existing = Get-ItemProperty -LiteralPath $path -Name $StateFlagName -ErrorAction SilentlyContinue
         $previousFlags += [pscustomobject]@{
             path = $path
             exists = $null -ne $existing
             value = if ($null -ne $existing) { $existing.$StateFlagName } else { $null }
         }
-        New-ItemProperty -LiteralPath $path -Name $StateFlagName -PropertyType DWord -Value 2 -Force | Out-Null
-        $selected += $category
+        Remove-ItemProperty -LiteralPath $path -Name $StateFlagName -ErrorAction SilentlyContinue
+        if ($AllowedCategories -contains $handler.PSChildName) {
+            New-ItemProperty -LiteralPath $path -Name $StateFlagName -PropertyType DWord -Value 2 -Force | Out-Null
+            $selected += $handler.PSChildName
+        }
     }
     if ($selected.Count -eq 0) {
         $result.verification = "no_approved_native_categories_available"
         throw "no_approved_native_categories_available"
     }
-    $process = Start-Process -FilePath $cleanmgr -ArgumentList "/sagerun:19144" -PassThru
+    $process = Start-Process -FilePath $cleanmgr -ArgumentList "/sagerun:9144" -PassThru
     if (-not $process.WaitForExit(600000)) {
         Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
         $result.verification = "native_disk_cleanup_timeout"
         throw "native_disk_cleanup_timeout"
     }
+    $result.command_exit_code = [int]$process.ExitCode
     if ($process.ExitCode -ne 0) {
         $result.verification = "native_disk_cleanup_failed"
         throw "native_disk_cleanup_failed"
@@ -282,6 +287,19 @@ try {
     }
     $CounterAvailable = $CounterPaths.Count -gt 0
 
+    # RemoteFX Network Current TCP RTT is the genuine RDP transport round-trip
+    # observation used by the customer threshold. Discover and persist its exact
+    # wildcard path once; recurring probes never enumerate counter sets.
+    $RttCounterSet = Get-Counter -ListSet "RemoteFX Network" -ErrorAction SilentlyContinue
+    $RttCounterPaths = @()
+    if ($null -ne $RttCounterSet) {
+        $RttCounterPaths = @(
+            $RttCounterSet.Paths |
+                Where-Object { $_ -match "\\Current TCP RTT$" }
+        )
+    }
+    $RttCounterAvailable = $RttCounterPaths.Count -gt 0
+
     [ordered]@{
         timestamp = (Get-Date).ToUniversalTime().ToString("o")
         available_event_channels = $AvailableChannels
@@ -289,6 +307,9 @@ try {
         user_input_delay_counter_set_available = $CounterAvailable
         user_input_delay_counter_set = if ($CounterAvailable) { $CounterSet.CounterSetName } else { $null }
         user_input_delay_counter_paths = $CounterPaths
+        rdp_tcp_rtt_counter_set_available = $RttCounterAvailable
+        rdp_tcp_rtt_counter_set = if ($RttCounterAvailable) { $RttCounterSet.CounterSetName } else { $null }
+        rdp_tcp_rtt_counter_paths = $RttCounterPaths
     } | ConvertTo-Json -Depth 4 | Set-Content -Path $CapabilityPath -Encoding UTF8
 
     $CounterProbeScript = @'
@@ -307,19 +328,26 @@ $ResultPath = Join-Path $ServiceDeskRoot ("rdp_input_delay_sample_{0}.txt" -f $R
 
 $CounterAvailable = $false
 $CounterPaths = @()
+$RttCounterAvailable = $false
+$RttCounterPaths = @()
 try {
     $Capabilities = Get-Content -Path $CapabilityPath -Raw -ErrorAction Stop |
         ConvertFrom-Json -ErrorAction Stop
     $CounterAvailable = $Capabilities.user_input_delay_counter_set_available -eq $true
     $CounterPaths = @($Capabilities.user_input_delay_counter_paths | Where-Object { $_ })
+    $RttCounterAvailable = $Capabilities.rdp_tcp_rtt_counter_set_available -eq $true
+    $RttCounterPaths = @($Capabilities.rdp_tcp_rtt_counter_paths | Where-Object { $_ })
 }
 catch {
     $CounterAvailable = $false
     $CounterPaths = @()
+    $RttCounterAvailable = $false
+    $RttCounterPaths = @()
 }
 
 $SessionLines = & "$env:SystemRoot\System32\qwinsta.exe" 2>$null
 $ActiveRdpSessionIds = @()
+$ActiveRdpCounterInstances = @()
 foreach ($SessionLine in @($SessionLines | Select-Object -Skip 1)) {
     $NormalizedLine = ([string]$SessionLine -replace "^\s*>", "").Trim()
     if (-not $NormalizedLine) {
@@ -334,30 +362,49 @@ foreach ($SessionLine in @($SessionLines | Select-Object -Skip 1)) {
     $SessionId = [string]$Columns[$StateIndex - 1]
     if ($SessionName -match "^rdp-tcp(?:#\d+)?$" -and $SessionId -match "^\d+$") {
         $ActiveRdpSessionIds += $SessionId
+        $ActiveRdpCounterInstances += (($SessionName -replace "#", " ").Trim().ToLowerInvariant())
     }
 }
 
 $ProbeRecord = [ordered]@{
     session_count = $ActiveRdpSessionIds.Count
-    counter_value = $null
+    user_input_delay_value = $null
+    tcp_rtt_value = $null
 }
 $ProbeRecord | ConvertTo-Json -Compress | Set-Content -Path $ResultPath -Encoding UTF8
 
-if ($ActiveRdpSessionIds.Count -eq 0 -or -not $CounterAvailable -or $CounterPaths.Count -eq 0) {
+if ($ActiveRdpSessionIds.Count -eq 0) {
     exit 0
 }
 
-$CounterResult = Get-Counter -Counter $CounterPaths -MaxSamples 1 -ErrorAction Stop
-$MaximumDelay = @(
-    $CounterResult.CounterSamples |
-        Where-Object { $ActiveRdpSessionIds -contains [string]$_.InstanceName } |
-        ForEach-Object { [double]$_.CookedValue } |
-        Where-Object { $_ -ge 0 }
-) | Measure-Object -Maximum
-if ($null -ne $MaximumDelay.Maximum) {
-    $ProbeRecord.counter_value = [double]$MaximumDelay.Maximum
-    $ProbeRecord | ConvertTo-Json -Compress | Set-Content -Path $ResultPath -Encoding UTF8
+if ($CounterAvailable -and $CounterPaths.Count -gt 0) {
+    $CounterResult = Get-Counter -Counter $CounterPaths -MaxSamples 1 -ErrorAction Stop
+    $MaximumDelay = @(
+        $CounterResult.CounterSamples |
+            Where-Object { $ActiveRdpSessionIds -contains [string]$_.InstanceName } |
+            ForEach-Object { [double]$_.CookedValue } |
+            Where-Object { $_ -ge 0 }
+    ) | Measure-Object -Maximum
+    if ($null -ne $MaximumDelay.Maximum) {
+        $ProbeRecord.user_input_delay_value = [double]$MaximumDelay.Maximum
+    }
 }
+
+if ($RttCounterAvailable -and $RttCounterPaths.Count -gt 0) {
+    $RttResult = Get-Counter -Counter $RttCounterPaths -MaxSamples 1 -ErrorAction Stop
+    $MaximumRtt = @(
+        $RttResult.CounterSamples |
+            Where-Object {
+                $ActiveRdpCounterInstances -contains ([string]$_.InstanceName).Trim().ToLowerInvariant()
+            } |
+            ForEach-Object { [double]$_.CookedValue } |
+            Where-Object { $_ -ge 0 }
+    ) | Measure-Object -Maximum
+    if ($null -ne $MaximumRtt.Maximum) {
+        $ProbeRecord.tcp_rtt_value = [double]$MaximumRtt.Maximum
+    }
+}
+$ProbeRecord | ConvertTo-Json -Compress | Set-Content -Path $ResultPath -Encoding UTF8
 '@
     Set-Content -Path $CounterProbePath -Value $CounterProbeScript -Encoding UTF8
 
@@ -369,7 +416,7 @@ $CounterProbePath = Join-Path $ServiceDeskRoot "Measure-RdpUserInputDelay.ps1"
 $CounterProbeOutputPath = Join-Path $ServiceDeskRoot ("rdp_input_delay_sample_{0}.txt" -f $PID)
 $MaximumTelemetryFiles = 360
 $PublishIntervalSeconds = 30
-$MaximumCounterProbeMilliseconds = 2500
+$MaximumCounterProbeMilliseconds = 5000
 $Utf8WithoutBom = New-Object System.Text.UTF8Encoding($false)
 $ServiceDeskEventSource = "ServiceDeskVDI"
 $TelemetryEventId = 7101
@@ -377,17 +424,21 @@ $TelemetryEventId = 7101
 New-Item -Path $ServiceDeskRoot -ItemType Directory -Force | Out-Null
 
 $CounterAvailable = $false
+$RttCounterAvailable = $false
 try {
     $Capabilities = Get-Content -Path $CapabilityPath -Raw -ErrorAction Stop |
         ConvertFrom-Json -ErrorAction Stop
     $CounterAvailable = $Capabilities.user_input_delay_counter_set_available -eq $true
+    $RttCounterAvailable = $Capabilities.rdp_tcp_rtt_counter_set_available -eq $true
 }
 catch {
     $CounterAvailable = $false
+    $RttCounterAvailable = $false
 }
 
 $WindowEnds = (Get-Date).AddSeconds($PublishIntervalSeconds)
 $DelaySamples = @()
+$RttSamples = @()
 $MaximumActiveSessions = 0
 
 while ((Get-Date) -lt $WindowEnds) {
@@ -422,8 +473,11 @@ while ((Get-Date) -lt $WindowEnds) {
         if ($ProbeSessionCount -gt $MaximumActiveSessions) {
             $MaximumActiveSessions = $ProbeSessionCount
         }
-        if ($null -ne $ProbeRecord.counter_value -and [double]$ProbeRecord.counter_value -ge 0) {
-            $DelaySamples += [double]$ProbeRecord.counter_value
+        if ($null -ne $ProbeRecord.user_input_delay_value -and [double]$ProbeRecord.user_input_delay_value -ge 0) {
+            $DelaySamples += [double]$ProbeRecord.user_input_delay_value
+        }
+        if ($null -ne $ProbeRecord.tcp_rtt_value -and [double]$ProbeRecord.tcp_rtt_value -ge 0) {
+            $RttSamples += [double]$ProbeRecord.tcp_rtt_value
         }
     }
     catch {
@@ -448,6 +502,13 @@ if ($DelaySamples.Count -gt 0) {
         2
     )
 }
+$MaximumRtt = $null
+if ($RttSamples.Count -gt 0) {
+    $MaximumRtt = [math]::Round(
+        [double](($RttSamples | Measure-Object -Maximum).Maximum),
+        2
+    )
+}
 
 $Record = [ordered]@{
     timestamp = (Get-Date).ToUniversalTime().ToString("o")
@@ -455,6 +516,9 @@ $Record = [ordered]@{
     session_count = $MaximumActiveSessions
     counter_available = $CounterAvailable
     max_user_input_delay_ms = $MaximumDelay
+    rdp_tcp_rtt_counter_available = $RttCounterAvailable
+    rdp_tcp_rtt_ms = $MaximumRtt
+    rdp_tcp_rtt_source = "windows_remotefx_network_current_tcp_rtt"
 }
 
 try {

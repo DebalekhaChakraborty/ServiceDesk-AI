@@ -97,6 +97,11 @@ an entry in that mapping. Current scope is self-service only. `off` is the safe
 default, `demo` uses fake test fixtures, and `gcp` uses real APIs. A real API failure
 never falls back to demo success.
 
+The mapping may contain an optional safe `display_name`; otherwise the portal uses
+`Shared Virtual Workstation`. Raw project, zone, instance name, numeric instance ID,
+and private IP remain controller-only. A fake tracked contract example is provided
+at `examples/gcp_vdi_user_map.example.json`.
+
 ### Evidence and threshold
 
 Host CPU, memory, disk, and network are observations from Cloud Monitoring. The
@@ -117,41 +122,37 @@ parallel collectors, and every collector child is capped at 45 seconds. The task
 first trigger is given a two-minute registration runway and must have a future
 `NextRunTime`; its repetition plus the VM have a three-hour safety boundary.
 
-**Recurring scheduled collection, active-session User Input Delay, and production
-diagnosis consumption are live-validated.** Real validation observed a
-post-registration task run, `LastTaskResult=0`, scheduled
-`supervisor_started`/`started`/`completed(0)`/`supervisor_completed(0)` evidence,
-was active and the record contained `session_count=1`, counter availability, and a
-genuine `0 ms` value. The production ServiceDesk performance diagnosis consumed
-that fresh value and returned `NO_RDP_INPUT_DELAY_THRESHOLD_BREACH`. This measured
-zero is distinct from missing telemetry: inactive or unavailable evidence remains
-null. Portal conversational wording/routing still requires manual validation.
+One-time read-only live discovery validated the Windows `RemoteFX Network(*)\Current
+TCP RTT` counter with an active RDP session. Recurring telemetry and production
+diagnosis preserve unavailable values as null; portal conversational behavior still
+requires manual validation after deployment.
 
 With no active session, the collector publishes capability/session state without
 querying the session counter. Each native session/counter read runs in its own
-2.5-second bounded child and is terminated as a process tree if Windows session
+5-second bounded child and is terminated as a process tree if Windows session
 query or PDH stalls. Wildcard counter-set discovery occurs only once during
-bootstrap; the validated `User Input Delay per Session` path is persisted locally
-and reused by the child probes. A probe identifies active `rdp-tcp` session IDs
-from Windows session state and selects only matching numeric counter instances.
+bootstrap; the validated `User Input Delay per Session` and `RemoteFX Network(*)\Current
+TCP RTT` paths are persisted locally and reused by child probes. A probe identifies
+active `rdp-tcp` sessions and matches each counter's documented instance form.
 Those IDs are used only in process memory and are never written to telemetry or
 audit output. The probe emits no user or session identity.
-The collector records only timestamp, active-session count, counter availability, and
-maximum **RDP User Input Delay**. It does not record usernames, keystrokes, clipboard
+The collector records only timestamp, active-session count, counter availability,
+maximum **RDP TCP RTT**, and maximum **RDP User Input Delay**. It does not record usernames, keystrokes, clipboard
 content, credentials, or user input. User Input Delay is queued Windows application
 input responsiveness, not network RTT or AWS WorkSpaces `InSessionLatency`.
 The collector's bounded execution audit records timestamps, phases, exit codes,
 and sanitized ServiceDesk task metadata. Unexpected action/principal values are
 redacted. It contains no user or session identity.
 
-The only explicit PoC performance boundary is:
+User Input Delay remains a supporting responsiveness observation and never
+qualifies cleanup. The only explicit customer-aligned performance boundary is:
 
 ```text
-RDP User Input Delay > 200 ms
+RDP TCP RTT > 200 ms
 ```
 
-This boundary follows Microsoft Remote Desktop guidance. Exactly 200 ms is not a
-breach. The PoC does not invent CPU, memory, disk, or network severity thresholds.
+Exactly 200 ms is not a breach. The PoC does not invent CPU, memory, disk, or
+network severity thresholds.
 
 ### Shared lab-machine boundary
 
@@ -186,18 +187,21 @@ that diagnosis is read-only, an inactive RDP session has no User Input Delay val
 and inconclusive evidence requires escalation rather than automatic password reset
 or infrastructure remediation.
 
-### KB0019144-compatible lab cleanup
+### KB screenshot-visible PoC cleanup
 
-When real RDP User Input Delay is strictly greater than 200 ms, the performance
+When genuine RDP TCP RTT is strictly greater than 200 ms, the performance
 controller creates a ten-minute, caller- and mapping-bound offer for the
-**KB0019144-Compatible LAB Cleanup Profile**. A later confirmation invokes one
+**KB screenshot-visible PoC cleanup profile**. A later confirmation invokes one
 GCP-specific controller; it revalidates the mapping, retrieves its SOP, requires
 the exact `gcp.virtual_desktop.system_file_cleanup` planner action, runs
 `check_list` once, and collects fresh evidence. It never uses generic
 `cleanup_temp_files`.
 
 The guest script uses native Windows Disk Cleanup only when it is installed and
-only for an explicit PoC allowlist of available VolumeCaches categories. It is not
+only with profile ID `9144`, using `StateFlags9144` and `/sagerun:9144`. The only
+authorized categories are `Downloaded Program Files` and `Temporary Internet
+Files`; all other handlers have profile 9144 cleared during execution and their
+prior profile-9144 values are restored afterward. It is not
 the customer's complete production cleanup policy. It never targets user folders,
 browser profiles, Outlook data, SCCM content, networking, domain membership, or
 Windows services. The controller resolves the mapped VM's Compute Engine private
@@ -208,6 +212,6 @@ RDP, or public WinRM is added.
 
 For a rehearsal that needs an elevated branch, use `GCP_VDI_MODE=demo` and
 `GCP_VDI_DEMO_SCENARIO=kb0019144_high_latency`. This produces a clearly labelled
-demo-only 243-ms RDP User Input Delay. For a genuine lab measurement, an operator
+demo-only 243-ms RDP TCP RTT. For a genuine lab measurement, an operator
 may run `scripts/gcp_vdi_demo_fault.ps1` through their existing secure guest
 session; it is bounded to 60–120 seconds and is never exposed to chat.

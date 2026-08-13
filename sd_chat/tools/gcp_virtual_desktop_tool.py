@@ -8,12 +8,14 @@ chat input can never select an arbitrary Compute Engine resource.
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import re
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
 from urllib.parse import unquote
 
@@ -27,12 +29,15 @@ from .gcp_virtual_desktop_cleanup import execute_system_file_cleanup
 
 SUPPORTED_MODES = {"off", "demo", "gcp"}
 IAP_TCP_SOURCE_RANGE = "35.235.240.0/20"
-RDP_USER_INPUT_DELAY_THRESHOLD_MS = 200.0
+RDP_TCP_RTT_THRESHOLD_MS = 200.0
 DEFAULT_LOOKBACK_MINUTES = 30
 DEFAULT_TELEMETRY_FRESHNESS_MINUTES = 10
 DEFAULT_LOG_LIMIT = 100
 CLEANUP_OFFER_TTL_SECONDS = 10 * 60
 GCP_VDI_CLEANUP_OFFER_STATE_KEY = "gcp_vdi_cleanup_offer"
+ENDPOINT_TARGET_BINDING_STATE_KEY = "endpoint_target_binding"
+SHARED_WORKSTATION_SCOPE = "shared_virtual_workstation"
+SHARED_WORKSTATION_SOURCE = "trusted_shared_workstation_mapping"
 DEFAULT_DEMO_FIXTURE_PATH = (
     Path(__file__).resolve().parents[2]
     / "tests"
@@ -106,8 +111,8 @@ _ORCHESTRATION_SPECS = {
         "action_id": "gcp.virtual_desktop.system_file_cleanup",
         "tool": "gcp_virtual_desktop_tool",
         "action": "confirm_virtual_desktop_system_file_cleanup",
-        "step": "Run KB0019144-compatible System File Cleanup on the authenticated caller's mapped GCP virtual desktop",
-        "sop_query": "KB0019144-Compatible GCP Virtual Desktop PoC System File Cleanup",
+        "step": "Run the ServiceDesk GCP shared-workstation System File Cleanup profile after confirmed high session RTT",
+        "sop_query": "KB screenshot-visible GCP shared-workstation System File Cleanup profile 9144",
     },
 }
 
@@ -169,6 +174,7 @@ def _validate_mapping_entry(raw: Any) -> Dict[str, str]:
         "zone": str(raw.get("zone") or "").strip(),
         "instance_name": str(raw.get("instance_name") or "").strip(),
         "windows_username": str(raw.get("windows_username") or "").strip(),
+        "display_name": str(raw.get("display_name") or "").strip(),
     }
     if not _PROJECT_RE.fullmatch(entry["project_id"]):
         raise _MappingError("invalid_project_id")
@@ -178,7 +184,40 @@ def _validate_mapping_entry(raw: Any) -> Dict[str, str]:
         raise _MappingError("invalid_instance_name")
     if not _WINDOWS_USER_RE.fullmatch(entry["windows_username"]):
         raise _MappingError("invalid_windows_username")
+    if entry["display_name"]:
+        if len(entry["display_name"]) > 80 or any(
+            ord(character) < 32 for character in entry["display_name"]
+        ):
+            raise _MappingError("invalid_display_name")
+    else:
+        entry["display_name"] = "Shared Virtual Workstation"
     return entry
+
+
+def _mapping_fingerprint(mapping: Mapping[str, str]) -> str:
+    stable = json.dumps(dict(mapping), sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(stable.encode("utf-8")).hexdigest()
+
+
+def _require_shared_workstation_binding(
+    caller_upn: str,
+    mapping: Mapping[str, str],
+    tool_context: ToolContext,
+) -> Optional[Dict[str, Any]]:
+    binding = _state(tool_context).get(ENDPOINT_TARGET_BINDING_STATE_KEY)
+    if not (
+        isinstance(binding, Mapping)
+        and binding.get("target_scope") == SHARED_WORKSTATION_SCOPE
+        and binding.get("source") == SHARED_WORKSTATION_SOURCE
+        and _norm_upn(binding.get("caller_upn")) == caller_upn
+        and binding.get("mapping_fingerprint") == _mapping_fingerprint(mapping)
+    ):
+        return _error(
+            "GCP_VDI_SHARED_BINDING_REQUIRED",
+            "Select the shared virtual workstation again before using this controller.",
+            _mode(),
+        )
+    return None
 
 
 def _mapping_for(caller_upn: str) -> Dict[str, str]:
@@ -252,6 +291,11 @@ def _resolve_request(
             configured_mode,
         )
 
+    binding_error = _require_shared_workstation_binding(
+        caller_upn, mapping, tool_context
+    )
+    if binding_error is not None:
+        return None, binding_error
     return mapping, None
 
 
@@ -268,7 +312,7 @@ def _orchestration_gate(
     controller therefore repeats the approved orchestration deterministically so
     an automatic tool call cannot bypass a failed or invented plan.  SOP
     prerequisites remain in the knowledge article; the generic planner receives
-    only the registry's single executable, read-only diagnostic step.
+    the registry's single executable step grounded in the retrieved material.
     """
     spec = _ORCHESTRATION_SPECS[issue_type]
     backend = _mode()
@@ -302,11 +346,21 @@ def _orchestration_gate(
         )
 
     canonical_step = str(spec["step"])
+    snippets = retrieved.get("snippets")
+    if not isinstance(snippets, list) or not snippets:
+        return None, _error(
+            "GCP_VDI_SOP_NOT_FOUND",
+            "The approved GCP virtual desktop SOP returned no usable material; diagnosis was not run.",
+            backend,
+        )
+    grounded_sop = canonical_step + "\n\nApproved SOP material:\n" + "\n\n".join(
+        str(snippet) for snippet in snippets
+    )
     try:
         planned = _propose_plan(
             user_text=canonical_step,
             ctx_vars=["target_upn"],
-            sop_texts=[canonical_step],
+            sop_texts=[grounded_sop],
         )
     except Exception:
         planned = {"status": "error"}
@@ -348,12 +402,25 @@ def _orchestration_gate(
             backend,
         )
 
+    policy_context = tool_context
+    if not use_caller_policy_context:
+        caller_state = _state(tool_context)
+        policy_context = SimpleNamespace(
+            state={
+                ENDPOINT_TARGET_BINDING_STATE_KEY: caller_state.get(
+                    ENDPOINT_TARGET_BINDING_STATE_KEY
+                ),
+                GCP_VDI_CLEANUP_OFFER_STATE_KEY: caller_state.get(
+                    GCP_VDI_CLEANUP_OFFER_STATE_KEY
+                ),
+            }
+        )
     try:
         policy = _check_list(
             preconditions=preconditions,
             caller_upn=target_upn,
             target_upn=target_upn,
-            tool_context=tool_context if use_caller_policy_context else None,
+            tool_context=policy_context,
         )
     except Exception:
         policy = {"status": "error"}
@@ -788,6 +855,7 @@ def _collect_logs(
     )
 
     telemetry: Dict[str, Any] = _unavailable("no_recent_rdp_telemetry")
+    rtt_telemetry: Dict[str, Any] = _unavailable("no_recent_rdp_telemetry")
     events: List[Dict[str, Any]] = []
     errors: List[str] = []
     try:
@@ -815,10 +883,14 @@ def _collect_logs(
                     payload = parsed_message
             timestamp = _iso_timestamp(getattr(entry, "timestamp", None))
             delay = _find_payload_value(payload, {"max_user_input_delay_ms"})
+            rtt = _find_payload_value(payload, {"rdp_tcp_rtt_ms"})
             session_active = _as_bool(_find_payload_value(payload, {"session_active"}))
             session_count = _as_int(_find_payload_value(payload, {"session_count"}))
             counter_available = _as_bool(
                 _find_payload_value(payload, {"counter_available"})
+            )
+            rtt_counter_available = _as_bool(
+                _find_payload_value(payload, {"rdp_tcp_rtt_counter_available"})
             )
             observed_at = (
                 _iso_timestamp(_find_payload_value(payload, {"timestamp"})) or timestamp
@@ -827,6 +899,10 @@ def _collect_logs(
                 numeric_delay = float(delay) if delay is not None else None
             except (TypeError, ValueError):
                 numeric_delay = None
+            try:
+                numeric_rtt = float(rtt) if rtt is not None else None
+            except (TypeError, ValueError):
+                numeric_rtt = None
             measurement_available = (
                 session_active is True
                 and counter_available is not False
@@ -848,10 +924,36 @@ def _collect_logs(
                 "source": "windows_user_input_delay",
                 "reason": reason,
             }
+            rtt_available = (
+                session_active is True
+                and rtt_counter_available is not False
+                and numeric_rtt is not None
+            )
+            if session_active is not True:
+                rtt_reason = "no_active_rdp_session"
+            elif rtt_counter_available is False or numeric_rtt is None:
+                rtt_reason = "counter_value_unavailable"
+            else:
+                rtt_reason = None
+            rtt_telemetry = {
+                "status": "available" if rtt_available else "unavailable",
+                "value": numeric_rtt if rtt_available else None,
+                "timestamp": observed_at,
+                "session_active": session_active is True,
+                "session_count": session_count,
+                "counter_available": rtt_counter_available,
+                "source": str(
+                    _find_payload_value(payload, {"rdp_tcp_rtt_source"})
+                    or "windows_remotefx_network_current_tcp_rtt"
+                ),
+                "unit": "ms",
+                "reason": rtt_reason,
+            }
             break
     except Exception:
         errors.append("telemetry_query_failed")
         telemetry = _unavailable("telemetry_query_failed")
+        rtt_telemetry = _unavailable("telemetry_query_failed")
 
     log_limit = _bounded_int("GCP_VDI_LOG_LIMIT", DEFAULT_LOG_LIMIT, 1, 500)
     try:
@@ -903,6 +1005,8 @@ def _collect_logs(
     except Exception:
         errors.append("rdp_event_query_failed")
     _reconcile_telemetry_session_state(telemetry, events)
+    _reconcile_telemetry_session_state(rtt_telemetry, events)
+    telemetry["rdp_tcp_rtt"] = rtt_telemetry
     return telemetry, events, errors
 
 
@@ -1010,6 +1114,7 @@ def _load_gcp_snapshot(mapping: Mapping[str, str]) -> Dict[str, Any]:
             },
             "metrics": {},
             "rdp_telemetry": _unavailable("instance_not_found"),
+            "rdp_tcp_rtt": _unavailable("instance_not_found"),
             "events": [],
             "network_access": {"status": "unavailable"},
             "collection_errors": [],
@@ -1019,6 +1124,9 @@ def _load_gcp_snapshot(mapping: Mapping[str, str]) -> Dict[str, Any]:
     metrics, metric_errors = _collect_metrics(project_id, instance_id)
     metrics["uptime_seconds"] = _instance_uptime_observation(instance)
     telemetry, events, logging_errors = _collect_logs(project_id, instance_id)
+    rtt_telemetry = telemetry.get("rdp_tcp_rtt")
+    telemetry = dict(telemetry)
+    telemetry.pop("rdp_tcp_rtt", None)
     network_access, network_errors = _network_access(project_id, instance)
     return {
         "instance": {
@@ -1029,6 +1137,11 @@ def _load_gcp_snapshot(mapping: Mapping[str, str]) -> Dict[str, Any]:
         },
         "metrics": metrics,
         "rdp_telemetry": telemetry,
+        "rdp_tcp_rtt": (
+            dict(rtt_telemetry)
+            if isinstance(rtt_telemetry, Mapping)
+            else _unavailable("no_recent_rdp_telemetry")
+        ),
         "events": events,
         "network_access": network_access,
         "collection_errors": metric_errors + logging_errors + network_errors,
@@ -1070,7 +1183,7 @@ def _cleanup_offer_public(offer: Mapping[str, Any]) -> Dict[str, Any]:
         "offer_id": offer.get("offer_id"),
         "action_id": offer.get("action_id"),
         "expires_at": offer.get("expires_at"),
-        "profile": "KB0019144-Compatible LAB Cleanup Profile",
+        "profile": "KB screenshot-visible PoC cleanup profile",
     }
 
 
@@ -1081,10 +1194,10 @@ def _create_cleanup_offer(
     tool_context: ToolContext,
 ) -> Optional[Dict[str, Any]]:
     """Create one non-executable, caller- and mapping-bound cleanup offer."""
-    if diagnosis.get("finding_code") != "RDP_USER_INPUT_DELAY_ELEVATED":
+    if diagnosis.get("finding_code") != "HIGH_SESSION_RTT":
         _state(tool_context)[GCP_VDI_CLEANUP_OFFER_STATE_KEY] = None
         return None
-    telemetry = (diagnosis.get("metrics") or {}).get("rdp_user_input_delay_ms")
+    telemetry = (diagnosis.get("metrics") or {}).get("rdp_tcp_rtt_ms")
     if not isinstance(telemetry, Mapping) or telemetry.get("status") != "available":
         _state(tool_context)[GCP_VDI_CLEANUP_OFFER_STATE_KEY] = None
         return None
@@ -1095,6 +1208,8 @@ def _create_cleanup_offer(
         "expires_at": int(time.time()) + CLEANUP_OFFER_TTL_SECONDS,
         "created_invocation_id": getattr(tool_context, "invocation_id", None),
         "caller_upn": target_upn,
+        "target_scope": SHARED_WORKSTATION_SCOPE,
+        "mapping_fingerprint": _mapping_fingerprint(mapping),
         "target": {
             "project_id": mapping["project_id"],
             "zone": mapping["zone"],
@@ -1103,7 +1218,7 @@ def _create_cleanup_offer(
         "backend": diagnosis.get("backend"),
         "finding_code": diagnosis.get("finding_code"),
         "evidence_timestamp": telemetry.get("timestamp"),
-        "rdp_user_input_delay_ms": telemetry.get("value"),
+        "rdp_tcp_rtt_ms": telemetry.get("value"),
         "action_id": _ORCHESTRATION_SPECS["cleanup"]["action_id"],
     }
     _state(tool_context)[GCP_VDI_CLEANUP_OFFER_STATE_KEY] = offer
@@ -1114,6 +1229,8 @@ def _mapping_matches_offer(mapping: Mapping[str, str], offer: Mapping[str, Any])
     target = offer.get("target")
     return bool(
         isinstance(target, Mapping)
+        and offer.get("target_scope") == SHARED_WORKSTATION_SCOPE
+        and offer.get("mapping_fingerprint") == _mapping_fingerprint(mapping)
         and target.get("project_id") == mapping.get("project_id")
         and target.get("zone") == mapping.get("zone")
         and target.get("instance_name") == mapping.get("instance_name")
@@ -1132,6 +1249,9 @@ def _latest_timestamp(snapshot: Mapping[str, Any]) -> Optional[str]:
     telemetry = snapshot.get("rdp_telemetry")
     if isinstance(telemetry, Mapping) and telemetry.get("timestamp"):
         timestamps.append(str(telemetry["timestamp"]))
+    rtt = snapshot.get("rdp_tcp_rtt")
+    if isinstance(rtt, Mapping) and rtt.get("timestamp"):
+        timestamps.append(str(rtt["timestamp"]))
     timestamps.extend(
         str(event.get("timestamp"))
         for event in (snapshot.get("events") or [])
@@ -1168,11 +1288,7 @@ def _base_diagnosis(
     return {
         "issue_type": issue_type,
         "backend": backend,
-        "target_upn": target_upn,
-        "project_id": mapping["project_id"],
-        "zone": mapping["zone"],
-        "instance_name": mapping["instance_name"],
-        "instance_id": instance.get("id"),
+        "workstation": mapping.get("display_name") or "Shared Virtual Workstation",
         "instance_state": instance.get("status", "UNKNOWN"),
         "read_only": True,
         "infrastructure_mutation_performed": False,
@@ -1260,9 +1376,20 @@ def _performance_diagnosis(
     disconnect_count = _disconnect_episode_count(raw_events)
     telemetry = snapshot.get("rdp_telemetry")
     telemetry = dict(telemetry) if isinstance(telemetry, Mapping) else _unavailable()
+    rtt_telemetry = snapshot.get("rdp_tcp_rtt")
+    rtt_telemetry = (
+        dict(rtt_telemetry)
+        if isinstance(rtt_telemetry, Mapping)
+        else _unavailable("no_recent_rdp_tcp_rtt")
+    )
     metrics = dict(snapshot.get("metrics") or {})
     metrics["rdp_user_input_delay_ms"] = telemetry
-    delay = telemetry.get("value") if telemetry.get("status") == "available" else None
+    metrics["rdp_tcp_rtt_ms"] = rtt_telemetry
+    rtt = (
+        rtt_telemetry.get("value")
+        if rtt_telemetry.get("status") == "available"
+        else None
+    )
 
     if not instance.get("exists"):
         finding = "VDI_INSTANCE_NOT_FOUND"
@@ -1271,27 +1398,27 @@ def _performance_diagnosis(
         finding = "VDI_INSTANCE_NOT_RUNNING"
         message = f"The assigned GCP virtual desktop is {instance.get('status', 'not running')}."
     elif (
-        isinstance(delay, (int, float))
-        and float(delay) > RDP_USER_INPUT_DELAY_THRESHOLD_MS
+        isinstance(rtt, (int, float))
+        and float(rtt) > RDP_TCP_RTT_THRESHOLD_MS
     ):
-        finding = "RDP_USER_INPUT_DELAY_ELEVATED"
-        message = "RDP User Input Delay is above the PoC responsiveness threshold."
+        finding = "HIGH_SESSION_RTT"
+        message = "Measured RDP TCP round-trip time is above the 200 ms threshold."
     elif disconnect_count >= 2:
         finding = "RDP_RECENT_DISCONNECTS"
         message = "Repeated recent Remote Desktop session disconnects were detected."
-    elif telemetry.get("reason") == "no_active_rdp_session":
+    elif rtt_telemetry.get("reason") == "no_active_rdp_session":
         finding = "NO_ACTIVE_RDP_SESSION"
         message = (
-            "No active Remote Desktop session is present, so RDP User Input Delay "
-            "cannot be measured."
+            "No active Remote Desktop session is present, so RDP TCP round-trip "
+            "time cannot be measured."
         )
-    elif telemetry.get("status") != "available":
-        finding = "NO_RECENT_RDP_TELEMETRY"
-        message = "Recent RDP User Input Delay telemetry is unavailable; it was not treated as zero."
+    elif rtt_telemetry.get("status") != "available":
+        finding = "RDP_TCP_RTT_UNAVAILABLE"
+        message = "Recent RDP TCP round-trip telemetry is unavailable; it was not treated as zero."
     else:
-        finding = "NO_RDP_INPUT_DELAY_THRESHOLD_BREACH"
+        finding = "NO_HIGH_SESSION_RTT"
         message = (
-            "RDP User Input Delay did not exceed the PoC responsiveness threshold."
+            "Measured RDP TCP round-trip time did not exceed 200 ms."
         )
 
     diagnosis.update(
@@ -1302,9 +1429,9 @@ def _performance_diagnosis(
             "telemetry_latest_timestamp": _latest_timestamp(snapshot),
             "collection_limitations": list(snapshot.get("collection_errors") or []),
             "finding_code": finding,
-            "rdp_user_input_delay_threshold_ms": RDP_USER_INPUT_DELAY_THRESHOLD_MS,
-            "threshold_rule": "RDP User Input Delay > 200 ms",
-            "threshold_source": "Microsoft Remote Desktop guidance",
+            "rdp_tcp_rtt_threshold_ms": RDP_TCP_RTT_THRESHOLD_MS,
+            "threshold_rule": "RDP TCP RTT > 200 ms",
+            "threshold_source": "customer KB performance threshold",
             "message": message,
         }
     )
@@ -1477,7 +1604,7 @@ def gcp_confirm_virtual_desktop_system_file_cleanup(
         "offer_id": offer.get("offer_id"),
         "pre_cleanup_evidence": {
             "finding_code": offer.get("finding_code"),
-            "rdp_user_input_delay_ms": offer.get("rdp_user_input_delay_ms"),
+            "rdp_tcp_rtt_ms": offer.get("rdp_tcp_rtt_ms"),
             "timestamp": offer.get("evidence_timestamp"),
         },
         "post_cleanup_diagnosis": post,
@@ -1486,12 +1613,24 @@ def gcp_confirm_virtual_desktop_system_file_cleanup(
         response["message"] = (
             "System File Cleanup completed, but fresh performance telemetry is not available yet."
         )
-    elif post.get("diagnosis", {}).get("finding_code") == "RDP_USER_INPUT_DELAY_ELEVATED":
+    elif post.get("diagnosis", {}).get("finding_code") == "HIGH_SESSION_RTT":
         response["message"] = (
-            "System File Cleanup completed, but the session-responsiveness condition remains; offer escalation."
+            "System File Cleanup completed successfully, but the measured RDP round-trip time remains above the 200 ms threshold. The remaining evidence is consistent with a network-path condition, so the next troubleshooting step is to investigate the network/ISP path."
+        )
+    elif (
+        post.get("diagnosis", {})
+        .get("metrics", {})
+        .get("rdp_tcp_rtt_ms", {})
+        .get("status")
+        != "available"
+    ):
+        response["message"] = (
+            "System File Cleanup completed, but fresh RDP round-trip telemetry is unavailable; no performance resolution was claimed."
         )
     else:
-        response["message"] = "System File Cleanup completed; fresh performance evidence was collected."
+        response["message"] = (
+            "System File Cleanup completed; current RDP round-trip time is no longer above the 200 ms threshold."
+        )
     return response
 
 

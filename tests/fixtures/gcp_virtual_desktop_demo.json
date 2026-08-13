@@ -13,45 +13,46 @@
         "uptime_seconds": {"status": "available", "value": 3600.0, "timestamp": "2030-01-01T00:00:00Z"}
       },
       "rdp_telemetry": {"status": "available", "value": 86.0, "timestamp": "2030-01-01T00:00:00Z", "session_active": true, "session_count": 1, "source": "windows_user_input_delay"},
+      "rdp_tcp_rtt": {"status": "available", "value": 80.0, "timestamp": "2030-01-01T00:00:00Z", "session_active": true, "session_count": 1, "source": "windows_remotefx_network_current_tcp_rtt", "unit": "ms"},
       "events": [{"timestamp": "2030-01-01T00:00:00Z", "event_id": 21, "channel": "Fake-RDP/Operational", "category": "session"}],
       "network_access": {"status": "available", "external_ip": false, "iap_tcp_3389_allowed": true, "public_tcp_3389_rule_present": false, "public_rdp_exposed": false},
       "collection_errors": []
     },
     "stopped": {
       "instance": {"exists": true, "id": "1000000000000000002", "name": "fake-vdi", "status": "TERMINATED"},
-      "metrics": {}, "rdp_telemetry": {"status": "unavailable", "value": null, "timestamp": null}, "events": [], "network_access": {"status": "available"}, "collection_errors": []
+      "metrics": {}, "rdp_telemetry": {"status": "unavailable", "value": null, "timestamp": null}, "rdp_tcp_rtt": {"status": "unavailable", "value": null, "timestamp": null}, "events": [], "network_access": {"status": "available"}, "collection_errors": []
     },
     "not_found": {
       "instance": {"exists": false, "id": null, "name": "fake-vdi", "status": "NOT_FOUND"},
-      "metrics": {}, "rdp_telemetry": {"status": "unavailable", "value": null, "timestamp": null}, "events": [], "network_access": {"status": "unavailable"}, "collection_errors": []
+      "metrics": {}, "rdp_telemetry": {"status": "unavailable", "value": null, "timestamp": null}, "rdp_tcp_rtt": {"status": "unavailable", "value": null, "timestamp": null}, "events": [], "network_access": {"status": "unavailable"}, "collection_errors": []
     },
     "rdp_login_failure": {
       "instance": {"exists": true, "id": "1000000000000000003", "name": "fake-vdi", "status": "RUNNING"},
-      "metrics": {}, "rdp_telemetry": {"status": "unavailable", "value": null, "timestamp": null},
+      "metrics": {}, "rdp_telemetry": {"status": "unavailable", "value": null, "timestamp": null}, "rdp_tcp_rtt": {"status": "unavailable", "value": null, "timestamp": null},
       "events": [{"timestamp": "2030-01-01T00:01:00Z", "event_id": 4625, "channel": "Security", "category": "authentication_failure"}],
       "network_access": {"status": "available", "external_ip": false, "iap_tcp_3389_allowed": true, "public_rdp_exposed": false}, "collection_errors": []
     },
     "rdp_disconnect": {
       "instance": {"exists": true, "id": "1000000000000000004", "name": "fake-vdi", "status": "RUNNING"},
-      "metrics": {}, "rdp_telemetry": {"status": "available", "value": 110.0, "timestamp": "2030-01-01T00:02:00Z", "session_active": false, "session_count": 0, "source": "windows_user_input_delay"},
+      "metrics": {}, "rdp_telemetry": {"status": "available", "value": 110.0, "timestamp": "2030-01-01T00:02:00Z", "session_active": false, "session_count": 0, "source": "windows_user_input_delay"}, "rdp_tcp_rtt": {"status": "unavailable", "value": null, "timestamp": "2030-01-01T00:02:00Z", "reason": "no_active_rdp_session"},
       "events": [{"timestamp": "2030-01-01T00:02:00Z", "event_id": 24, "channel": "Fake-RDP/Operational", "category": "disconnect"}, {"timestamp": "2030-01-01T00:01:00Z", "event_id": 40, "channel": "Fake-RDP/Operational", "category": "disconnect"}],
       "network_access": {"status": "available"}, "collection_errors": []
     },
     "delay_below_200": {
       "instance": {"exists": true, "id": "1000000000000000005", "name": "fake-vdi", "status": "RUNNING"},
-      "metrics": {}, "rdp_telemetry": {"status": "available", "value": 199.0, "timestamp": "2030-01-01T00:03:00Z", "session_active": true, "session_count": 1, "source": "windows_user_input_delay"}, "events": [], "network_access": {"status": "available"}, "collection_errors": []
+      "metrics": {}, "rdp_telemetry": {"status": "available", "value": 260.0, "timestamp": "2030-01-01T00:03:00Z", "session_active": true, "session_count": 1, "source": "windows_user_input_delay"}, "rdp_tcp_rtt": {"status": "available", "value": 199.0, "timestamp": "2030-01-01T00:03:00Z", "session_active": true, "source": "windows_remotefx_network_current_tcp_rtt", "unit": "ms"}, "events": [], "network_access": {"status": "available"}, "collection_errors": []
     },
     "delay_exactly_200": {
       "instance": {"exists": true, "id": "1000000000000000006", "name": "fake-vdi", "status": "RUNNING"},
-      "metrics": {}, "rdp_telemetry": {"status": "available", "value": 200.0, "timestamp": "2030-01-01T00:04:00Z", "session_active": true, "session_count": 1, "source": "windows_user_input_delay"}, "events": [], "network_access": {"status": "available"}, "collection_errors": []
+      "metrics": {}, "rdp_telemetry": {"status": "available", "value": 260.0, "timestamp": "2030-01-01T00:04:00Z", "session_active": true, "session_count": 1, "source": "windows_user_input_delay"}, "rdp_tcp_rtt": {"status": "available", "value": 200.0, "timestamp": "2030-01-01T00:04:00Z", "session_active": true, "source": "windows_remotefx_network_current_tcp_rtt", "unit": "ms"}, "events": [], "network_access": {"status": "available"}, "collection_errors": []
     },
     "delay_above_200": {
       "instance": {"exists": true, "id": "1000000000000000007", "name": "fake-vdi", "status": "RUNNING"},
-      "metrics": {}, "rdp_telemetry": {"status": "available", "value": 243.0, "timestamp": "2030-01-01T00:05:00Z", "session_active": true, "session_count": 1, "source": "windows_user_input_delay"}, "events": [], "network_access": {"status": "available"}, "collection_errors": []
+      "metrics": {}, "rdp_telemetry": {"status": "available", "value": 90.0, "timestamp": "2030-01-01T00:05:00Z", "session_active": true, "session_count": 1, "source": "windows_user_input_delay"}, "rdp_tcp_rtt": {"status": "available", "value": 201.0, "timestamp": "2030-01-01T00:05:00Z", "session_active": true, "source": "windows_remotefx_network_current_tcp_rtt", "unit": "ms"}, "events": [], "network_access": {"status": "available"}, "collection_errors": []
     },
     "kb0019144_high_latency": {
       "instance": {"exists": true, "id": "1000000000000000009", "name": "fake-vdi", "status": "RUNNING"},
-      "metrics": {}, "rdp_telemetry": {"status": "available", "value": 243.0, "timestamp": "2030-01-01T00:07:00Z", "session_active": true, "session_count": 1, "source": "windows_user_input_delay"}, "events": [], "network_access": {"status": "available"}, "collection_errors": []
+      "metrics": {}, "rdp_telemetry": {"status": "available", "value": 243.0, "timestamp": "2030-01-01T00:07:00Z", "session_active": true, "session_count": 1, "source": "windows_user_input_delay"}, "rdp_tcp_rtt": {"status": "available", "value": 243.0, "timestamp": "2030-01-01T00:07:00Z", "session_active": true, "source": "windows_remotefx_network_current_tcp_rtt", "unit": "ms"}, "events": [], "network_access": {"status": "available"}, "collection_errors": []
     },
     "missing_telemetry": {
       "instance": {"exists": true, "id": "1000000000000000008", "name": "fake-vdi", "status": "RUNNING"},
@@ -59,6 +60,7 @@
         "cpu": {"status": "available", "value": 0.11, "timestamp": "2030-01-01T00:06:00Z"}
       },
       "rdp_telemetry": {"status": "unavailable", "value": null, "timestamp": null, "reason": "no_recent_rdp_telemetry"}, "events": [], "network_access": {"status": "available"}, "collection_errors": []
+      ,"rdp_tcp_rtt": {"status": "unavailable", "value": null, "timestamp": null, "reason": "no_recent_rdp_telemetry"}
     }
   }
 }
