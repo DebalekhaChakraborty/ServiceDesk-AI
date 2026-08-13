@@ -1007,6 +1007,7 @@ def test_windows_bootstrap_proves_one_window_and_registers_recurring_task():
     assert "validation did not produce a fresh sample" in script
     assert 'CollectorTask.State -eq "Ready"' in script
     assert "TelemetryFile.LastWriteTimeUtc -lt $CollectorValidationStarted" in script
+    assert script.count('Filter "rdp_telemetry_*.jsonl"') >= 3
     assert "collector validation returned exit code" in script
     assert "bounded scheduled supervisor" in script
     assert 'Phase "scheduled_task_validation"' not in script
@@ -1116,11 +1117,29 @@ def test_windows_scheduled_collector_has_bounded_non_sensitive_execution_audit()
 
     assert "rdp_collector_audit.jsonl" in script
     assert "servicedesk_rdp_collector_audit" in script
-    assert "$MaximumAuditBytes = 1MB" in task_runner
+    assert "$MaximumAuditFiles = 720" in task_runner
     assert 'Write-CollectorAudit -Phase "started"' in task_runner
     assert 'Write-CollectorAudit -Phase "completed"' in task_runner
+    assert 'rdp_collector_audit_{0}.tmp' in task_runner
+    assert 'rdp_collector_audit_{0}.jsonl' in task_runner
+    assert "Move-Item -Path $AuditTempPath -Destination $AuditPath" in task_runner
     assert "username" not in task_runner.casefold()
     assert "credential" not in task_runner.casefold()
+
+
+def test_windows_collector_atomically_publishes_bounded_telemetry_files():
+    script = Path("scripts/configure_gcp_vdi_windows.ps1").read_text(encoding="utf-8")
+    collector = script.split("$CollectorScript = @'", 1)[1].split("'@", 1)[0]
+
+    assert "$MaximumTelemetryFiles = 360" in collector
+    assert 'rdp_telemetry_{0}.tmp' in collector
+    assert 'rdp_telemetry_{0}.jsonl' in collector
+    assert "Move-Item -Path $TelemetryTempPath -Destination $TelemetryPath" in collector
+    assert 'Filter "rdp_telemetry_*.jsonl"' in collector
+    assert "Select-Object -Skip $MaximumTelemetryFiles" in collector
+    assert "rdp_telemetry_*.jsonl" in script
+    assert "rdp_collector_audit_*.jsonl" in script
+    assert script.count("wildcard_refresh_interval: 10s") == 2
 
 
 def test_windows_bootstrap_does_not_modify_sccm_domain_or_network_configuration():

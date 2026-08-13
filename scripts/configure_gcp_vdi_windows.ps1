@@ -62,8 +62,18 @@ function Write-ExistingTaskDiagnostic {
         if ($null -ne $ExistingTaskInfo -and $ExistingTaskInfo.NextRunTime.Year -gt 1) {
             $SafeNextRunTime = $ExistingTaskInfo.NextRunTime.ToUniversalTime().ToString("o")
         }
-        $TelemetryFile = Get-Item -Path $TelemetryPath -ErrorAction SilentlyContinue
-        $AuditFile = Get-Item -Path $CollectorAuditPath -ErrorAction SilentlyContinue
+        $TelemetryFile = Get-ChildItem -Path $ServiceDeskRoot -Filter "rdp_telemetry_*.jsonl" -File -ErrorAction SilentlyContinue |
+            Sort-Object LastWriteTimeUtc -Descending |
+            Select-Object -First 1
+        if ($null -eq $TelemetryFile) {
+            $TelemetryFile = Get-Item -Path $TelemetryPath -ErrorAction SilentlyContinue
+        }
+        $AuditFile = Get-ChildItem -Path $ServiceDeskRoot -Filter "rdp_collector_audit_*.jsonl" -File -ErrorAction SilentlyContinue |
+            Sort-Object LastWriteTimeUtc -Descending |
+            Select-Object -First 1
+        if ($null -eq $AuditFile) {
+            $AuditFile = Get-Item -Path $CollectorAuditPath -ErrorAction SilentlyContinue
+        }
         [ordered]@{
             timestamp = (Get-Date).ToUniversalTime().ToString("o")
             phase = "existing_task_diagnostic"
@@ -236,19 +246,14 @@ if ($null -ne $MaximumDelay.Maximum) {
     $CollectorScript = @'
 $ErrorActionPreference = "Continue"
 $ServiceDeskRoot = "C:\ProgramData\ServiceDeskVDI"
-$TelemetryPath = Join-Path $ServiceDeskRoot "rdp_telemetry.jsonl"
 $CapabilityPath = Join-Path $ServiceDeskRoot "capabilities.json"
 $CounterProbePath = Join-Path $ServiceDeskRoot "Measure-RdpUserInputDelay.ps1"
 $CounterProbeOutputPath = Join-Path $ServiceDeskRoot ("rdp_input_delay_sample_{0}.txt" -f $PID)
-$RotatedPath = "$TelemetryPath.1"
-$MaximumLogBytes = 5MB
+$MaximumTelemetryFiles = 360
 $PublishIntervalSeconds = 30
 $MaximumCounterProbeMilliseconds = 2500
 
 New-Item -Path $ServiceDeskRoot -ItemType Directory -Force | Out-Null
-if (-not (Test-Path $TelemetryPath)) {
-    New-Item -Path $TelemetryPath -ItemType File -Force | Out-Null
-}
 
 $CounterAvailable = $false
 try {
@@ -332,13 +337,26 @@ $Record = [ordered]@{
 }
 
 try {
-    if ((Test-Path $TelemetryPath) -and (Get-Item $TelemetryPath).Length -ge $MaximumLogBytes) {
-        Move-Item -Path $TelemetryPath -Destination $RotatedPath -Force
-        New-Item -Path $TelemetryPath -ItemType File -Force | Out-Null
-    }
-    $Record | ConvertTo-Json -Compress | Add-Content -Path $TelemetryPath -Encoding UTF8
+    # Publish a completed record under a fresh, fixed-prefix filename. On
+    # Windows this avoids write contention with the Ops Agent tail receiver,
+    # which can keep an already-discovered file open. The temporary filename
+    # does not match the receiver wildcard and the final move is atomic.
+    $RecordToken = "{0}_{1}_{2}" -f (
+        (Get-Date).ToUniversalTime().ToString("yyyyMMddTHHmmssfffffffZ")
+    ), $PID, ([guid]::NewGuid().ToString("N"))
+    $TelemetryTempPath = Join-Path $ServiceDeskRoot ("rdp_telemetry_{0}.tmp" -f $RecordToken)
+    $TelemetryPath = Join-Path $ServiceDeskRoot ("rdp_telemetry_{0}.jsonl" -f $RecordToken)
+    $Record | ConvertTo-Json -Compress | Set-Content -Path $TelemetryTempPath -Encoding UTF8
+    Move-Item -Path $TelemetryTempPath -Destination $TelemetryPath
+    Get-ChildItem -Path $ServiceDeskRoot -Filter "rdp_telemetry_*.jsonl" -File -ErrorAction SilentlyContinue |
+        Sort-Object LastWriteTimeUtc -Descending |
+        Select-Object -Skip $MaximumTelemetryFiles |
+        Remove-Item -Force -ErrorAction SilentlyContinue
 }
 catch {
+    if ($TelemetryTempPath) {
+        Remove-Item -Path $TelemetryTempPath -Force -ErrorAction SilentlyContinue
+    }
     exit 1
 }
 '@
@@ -347,8 +365,8 @@ catch {
     $TaskRunnerScript = @'
 $ErrorActionPreference = "Continue"
 $CollectorPath = "C:\ProgramData\ServiceDeskVDI\Collect-RdpUserInputDelay.ps1"
-$AuditPath = "C:\ProgramData\ServiceDeskVDI\rdp_collector_audit.jsonl"
-$MaximumAuditBytes = 1MB
+$ServiceDeskRoot = "C:\ProgramData\ServiceDeskVDI"
+$MaximumAuditFiles = 720
 
 function Write-CollectorAudit {
     param(
@@ -356,16 +374,26 @@ function Write-CollectorAudit {
         [Nullable[int]]$ExitCode
     )
     try {
-        if ((Test-Path $AuditPath) -and (Get-Item $AuditPath).Length -ge $MaximumAuditBytes) {
-            Move-Item -Path $AuditPath -Destination "$AuditPath.1" -Force
-        }
+        $AuditToken = "{0}_{1}_{2}" -f (
+            (Get-Date).ToUniversalTime().ToString("yyyyMMddTHHmmssfffffffZ")
+        ), $PID, ([guid]::NewGuid().ToString("N"))
+        $AuditTempPath = Join-Path $ServiceDeskRoot ("rdp_collector_audit_{0}.tmp" -f $AuditToken)
+        $AuditPath = Join-Path $ServiceDeskRoot ("rdp_collector_audit_{0}.jsonl" -f $AuditToken)
         [ordered]@{
             timestamp = (Get-Date).ToUniversalTime().ToString("o")
             phase = $Phase
             exit_code = $ExitCode
-        } | ConvertTo-Json -Compress | Add-Content -Path $AuditPath -Encoding UTF8
+        } | ConvertTo-Json -Compress | Set-Content -Path $AuditTempPath -Encoding UTF8
+        Move-Item -Path $AuditTempPath -Destination $AuditPath
+        Get-ChildItem -Path $ServiceDeskRoot -Filter "rdp_collector_audit_*.jsonl" -File -ErrorAction SilentlyContinue |
+            Sort-Object LastWriteTimeUtc -Descending |
+            Select-Object -Skip $MaximumAuditFiles |
+            Remove-Item -Force -ErrorAction SilentlyContinue
     }
     catch {
+        if ($AuditTempPath) {
+            Remove-Item -Path $AuditTempPath -Force -ErrorAction SilentlyContinue
+        }
         # The audit is diagnostic only and must not change collector behavior.
     }
 }
@@ -390,7 +418,8 @@ param(
 
 $ErrorActionPreference = "Continue"
 $TaskRunnerPath = "C:\ProgramData\ServiceDeskVDI\Invoke-RdpTelemetryCollector.ps1"
-$AuditPath = "C:\ProgramData\ServiceDeskVDI\rdp_collector_audit.jsonl"
+$ServiceDeskRoot = "C:\ProgramData\ServiceDeskVDI"
+$MaximumAuditFiles = 720
 $MaximumCollectorRuntimeMilliseconds = 45000
 $RestartDelaySeconds = 2
 $Iteration = 0
@@ -402,13 +431,26 @@ function Write-SupervisorAudit {
         [Nullable[int]]$ExitCode
     )
     try {
+        $AuditToken = "{0}_{1}_{2}" -f (
+            (Get-Date).ToUniversalTime().ToString("yyyyMMddTHHmmssfffffffZ")
+        ), $PID, ([guid]::NewGuid().ToString("N"))
+        $AuditTempPath = Join-Path $ServiceDeskRoot ("rdp_collector_audit_{0}.tmp" -f $AuditToken)
+        $AuditPath = Join-Path $ServiceDeskRoot ("rdp_collector_audit_{0}.jsonl" -f $AuditToken)
         [ordered]@{
             timestamp = (Get-Date).ToUniversalTime().ToString("o")
             phase = $Phase
             exit_code = $ExitCode
-        } | ConvertTo-Json -Compress | Add-Content -Path $AuditPath -Encoding UTF8
+        } | ConvertTo-Json -Compress | Set-Content -Path $AuditTempPath -Encoding UTF8
+        Move-Item -Path $AuditTempPath -Destination $AuditPath
+        Get-ChildItem -Path $ServiceDeskRoot -Filter "rdp_collector_audit_*.jsonl" -File -ErrorAction SilentlyContinue |
+            Sort-Object LastWriteTimeUtc -Descending |
+            Select-Object -Skip $MaximumAuditFiles |
+            Remove-Item -Force -ErrorAction SilentlyContinue
     }
     catch {
+        if ($AuditTempPath) {
+            Remove-Item -Path $AuditTempPath -Force -ErrorAction SilentlyContinue
+        }
         # The audit is diagnostic only and must not change collector behavior.
     }
 }
@@ -478,12 +520,16 @@ $ChannelYaml
       type: files
       include_paths:
         - 'C:\ProgramData\ServiceDeskVDI\rdp_telemetry.jsonl'
+        - 'C:\ProgramData\ServiceDeskVDI\rdp_telemetry_*.jsonl'
       record_log_file_path: false
+      wildcard_refresh_interval: 10s
     servicedesk_rdp_collector_audit:
       type: files
       include_paths:
         - 'C:\ProgramData\ServiceDeskVDI\rdp_collector_audit.jsonl'
+        - 'C:\ProgramData\ServiceDeskVDI\rdp_collector_audit_*.jsonl'
       record_log_file_path: false
+      wildcard_refresh_interval: 10s
   processors:
     servicedesk_rdp_json:
       type: parse_json
@@ -578,7 +624,12 @@ $ChannelYaml
     if ($LASTEXITCODE -ne 0) {
         throw "The RDP telemetry collector validation returned exit code $LASTEXITCODE."
     }
-    $TelemetryFile = Get-Item -Path $TelemetryPath -ErrorAction SilentlyContinue
+    $TelemetryFile = Get-ChildItem -Path $ServiceDeskRoot -Filter "rdp_telemetry_*.jsonl" -File -ErrorAction SilentlyContinue |
+        Sort-Object LastWriteTimeUtc -Descending |
+        Select-Object -First 1
+    if ($null -eq $TelemetryFile) {
+        $TelemetryFile = Get-Item -Path $TelemetryPath -ErrorAction SilentlyContinue
+    }
     if ($null -eq $TelemetryFile -or $TelemetryFile.LastWriteTimeUtc -lt $CollectorValidationStarted) {
         throw "The RDP telemetry collector validation did not produce a fresh sample."
     }
