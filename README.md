@@ -112,6 +112,7 @@ task is registered only after a synchronous one-window validation completes, so
 its first trigger cannot overlap startup validation. Windows may defer scheduled
 work until metadata startup exits, so recurring cycles are verified afterward in
 the identity-free Cloud Logging audit rather than from inside the startup job. The
+first run is scheduled 30 seconds after registration and repeats every minute. The
 trigger and VM have a three-hour safety boundary, and every collector child is
 independently capped at 45 seconds. This does not depend on a new Windows logon,
 so reconnecting an existing RDP session remains observable. With no active session,

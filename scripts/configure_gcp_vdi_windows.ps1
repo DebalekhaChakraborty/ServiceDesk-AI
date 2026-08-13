@@ -450,7 +450,7 @@ $ChannelYaml
     $TaskAction = New-ScheduledTaskAction `
         -Execute "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" `
         -Argument "-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $SupervisorPath -MaximumIterations 1"
-    $TaskStartTime = (Get-Date).AddMinutes(1)
+    $TaskStartTime = (Get-Date).AddSeconds(30)
     $TaskTrigger = New-ScheduledTaskTrigger `
         -Once `
         -At $TaskStartTime `
@@ -474,6 +474,18 @@ $ChannelYaml
 
     $CollectorTask = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
     $CollectorTaskInfo = Get-ScheduledTaskInfo -TaskName $TaskName -ErrorAction SilentlyContinue
+    try {
+        [ordered]@{
+            timestamp = (Get-Date).ToUniversalTime().ToString("o")
+            phase = "task_registered"
+            exit_code = $null
+            task_state = if ($null -ne $CollectorTask) { [string]$CollectorTask.State } else { "unavailable" }
+            next_run_time = if ($null -ne $CollectorTaskInfo) { $CollectorTaskInfo.NextRunTime.ToUniversalTime().ToString("o") } else { $null }
+        } | ConvertTo-Json -Compress | Add-Content -Path $CollectorAuditPath -Encoding UTF8
+    }
+    catch {
+        # Registration audit is diagnostic only.
+    }
     $CollectorReady = $null -ne $CollectorTask -and
         $CollectorTask.State -eq "Ready" -and
         $null -ne $CollectorTaskInfo
