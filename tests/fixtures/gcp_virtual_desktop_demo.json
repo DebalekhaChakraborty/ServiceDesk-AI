@@ -49,6 +49,10 @@
       "instance": {"exists": true, "id": "1000000000000000007", "name": "fake-vdi", "status": "RUNNING"},
       "metrics": {}, "rdp_telemetry": {"status": "available", "value": 243.0, "timestamp": "2030-01-01T00:05:00Z", "session_active": true, "session_count": 1, "source": "windows_user_input_delay"}, "events": [], "network_access": {"status": "available"}, "collection_errors": []
     },
+    "kb0019144_high_latency": {
+      "instance": {"exists": true, "id": "1000000000000000009", "name": "fake-vdi", "status": "RUNNING"},
+      "metrics": {}, "rdp_telemetry": {"status": "available", "value": 243.0, "timestamp": "2030-01-01T00:07:00Z", "session_active": true, "session_count": 1, "source": "windows_user_input_delay"}, "events": [], "network_access": {"status": "available"}, "collection_errors": []
+    },
     "missing_telemetry": {
       "instance": {"exists": true, "id": "1000000000000000008", "name": "fake-vdi", "status": "RUNNING"},
       "metrics": {

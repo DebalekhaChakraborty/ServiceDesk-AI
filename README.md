@@ -185,3 +185,29 @@ outside chat, a genuine IAP/RDP session, and `GCP_VDI_MODE=gcp`. Known limitatio
 that diagnosis is read-only, an inactive RDP session has no User Input Delay value,
 and inconclusive evidence requires escalation rather than automatic password reset
 or infrastructure remediation.
+
+### KB0019144-compatible lab cleanup
+
+When real RDP User Input Delay is strictly greater than 200 ms, the performance
+controller creates a ten-minute, caller- and mapping-bound offer for the
+**KB0019144-Compatible LAB Cleanup Profile**. A later confirmation invokes one
+GCP-specific controller; it revalidates the mapping, retrieves its SOP, requires
+the exact `gcp.virtual_desktop.system_file_cleanup` planner action, runs
+`check_list` once, and collects fresh evidence. It never uses generic
+`cleanup_temp_files`.
+
+The guest script uses native Windows Disk Cleanup only when it is installed and
+only for an explicit PoC allowlist of available VolumeCaches categories. It is not
+the customer's complete production cleanup policy. It never targets user folders,
+browser profiles, Outlook data, SCCM content, networking, domain membership, or
+Windows services. The controller resolves the mapped VM's Compute Engine private
+IP and invokes the fixed script through the existing ServiceDesk
+`win_tool.execute_winrm_ps` transport and `WINRM_*` runtime identity. The model
+supplies neither the host nor PowerShell. No second transport, public IP, public
+RDP, or public WinRM is added.
+
+For a rehearsal that needs an elevated branch, use `GCP_VDI_MODE=demo` and
+`GCP_VDI_DEMO_SCENARIO=kb0019144_high_latency`. This produces a clearly labelled
+demo-only 243-ms RDP User Input Delay. For a genuine lab measurement, an operator
+may run `scripts/gcp_vdi_demo_fault.ps1` through their existing secure guest
+session; it is bounded to 60–120 seconds and is never exposed to chat.

@@ -12,6 +12,7 @@ os.environ.setdefault("WINRM_PORT", "5986")
 
 from sd_chat.agent import root_agent, sd_chat
 from sd_chat.planner import reasoning_composer
+from sd_chat.tools import gcp_virtual_desktop_cleanup as cleanup_tool
 from sd_chat.tools import gcp_virtual_desktop_tool as gcp_tool
 
 
@@ -106,6 +107,10 @@ def _performance(tool_context=None):
         CALLER_UPN,
         tool_context or _context(),
     )
+
+
+def _cleanup(tool_context):
+    return gcp_tool.gcp_confirm_virtual_desktop_system_file_cleanup.func(tool_context)
 
 
 @pytest.mark.parametrize(
@@ -419,6 +424,277 @@ def test_user_input_delay_threshold_is_strictly_greater_than_200(
     assert diagnosis["metrics"]["rdp_user_input_delay_ms"]["value"] == value
     assert diagnosis["finding_code"] == finding
     assert diagnosis["threshold_rule"] == "RDP User Input Delay > 200 ms"
+
+
+@pytest.mark.parametrize(
+    ("scenario", "has_offer"),
+    [
+        ("delay_below_200", False),
+        ("delay_exactly_200", False),
+        ("missing_telemetry", False),
+        ("delay_above_200", True),
+    ],
+)
+def test_cleanup_offer_is_created_only_for_strictly_elevated_delay(
+    monkeypatch, scenario, has_offer
+):
+    monkeypatch.setenv("GCP_VDI_DEMO_SCENARIO", scenario)
+    context = SimpleNamespace(
+        state={"identity_context": {"upn": CALLER_UPN}}, invocation_id="offer-turn"
+    )
+
+    result = _performance(context)
+
+    assert bool(result["cleanup_offer"]) is has_offer
+    if has_offer:
+        offer = context.state[gcp_tool.GCP_VDI_CLEANUP_OFFER_STATE_KEY]
+        assert offer["caller_upn"] == CALLER_UPN
+        assert offer["target"] == {
+            "project_id": "fake-vdi-project",
+            "zone": "us-central1-b",
+            "instance_name": "fake-assigned-vdi",
+        }
+        assert offer["action_id"] == "gcp.virtual_desktop.system_file_cleanup"
+
+
+def test_cleanup_requires_later_confirmation_and_checks_policy_once(monkeypatch):
+    context = SimpleNamespace(
+        state={"identity_context": {"upn": CALLER_UPN}}, invocation_id="offer-turn"
+    )
+    monkeypatch.setenv("GCP_VDI_DEMO_SCENARIO", "delay_above_200")
+    _performance(context)
+    policy = Mock(return_value={"status": "ok", "details": {}})
+    cleanup = Mock(return_value={"status": "ok", "backend": "demo"})
+    monkeypatch.setattr(gcp_tool, "_check_list", policy)
+    monkeypatch.setattr(gcp_tool, "execute_system_file_cleanup", cleanup)
+
+    same_turn = _cleanup(context)
+    assert same_turn["code"] == "GCP_VDI_CLEANUP_NEW_CONFIRMATION_REQUIRED"
+    cleanup.assert_not_called()
+
+    context.invocation_id = "confirm-turn"
+    result = _cleanup(context)
+
+    assert result["status"] == "ok"
+    cleanup.assert_called_once()
+    assert policy.call_count == 1
+    assert policy.call_args.kwargs["tool_context"] is None
+    assert context.state[gcp_tool.GCP_VDI_CLEANUP_OFFER_STATE_KEY]["phase"] == "executed"
+    second_attempt = _cleanup(context)
+    assert second_attempt["code"] == "GCP_VDI_CLEANUP_OFFER_MISSING"
+
+
+@pytest.mark.parametrize(
+    "mutation,expected_code",
+    [
+        ({"expires_at": 0}, "GCP_VDI_CLEANUP_OFFER_EXPIRED"),
+        ({"action_id": "wrong.action"}, "GCP_VDI_CLEANUP_ACTION_INVALID"),
+    ],
+)
+def test_cleanup_rejects_invalid_retained_offer(monkeypatch, mutation, expected_code):
+    context = SimpleNamespace(
+        state={"identity_context": {"upn": CALLER_UPN}}, invocation_id="offer-turn"
+    )
+    monkeypatch.setenv("GCP_VDI_DEMO_SCENARIO", "delay_above_200")
+    _performance(context)
+    context.state[gcp_tool.GCP_VDI_CLEANUP_OFFER_STATE_KEY].update(mutation)
+    context.invocation_id = "confirm-turn"
+
+    result = _cleanup(context)
+
+    assert result["code"] == expected_code
+
+
+def test_cleanup_rejects_changed_mapping_and_caller(monkeypatch):
+    context = SimpleNamespace(
+        state={"identity_context": {"upn": CALLER_UPN}}, invocation_id="offer-turn"
+    )
+    monkeypatch.setenv("GCP_VDI_DEMO_SCENARIO", "delay_above_200")
+    _performance(context)
+    context.invocation_id = "confirm-turn"
+    context.state["identity_context"]["upn"] = "different@example.test"
+    assert _cleanup(context)["code"] == "GCP_VDI_CLEANUP_CALLER_CHANGED"
+
+    context.state["identity_context"]["upn"] = CALLER_UPN
+    context.state[gcp_tool.GCP_VDI_CLEANUP_OFFER_STATE_KEY]["phase"] = "offered"
+    context.state[gcp_tool.GCP_VDI_CLEANUP_OFFER_STATE_KEY]["target"]["instance_name"] = "other-vm"
+    assert _cleanup(context)["code"] == "GCP_VDI_CLEANUP_MAPPING_CHANGED"
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        {"can_execute_fully": False},
+        {"low_confidence": True},
+        {"unmapped": [{"name": "unexpected"}]},
+        {"required_inputs": ["target_host"]},
+        {
+            "tool_sequence": [
+                {
+                    "tool": "gcp_virtual_desktop_tool",
+                    "action": "diagnose_virtual_desktop_performance",
+                    "action_id": "gcp.virtual_desktop.diagnose_performance",
+                }
+            ]
+        },
+    ],
+)
+def test_cleanup_unsafe_or_unexpected_plan_stops_before_policy_and_backend(
+    monkeypatch, mutation
+):
+    context = SimpleNamespace(
+        state={"identity_context": {"upn": CALLER_UPN}}, invocation_id="offer-turn"
+    )
+    monkeypatch.setenv("GCP_VDI_DEMO_SCENARIO", "delay_above_200")
+    _performance(context)
+    context.invocation_id = "confirm-turn"
+    planned = _safe_plan("cleanup")
+    planned["plan"].update(mutation)
+    policy = Mock()
+    cleanup = Mock()
+    monkeypatch.setattr(gcp_tool, "_propose_plan", Mock(return_value=planned))
+    monkeypatch.setattr(gcp_tool, "_check_list", policy)
+    monkeypatch.setattr(gcp_tool, "execute_system_file_cleanup", cleanup)
+
+    result = _cleanup(context)
+
+    assert result["code"] == "GCP_VDI_PLAN_NOT_EXECUTABLE"
+    policy.assert_not_called()
+    cleanup.assert_not_called()
+
+
+def test_cleanup_policy_denial_stops_before_backend_and_account_access_state(monkeypatch):
+    context = SimpleNamespace(
+        state={"identity_context": {"upn": CALLER_UPN}}, invocation_id="offer-turn"
+    )
+    monkeypatch.setenv("GCP_VDI_DEMO_SCENARIO", "delay_above_200")
+    _performance(context)
+    context.invocation_id = "confirm-turn"
+    cleanup = Mock()
+    monkeypatch.setattr(
+        gcp_tool,
+        "_check_list",
+        Mock(return_value={"status": "error", "code": "DENIED"}),
+    )
+    monkeypatch.setattr(gcp_tool, "execute_system_file_cleanup", cleanup)
+
+    result = _cleanup(context)
+
+    assert result["code"] == "GCP_VDI_POLICY_DENIED"
+    cleanup.assert_not_called()
+    assert "temp:account_access_authorization" not in context.state
+    assert "account_access_identity_verification" not in context.state
+
+
+def test_cleanup_failure_and_missing_post_telemetry_never_claim_resolution(monkeypatch):
+    context = SimpleNamespace(
+        state={"identity_context": {"upn": CALLER_UPN}}, invocation_id="offer-turn"
+    )
+    monkeypatch.setenv("GCP_VDI_DEMO_SCENARIO", "delay_above_200")
+    _performance(context)
+    context.invocation_id = "confirm-turn"
+    monkeypatch.setattr(
+        gcp_tool,
+        "execute_system_file_cleanup",
+        Mock(return_value={"status": "error", "code": "transport_failed"}),
+    )
+    failed = _cleanup(context)
+    assert failed["code"] == "GCP_VDI_CLEANUP_FAILED"
+    assert "completed successfully" not in failed["message"].lower()
+
+    context.state[gcp_tool.GCP_VDI_CLEANUP_OFFER_STATE_KEY]["phase"] = "offered"
+    monkeypatch.setattr(
+        gcp_tool,
+        "execute_system_file_cleanup",
+        Mock(return_value={"status": "ok", "backend": "demo"}),
+    )
+    monkeypatch.setattr(
+        gcp_tool,
+        "_load_snapshot",
+        Mock(side_effect=RuntimeError("telemetry delayed")),
+    )
+    unavailable = _cleanup(context)
+    assert unavailable["status"] == "ok"
+    assert "not available yet" in unavailable["message"]
+    assert unavailable["post_cleanup_diagnosis"]["code"] == (
+        "GCP_VDI_POST_CLEANUP_EVIDENCE_UNAVAILABLE"
+    )
+
+
+def test_real_cleanup_reuses_existing_winrm_with_controller_owned_private_host(
+    monkeypatch,
+):
+    mapping = {
+        "project_id": "fake-vdi-project",
+        "zone": "us-central1-b",
+        "instance_name": "fake-assigned-vdi",
+    }
+    monkeypatch.setattr(
+        cleanup_tool,
+        "_resolve_private_target",
+        lambda value: "10.0.0.8",
+    )
+    execute = Mock(
+        return_value={
+            "status": "success",
+            "code": 0,
+            "stdout": json.dumps(
+                {
+                    "status": "ok",
+                    "profile": "KB0019144-Compatible LAB Cleanup Profile",
+                    "selected_categories": ["Delivery Optimization Files"],
+                    "verification": "native_disk_cleanup_completed",
+                }
+            ),
+            "stderr": "",
+        }
+    )
+    monkeypatch.setattr(cleanup_tool.win_tool, "execute_winrm_ps", execute)
+
+    result = cleanup_tool.execute_system_file_cleanup(mapping, "gcp")
+
+    assert result["status"] == "ok"
+    assert result["transport"] == "private_winrm"
+    execute.assert_called_once()
+    target_host, script = execute.call_args.args
+    assert target_host == "10.0.0.8"
+    assert "Invoke-ServiceDeskVdiLabCleanup.ps1" in script
+    assert "gcloud" not in script.lower()
+
+
+def test_cleanup_transport_has_no_second_remote_execution_framework():
+    source = inspect.getsource(cleanup_tool)
+
+    assert "execute_winrm_ps" in source
+    assert "subprocess" not in source
+    assert "tunnel-through-iap" not in source
+    assert "metadata" not in source.lower()
+    assert "scheduled remediation" not in source.lower()
+
+
+@pytest.mark.parametrize("address", ["203.0.113.8", "127.0.0.1", "169.254.1.2"])
+def test_private_target_rejects_non_rfc1918_addresses(monkeypatch, address):
+    instance = SimpleNamespace(
+        name="fake-assigned-vdi",
+        status="RUNNING",
+        network_interfaces=[SimpleNamespace(network_i_p=address)],
+    )
+    from google.cloud import compute_v1
+
+    monkeypatch.setattr(
+        compute_v1,
+        "InstancesClient",
+        lambda: SimpleNamespace(get=lambda **kwargs: instance),
+    )
+
+    with pytest.raises(ValueError, match="private_address_unavailable"):
+        cleanup_tool._resolve_private_target(
+            {
+                "project_id": "fake-vdi-project",
+                "zone": "us-central1-b",
+                "instance_name": "fake-assigned-vdi",
+            }
+        )
 
 
 def test_missing_rdp_telemetry_is_not_zero(monkeypatch):
@@ -928,7 +1204,7 @@ def test_tool_implementation_has_no_compute_or_password_mutation_calls():
         assert forbidden not in source
 
 
-def test_exactly_two_gcp_action_registry_entries():
+def test_gcp_action_registry_contains_two_diagnostics_and_one_cleanup_action():
     registry_dir = Path(reasoning_composer.REG_DIR)
     entries = [
         json.loads(path.read_text(encoding="utf-8"))
@@ -938,8 +1214,15 @@ def test_exactly_two_gcp_action_registry_entries():
     assert {entry["id"] for entry in entries} == {
         "gcp.virtual_desktop.diagnose_login",
         "gcp.virtual_desktop.diagnose_performance",
+        "gcp.virtual_desktop.system_file_cleanup",
     }
-    assert all(entry["inputs"] == ["target_upn"] for entry in entries)
+    assert {
+        entry["id"]: entry["inputs"] for entry in entries
+    } == {
+        "gcp.virtual_desktop.diagnose_login": ["target_upn"],
+        "gcp.virtual_desktop.diagnose_performance": ["target_upn"],
+        "gcp.virtual_desktop.system_file_cleanup": [],
+    }
 
 
 @pytest.mark.parametrize(
@@ -974,6 +1257,54 @@ def test_realistic_planner_step_maps_to_one_gcp_action(
     assert plan["unmapped"] == []
     assert len(plan["tool_sequence"]) == 1
     assert plan["tool_sequence"][0]["action_id"] == expected_action
+
+
+def test_cleanup_planner_step_maps_to_only_the_new_cleanup_action(monkeypatch):
+    monkeypatch.setattr(reasoning_composer, "GENAI_AVAILABLE", False)
+    step = gcp_tool._ORCHESTRATION_SPECS["cleanup"]["step"]
+
+    result = reasoning_composer.propose_plan(
+        user_text=step,
+        ctx_vars=[],
+        sop_texts=[step],
+    )
+
+    plan = result["plan"]
+    assert plan["can_execute_fully"] is True
+    assert plan["low_confidence"] is False
+    assert plan["unmapped"] == []
+    assert plan["required_inputs"] == []
+    assert [step["action_id"] for step in plan["tool_sequence"]] == [
+        "gcp.virtual_desktop.system_file_cleanup"
+    ]
+
+
+def test_new_cleanup_registry_entry_does_not_change_existing_title_mappings(monkeypatch):
+    """Global-registry collision guard for every action that predates cleanup."""
+    monkeypatch.setattr(reasoning_composer, "GENAI_AVAILABLE", False)
+    entries = [
+        json.loads(path.read_text(encoding="utf-8"))
+        for path in Path(reasoning_composer.REG_DIR).glob("*.json")
+    ]
+    existing = [
+        entry
+        for entry in entries
+        if entry["id"] != "gcp.virtual_desktop.system_file_cleanup"
+    ]
+
+    for entry in existing:
+        result = reasoning_composer.propose_plan(
+            user_text=entry["title"],
+            ctx_vars=["target_upn", "target_host", "package_id"],
+            sop_texts=[entry["title"]],
+        )
+        plan = result["plan"]
+        assert plan["can_execute_fully"] is True, entry["id"]
+        assert plan["low_confidence"] is False, entry["id"]
+        assert plan["unmapped"] == [], entry["id"]
+        assert [step["action_id"] for step in plan["tool_sequence"]] == [
+            entry["id"]
+        ], entry["id"]
 
 
 def test_focused_gcp_routing_contract_preserves_other_system_flows():
@@ -1065,10 +1396,11 @@ def test_gcp_routing_contract_lists_explicit_gcp_requests(explicit_request):
     assert "Examples that establish GCP" in instruction
 
 
-def test_public_tool_surface_is_exactly_two_cohesive_diagnostics():
+def test_public_tool_surface_contains_diagnostics_and_retained_cleanup_controller():
     assert gcp_tool.gcp_virtual_desktop_tools == [
         gcp_tool.gcp_diagnose_virtual_desktop_login,
         gcp_tool.gcp_diagnose_virtual_desktop_performance,
+        gcp_tool.gcp_confirm_virtual_desktop_system_file_cleanup,
     ]
 
 

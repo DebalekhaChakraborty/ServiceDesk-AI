@@ -12,6 +12,7 @@ $CollectorPath = Join-Path $ServiceDeskRoot "Collect-RdpUserInputDelay.ps1"
 $CounterProbePath = Join-Path $ServiceDeskRoot "Measure-RdpUserInputDelay.ps1"
 $TaskRunnerPath = Join-Path $ServiceDeskRoot "Invoke-RdpTelemetryCollector.ps1"
 $SupervisorPath = Join-Path $ServiceDeskRoot "Run-RdpTelemetryCollector.ps1"
+$CleanupPath = Join-Path $ServiceDeskRoot "Invoke-ServiceDeskVdiLabCleanup.ps1"
 $CollectorAuditPath = Join-Path $ServiceDeskRoot "rdp_collector_audit.jsonl"
 $CapabilityPath = Join-Path $ServiceDeskRoot "capabilities.json"
 $SetupStatusPath = Join-Path $ServiceDeskRoot "setup_status.json"
@@ -22,6 +23,119 @@ $OpsAgentOwnershipMarker = "# managed-by: ServiceDeskVDI"
 $TaskName = "ServiceDeskVDI-RdpTelemetry"
 
 New-Item -Path $ServiceDeskRoot -ItemType Directory -Force | Out-Null
+
+# This fixed guest-side script is the PoC-only analogue of KB0019144's native
+# Disk Cleanup workflow. It is not a production cleanup policy and it accepts no
+# user-supplied categories, paths, or commands. The ServiceDesk backend invokes
+# it only through its retained GCP offer controller and secure IAP transport.
+$CleanupScript = @'
+$ErrorActionPreference = "Stop"
+$ProfileName = "KB0019144-Compatible LAB Cleanup Profile"
+$VolumeCachesRoot = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\VolumeCaches"
+$StateFlagName = "StateFlags0017"
+$AllowedCategories = @(
+    "Downloaded Program Files",
+    "Temporary Internet Files",
+    "Windows Error Reporting Files",
+    "Windows Error Reporting Archive Files",
+    "Windows Error Reporting Queue Files",
+    "DirectX Shader Cache",
+    "Delivery Optimization Files"
+)
+
+function Get-FreeDiskBytes {
+    $drive = Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='C:'" -ErrorAction Stop
+    return [int64]$drive.FreeSpace
+}
+
+function Write-CleanupResult {
+    param([hashtable]$Result)
+    $Result | ConvertTo-Json -Compress -Depth 4 | Write-Output
+}
+
+$startedAt = (Get-Date).ToUniversalTime().ToString("o")
+$before = $null
+$after = $null
+$selected = @()
+$previousFlags = @()
+$result = @{
+    status = "error"
+    profile = $ProfileName
+    selected_categories = @()
+    free_disk_bytes_before = $null
+    free_disk_bytes_after = $null
+    bytes_reclaimed = $null
+    started_at = $startedAt
+    completed_at = $null
+    verification = "not_completed"
+}
+
+try {
+    $cleanmgr = Join-Path $env:SystemRoot "System32\cleanmgr.exe"
+    if (-not (Test-Path -LiteralPath $cleanmgr)) {
+        $result.verification = "native_disk_cleanup_unavailable"
+        throw "native_disk_cleanup_unavailable"
+    }
+    $before = Get-FreeDiskBytes
+    foreach ($category in $AllowedCategories) {
+        $path = Join-Path $VolumeCachesRoot $category
+        if (-not (Test-Path -LiteralPath $path)) { continue }
+        $existing = Get-ItemProperty -LiteralPath $path -Name $StateFlagName -ErrorAction SilentlyContinue
+        $previousFlags += [pscustomobject]@{
+            path = $path
+            exists = $null -ne $existing
+            value = if ($null -ne $existing) { $existing.$StateFlagName } else { $null }
+        }
+        New-ItemProperty -LiteralPath $path -Name $StateFlagName -PropertyType DWord -Value 2 -Force | Out-Null
+        $selected += $category
+    }
+    if ($selected.Count -eq 0) {
+        $result.verification = "no_approved_native_categories_available"
+        throw "no_approved_native_categories_available"
+    }
+    $process = Start-Process -FilePath $cleanmgr -ArgumentList "/sagerun:19144" -PassThru
+    if (-not $process.WaitForExit(600000)) {
+        Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+        $result.verification = "native_disk_cleanup_timeout"
+        throw "native_disk_cleanup_timeout"
+    }
+    if ($process.ExitCode -ne 0) {
+        $result.verification = "native_disk_cleanup_failed"
+        throw "native_disk_cleanup_failed"
+    }
+    $after = Get-FreeDiskBytes
+    $result.status = "ok"
+    $result.selected_categories = $selected
+    $result.free_disk_bytes_before = $before
+    $result.free_disk_bytes_after = $after
+    $result.bytes_reclaimed = [int64]($after - $before)
+    $result.verification = "native_disk_cleanup_completed"
+}
+catch {
+    if ($result.verification -eq "not_completed") {
+        $result.verification = "native_disk_cleanup_error"
+    }
+}
+finally {
+    foreach ($previous in $previousFlags) {
+        if ($previous.exists) {
+            New-ItemProperty -LiteralPath $previous.path -Name $StateFlagName -PropertyType DWord -Value ([int]$previous.value) -Force | Out-Null
+        }
+        else {
+            Remove-ItemProperty -LiteralPath $previous.path -Name $StateFlagName -ErrorAction SilentlyContinue
+        }
+    }
+    $result.selected_categories = $selected
+    $result.free_disk_bytes_before = $before
+    $result.free_disk_bytes_after = $after
+    if ($null -ne $before -and $null -ne $after) {
+        $result.bytes_reclaimed = [int64]($after - $before)
+    }
+    $result.completed_at = (Get-Date).ToUniversalTime().ToString("o")
+    Write-CleanupResult $result
+}
+'@
+Set-Content -Path $CleanupPath -Value $CleanupScript -Encoding UTF8
 
 function Write-SetupStatus {
     param(

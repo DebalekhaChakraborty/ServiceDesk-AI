@@ -10,6 +10,8 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
+import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
@@ -20,6 +22,7 @@ from google.adk.tools import FunctionTool, ToolContext
 from ..planner.reasoning_composer import propose_plan as _propose_plan
 from .policy_tool import check_list as _check_list
 from .sop_retriever import sop_retriever as _sop_retriever
+from .gcp_virtual_desktop_cleanup import execute_system_file_cleanup
 
 
 SUPPORTED_MODES = {"off", "demo", "gcp"}
@@ -28,6 +31,8 @@ RDP_USER_INPUT_DELAY_THRESHOLD_MS = 200.0
 DEFAULT_LOOKBACK_MINUTES = 30
 DEFAULT_TELEMETRY_FRESHNESS_MINUTES = 10
 DEFAULT_LOG_LIMIT = 100
+CLEANUP_OFFER_TTL_SECONDS = 10 * 60
+GCP_VDI_CLEANUP_OFFER_STATE_KEY = "gcp_vdi_cleanup_offer"
 DEFAULT_DEMO_FIXTURE_PATH = (
     Path(__file__).resolve().parents[2]
     / "tests"
@@ -97,6 +102,13 @@ _ORCHESTRATION_SPECS = {
         "step": "Check the GCP virtual desktop's host performance and Remote Desktop responsiveness.",
         "sop_query": "GCP virtual desktop performance and RDP responsiveness diagnosis",
     },
+    "cleanup": {
+        "action_id": "gcp.virtual_desktop.system_file_cleanup",
+        "tool": "gcp_virtual_desktop_tool",
+        "action": "confirm_virtual_desktop_system_file_cleanup",
+        "step": "Run KB0019144-compatible System File Cleanup on the authenticated caller's mapped GCP virtual desktop",
+        "sop_query": "KB0019144-Compatible GCP Virtual Desktop PoC System File Cleanup",
+    },
 }
 
 
@@ -137,6 +149,15 @@ def _identity_upn(tool_context: ToolContext) -> str:
     if not isinstance(identity, Mapping):
         return ""
     return _norm_upn(identity.get("upn"))
+
+
+def _state(tool_context: ToolContext) -> Dict[str, Any]:
+    state = tool_context.state if tool_context is not None else None
+    if state is None:
+        state = {}
+        if tool_context is not None:
+            tool_context.state = state
+    return state
 
 
 def _validate_mapping_entry(raw: Any) -> Dict[str, str]:
@@ -238,6 +259,8 @@ def _orchestration_gate(
     issue_type: str,
     target_upn: str,
     tool_context: ToolContext,
+    *,
+    use_caller_policy_context: bool = True,
 ) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
     """Enforce SOP -> exact atomic plan -> policy before any backend read.
 
@@ -330,7 +353,7 @@ def _orchestration_gate(
             preconditions=preconditions,
             caller_upn=target_upn,
             target_upn=target_upn,
-            tool_context=tool_context,
+            tool_context=tool_context if use_caller_policy_context else None,
         )
     except Exception:
         policy = {"status": "error"}
@@ -1035,6 +1058,68 @@ def _load_demo_snapshot(mapping: Mapping[str, str]) -> Dict[str, Any]:
     return cloned
 
 
+def _load_snapshot(mapping: Mapping[str, str], backend: str) -> Dict[str, Any]:
+    if backend == "demo":
+        return _load_demo_snapshot(mapping)
+    return _load_gcp_snapshot(mapping)
+
+
+def _cleanup_offer_public(offer: Mapping[str, Any]) -> Dict[str, Any]:
+    return {
+        "available": True,
+        "offer_id": offer.get("offer_id"),
+        "action_id": offer.get("action_id"),
+        "expires_at": offer.get("expires_at"),
+        "profile": "KB0019144-Compatible LAB Cleanup Profile",
+    }
+
+
+def _create_cleanup_offer(
+    target_upn: str,
+    mapping: Mapping[str, str],
+    diagnosis: Mapping[str, Any],
+    tool_context: ToolContext,
+) -> Optional[Dict[str, Any]]:
+    """Create one non-executable, caller- and mapping-bound cleanup offer."""
+    if diagnosis.get("finding_code") != "RDP_USER_INPUT_DELAY_ELEVATED":
+        _state(tool_context)[GCP_VDI_CLEANUP_OFFER_STATE_KEY] = None
+        return None
+    telemetry = (diagnosis.get("metrics") or {}).get("rdp_user_input_delay_ms")
+    if not isinstance(telemetry, Mapping) or telemetry.get("status") != "available":
+        _state(tool_context)[GCP_VDI_CLEANUP_OFFER_STATE_KEY] = None
+        return None
+    offer = {
+        "offer_id": str(uuid.uuid4()),
+        "phase": "offered",
+        "created_at": int(time.time()),
+        "expires_at": int(time.time()) + CLEANUP_OFFER_TTL_SECONDS,
+        "created_invocation_id": getattr(tool_context, "invocation_id", None),
+        "caller_upn": target_upn,
+        "target": {
+            "project_id": mapping["project_id"],
+            "zone": mapping["zone"],
+            "instance_name": mapping["instance_name"],
+        },
+        "backend": diagnosis.get("backend"),
+        "finding_code": diagnosis.get("finding_code"),
+        "evidence_timestamp": telemetry.get("timestamp"),
+        "rdp_user_input_delay_ms": telemetry.get("value"),
+        "action_id": _ORCHESTRATION_SPECS["cleanup"]["action_id"],
+    }
+    _state(tool_context)[GCP_VDI_CLEANUP_OFFER_STATE_KEY] = offer
+    return offer
+
+
+def _mapping_matches_offer(mapping: Mapping[str, str], offer: Mapping[str, Any]) -> bool:
+    target = offer.get("target")
+    return bool(
+        isinstance(target, Mapping)
+        and target.get("project_id") == mapping.get("project_id")
+        and target.get("zone") == mapping.get("zone")
+        and target.get("instance_name") == mapping.get("instance_name")
+    )
+
+
 def _latest_timestamp(snapshot: Mapping[str, Any]) -> Optional[str]:
     timestamps: List[str] = []
     metrics = snapshot.get("metrics")
@@ -1230,6 +1315,8 @@ def _diagnose(
     issue_type: str,
     target_upn: str,
     tool_context: ToolContext,
+    *,
+    create_cleanup_offer: bool = True,
 ) -> Dict[str, Any]:
     mapping, request_error = _resolve_request(target_upn, tool_context)
     if request_error is not None:
@@ -1247,11 +1334,7 @@ def _diagnose(
     assert orchestration is not None
 
     try:
-        snapshot = (
-            _load_demo_snapshot(mapping)
-            if backend == "demo"
-            else _load_gcp_snapshot(mapping)
-        )
+        snapshot = _load_snapshot(mapping, backend)
     except Exception:
         return _error(
             "GCP_VDI_API_FAILURE"
@@ -1267,7 +1350,149 @@ def _diagnose(
     else:
         result = _performance_diagnosis(backend, normalized_upn, mapping, snapshot)
     result["orchestration"] = orchestration
+    if issue_type == "performance" and create_cleanup_offer:
+        offer = _create_cleanup_offer(
+            normalized_upn, mapping, result["diagnosis"], tool_context
+        )
+        result["cleanup_offer"] = _cleanup_offer_public(offer) if offer else None
     return result
+
+
+def _fresh_performance_diagnosis(
+    caller_upn: str,
+    mapping: Mapping[str, str],
+    backend: str,
+) -> Dict[str, Any]:
+    """Collect fresh evidence after cleanup without creating another offer."""
+    try:
+        snapshot = _load_snapshot(mapping, backend)
+    except Exception:
+        return _error(
+            "GCP_VDI_POST_CLEANUP_EVIDENCE_UNAVAILABLE",
+            "Cleanup completed, but fresh performance telemetry is not available yet.",
+            backend,
+        )
+    return _performance_diagnosis(backend, caller_upn, mapping, snapshot)
+
+
+def gcp_confirm_virtual_desktop_system_file_cleanup(
+    tool_context: ToolContext,
+) -> Dict[str, Any]:
+    """Execute only the retained, confirmed GCP VDI lab-cleanup offer."""
+    state = _state(tool_context)
+    offer = state.get(GCP_VDI_CLEANUP_OFFER_STATE_KEY)
+    if not isinstance(offer, Mapping) or offer.get("phase") != "offered":
+        return _error(
+            "GCP_VDI_CLEANUP_OFFER_MISSING",
+            "There is no current GCP virtual desktop cleanup offer to confirm.",
+            _mode(),
+        )
+    if int(offer.get("expires_at") or 0) < int(time.time()):
+        state[GCP_VDI_CLEANUP_OFFER_STATE_KEY] = {**offer, "phase": "expired"}
+        return _error(
+            "GCP_VDI_CLEANUP_OFFER_EXPIRED",
+            "The GCP virtual desktop cleanup offer expired; run a fresh diagnosis.",
+            _mode(),
+        )
+    current_invocation_id = getattr(tool_context, "invocation_id", None)
+    if (
+        not current_invocation_id
+        or not offer.get("created_invocation_id")
+        or current_invocation_id == offer.get("created_invocation_id")
+    ):
+        return _error(
+            "GCP_VDI_CLEANUP_NEW_CONFIRMATION_REQUIRED",
+            "System File Cleanup requires confirmation in a new user turn; no cleanup was run.",
+            _mode(),
+        )
+
+    caller_upn = _identity_upn(tool_context)
+    if not caller_upn or caller_upn != _norm_upn(offer.get("caller_upn")):
+        state[GCP_VDI_CLEANUP_OFFER_STATE_KEY] = {**offer, "phase": "failed"}
+        return _error(
+            "GCP_VDI_CLEANUP_CALLER_CHANGED",
+            "The authenticated caller changed after the cleanup offer; no cleanup was run.",
+            _mode(),
+        )
+    mapping, request_error = _resolve_request(caller_upn, tool_context)
+    if request_error is not None or mapping is None:
+        state[GCP_VDI_CLEANUP_OFFER_STATE_KEY] = {**offer, "phase": "failed"}
+        return request_error or _error(
+            "GCP_VDI_CLEANUP_MAPPING_INVALID",
+            "The trusted virtual desktop mapping could not be verified; no cleanup was run.",
+            _mode(),
+        )
+    if not _mapping_matches_offer(mapping, offer):
+        state[GCP_VDI_CLEANUP_OFFER_STATE_KEY] = {**offer, "phase": "failed"}
+        return _error(
+            "GCP_VDI_CLEANUP_MAPPING_CHANGED",
+            "The trusted virtual desktop assignment changed after the cleanup offer; no cleanup was run.",
+            _mode(),
+        )
+    if offer.get("action_id") != _ORCHESTRATION_SPECS["cleanup"]["action_id"]:
+        state[GCP_VDI_CLEANUP_OFFER_STATE_KEY] = {**offer, "phase": "failed"}
+        return _error(
+            "GCP_VDI_CLEANUP_ACTION_INVALID",
+            "The retained cleanup offer is invalid; no cleanup was run.",
+            _mode(),
+        )
+
+    # Commit the one-way state transition before any external operation. The
+    # cleanup policy is enforced by this target-bound controller, so use an
+    # isolated policy context and never alter Account Access state.
+    state[GCP_VDI_CLEANUP_OFFER_STATE_KEY] = {**offer, "phase": "confirmed"}
+    orchestration, orchestration_error = _orchestration_gate(
+        "cleanup",
+        caller_upn,
+        tool_context,
+        use_caller_policy_context=False,
+    )
+    if orchestration_error is not None:
+        state[GCP_VDI_CLEANUP_OFFER_STATE_KEY] = {**offer, "phase": "failed"}
+        return orchestration_error
+    assert orchestration is not None
+
+    cleanup = execute_system_file_cleanup(mapping, _mode())
+    if cleanup.get("status") != "ok":
+        state[GCP_VDI_CLEANUP_OFFER_STATE_KEY] = {**offer, "phase": "failed"}
+        return {
+            "status": "error",
+            "code": "GCP_VDI_CLEANUP_FAILED",
+            "message": "The approved lab cleanup did not complete; no performance resolution was claimed.",
+            "cleanup": cleanup,
+            "orchestration": orchestration,
+            "offer_id": offer.get("offer_id"),
+        }
+
+    post = _fresh_performance_diagnosis(caller_upn, mapping, _mode())
+    state[GCP_VDI_CLEANUP_OFFER_STATE_KEY] = {
+        **offer,
+        "phase": "executed",
+        "completed_at": int(time.time()),
+    }
+    response: Dict[str, Any] = {
+        "status": "ok",
+        "cleanup": cleanup,
+        "orchestration": orchestration,
+        "offer_id": offer.get("offer_id"),
+        "pre_cleanup_evidence": {
+            "finding_code": offer.get("finding_code"),
+            "rdp_user_input_delay_ms": offer.get("rdp_user_input_delay_ms"),
+            "timestamp": offer.get("evidence_timestamp"),
+        },
+        "post_cleanup_diagnosis": post,
+    }
+    if post.get("status") != "ok":
+        response["message"] = (
+            "System File Cleanup completed, but fresh performance telemetry is not available yet."
+        )
+    elif post.get("diagnosis", {}).get("finding_code") == "RDP_USER_INPUT_DELAY_ELEVATED":
+        response["message"] = (
+            "System File Cleanup completed, but the session-responsiveness condition remains; offer escalation."
+        )
+    else:
+        response["message"] = "System File Cleanup completed; fresh performance evidence was collected."
+    return response
 
 
 def gcp_diagnose_virtual_desktop_login(
@@ -1292,8 +1517,12 @@ gcp_diagnose_virtual_desktop_login = FunctionTool(
 gcp_diagnose_virtual_desktop_performance = FunctionTool(
     func=gcp_diagnose_virtual_desktop_performance
 )
+gcp_confirm_virtual_desktop_system_file_cleanup = FunctionTool(
+    func=gcp_confirm_virtual_desktop_system_file_cleanup
+)
 
 gcp_virtual_desktop_tools = [
     gcp_diagnose_virtual_desktop_login,
     gcp_diagnose_virtual_desktop_performance,
+    gcp_confirm_virtual_desktop_system_file_cleanup,
 ]

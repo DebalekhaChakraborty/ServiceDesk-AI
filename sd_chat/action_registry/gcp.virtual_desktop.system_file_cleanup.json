@@ -1,0 +1,12 @@
+{
+  "id": "gcp.virtual_desktop.system_file_cleanup",
+  "title": "Run KB0019144-compatible System File Cleanup on the authenticated caller's mapped GCP virtual desktop",
+  "description": "Run the approved PoC-only native Windows Disk Cleanup profile on the caller's privately mapped GCP virtual desktop after a retained elevated-responsiveness offer is confirmed.",
+  "inputs": [],
+  "outputs": ["cleanup.status", "cleanup.verification"],
+  "preconditions": [],
+  "effects": ["gcp_vdi_lab_system_file_cleanup_completed"],
+  "tool": "gcp_virtual_desktop_tool",
+  "action": "confirm_virtual_desktop_system_file_cleanup",
+  "args_template": {}
+}
