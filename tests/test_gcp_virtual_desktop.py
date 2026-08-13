@@ -1020,16 +1020,21 @@ def test_public_tool_surface_is_exactly_two_cohesive_diagnostics():
     ]
 
 
-def test_readme_distinguishes_recurring_from_active_session_validation():
+def test_readme_reports_active_session_validation_without_fabrication():
     readme = Path("README.md").read_text(encoding="utf-8")
 
     assert (
-        "Recurring scheduled collection and telemetry delivery are live-validated; an"
+        "Recurring scheduled collection, active-session User Input Delay, and production"
         in readme
     )
-    assert "active-session User Input Delay value is not yet live-validated." in readme
-    assert "session_count=0" in readme
-    assert "null delay" in readme
+    assert "diagnosis consumption are live-validated." in readme
+    assert "session_count=1" in readme
+    assert "genuine `0 ms` value" in readme
+    assert "inactive or unavailable evidence remains" in readme
+    assert (
+        "Portal conversational wording/routing still requires manual validation."
+        in readme
+    )
     assert "autonomous scheduled cycles verified" not in readme
     assert "aggregation=latest_delta" in readme
 

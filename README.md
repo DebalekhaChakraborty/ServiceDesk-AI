@@ -117,15 +117,15 @@ parallel collectors, and every collector child is capped at 45 seconds. The task
 first trigger is given a two-minute registration runway and must have a future
 `NextRunTime`; its repetition plus the VM have a three-hour safety boundary.
 
-**Recurring scheduled collection and telemetry delivery are live-validated; an
-active-session User Input Delay value is not yet live-validated.** Real validation
-observed a post-registration task run, `LastTaskResult=0`, scheduled
+**Recurring scheduled collection, active-session User Input Delay, and production
+diagnosis consumption are live-validated.** Real validation observed a
+post-registration task run, `LastTaskResult=0`, scheduled
 `supervisor_started`/`started`/`completed(0)`/`supervisor_completed(0)` evidence,
-and a fresh Cloud Logging telemetry event from that cycle. The validated session
-was inactive, so the record correctly contained `session_count=0` and a null delay
-instead of a fabricated zero. A real active RDP session and the ServiceDesk
-performance diagnosis reading its counter value are still required before claiming
-end-to-end active-session User Input Delay validation.
+was active and the record contained `session_count=1`, counter availability, and a
+genuine `0 ms` value. The production ServiceDesk performance diagnosis consumed
+that fresh value and returned `NO_RDP_INPUT_DELAY_THRESHOLD_BREACH`. This measured
+zero is distinct from missing telemetry: inactive or unavailable evidence remains
+null. Portal conversational wording/routing still requires manual validation.
 
 With no active session, the collector publishes capability/session state without
 querying the session counter. Each native session/counter read runs in its own
