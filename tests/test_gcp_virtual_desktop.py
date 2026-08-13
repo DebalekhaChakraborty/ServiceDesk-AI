@@ -1032,6 +1032,10 @@ def test_windows_bootstrap_captures_existing_task_truth_before_replacement():
         "repetition_duration",
         "principal_logon_type",
         "principal_run_level",
+        "telemetry_last_write_time",
+        "telemetry_size_bytes",
+        "audit_last_write_time",
+        "audit_size_bytes",
     ):
         assert field in script
     assert 'LogName = "Microsoft-Windows-TaskScheduler/Operational"' in script
@@ -1061,6 +1065,10 @@ def test_windows_collector_is_one_shot_under_a_repeating_bounded_task():
     assert "Run-RdpTelemetryCollector.ps1" in script
     assert "$MaximumCollectorRuntimeMilliseconds = 45000" in script
     assert "$RestartDelaySeconds = 2" in script
+    assert "$SupervisorExitCode = 0" in script
+    assert '$SupervisorExitCode = 124' in script
+    assert 'Phase "collector_failed"' in script
+    assert "exit $SupervisorExitCode" in script
     assert "[int]$MaximumIterations = 0" in script
     assert "-MaximumIterations 1" in script
     assert script.index("-MaximumIterations 1") < script.index("$TaskAction =")

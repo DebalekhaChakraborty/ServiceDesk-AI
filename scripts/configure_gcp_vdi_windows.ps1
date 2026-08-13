@@ -62,6 +62,8 @@ function Write-ExistingTaskDiagnostic {
         if ($null -ne $ExistingTaskInfo -and $ExistingTaskInfo.NextRunTime.Year -gt 1) {
             $SafeNextRunTime = $ExistingTaskInfo.NextRunTime.ToUniversalTime().ToString("o")
         }
+        $TelemetryFile = Get-Item -Path $TelemetryPath -ErrorAction SilentlyContinue
+        $AuditFile = Get-Item -Path $CollectorAuditPath -ErrorAction SilentlyContinue
         [ordered]@{
             timestamp = (Get-Date).ToUniversalTime().ToString("o")
             phase = "existing_task_diagnostic"
@@ -78,6 +80,10 @@ function Write-ExistingTaskDiagnostic {
             principal_user_id = if ($ActualPrincipal -ieq "SYSTEM") { "SYSTEM" } else { "unexpected_redacted" }
             principal_logon_type = [string]$ExistingTask.Principal.LogonType
             principal_run_level = [string]$ExistingTask.Principal.RunLevel
+            telemetry_last_write_time = if ($null -ne $TelemetryFile) { $TelemetryFile.LastWriteTimeUtc.ToString("o") } else { $null }
+            telemetry_size_bytes = if ($null -ne $TelemetryFile) { [int64]$TelemetryFile.Length } else { $null }
+            audit_last_write_time = if ($null -ne $AuditFile) { $AuditFile.LastWriteTimeUtc.ToString("o") } else { $null }
+            audit_size_bytes = if ($null -ne $AuditFile) { [int64]$AuditFile.Length } else { $null }
         } | ConvertTo-Json -Compress | Add-Content -Path $CollectorAuditPath -Encoding UTF8
 
         $TaskSchedulerEvents = Get-WinEvent -FilterHashtable @{
@@ -388,6 +394,7 @@ $AuditPath = "C:\ProgramData\ServiceDeskVDI\rdp_collector_audit.jsonl"
 $MaximumCollectorRuntimeMilliseconds = 45000
 $RestartDelaySeconds = 2
 $Iteration = 0
+$SupervisorExitCode = 0
 
 function Write-SupervisorAudit {
     param(
@@ -424,14 +431,20 @@ while ($MaximumIterations -eq 0 -or $Iteration -lt $MaximumIterations) {
             -PassThru
         if (-not $CollectorProcess.WaitForExit($MaximumCollectorRuntimeMilliseconds)) {
             Write-SupervisorAudit -Phase "collector_timeout" -ExitCode $null
+            $SupervisorExitCode = 124
             & "$env:SystemRoot\System32\taskkill.exe" `
                 /PID $CollectorProcess.Id `
                 /T `
                 /F | Out-Null
             $CollectorProcess.WaitForExit()
         }
+        elseif ($CollectorProcess.ExitCode -ne 0) {
+            $SupervisorExitCode = [int]$CollectorProcess.ExitCode
+            Write-SupervisorAudit -Phase "collector_failed" -ExitCode $SupervisorExitCode
+        }
     }
     catch {
+        $SupervisorExitCode = 1
         Write-SupervisorAudit -Phase "collector_launch_failed" -ExitCode $null
         if ($null -ne $CollectorProcess -and -not $CollectorProcess.HasExited) {
             & "$env:SystemRoot\System32\taskkill.exe" `
@@ -444,7 +457,8 @@ while ($MaximumIterations -eq 0 -or $Iteration -lt $MaximumIterations) {
         Start-Sleep -Seconds $RestartDelaySeconds
     }
 }
-Write-SupervisorAudit -Phase "supervisor_completed" -ExitCode 0
+Write-SupervisorAudit -Phase "supervisor_completed" -ExitCode $SupervisorExitCode
+exit $SupervisorExitCode
 '@
     Set-Content -Path $SupervisorPath -Value $SupervisorScript -Encoding UTF8
 
