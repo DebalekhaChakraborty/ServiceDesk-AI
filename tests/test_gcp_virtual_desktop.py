@@ -451,9 +451,9 @@ def test_inactive_rdp_session_is_distinct_from_missing_telemetry():
         "reason": "no_active_rdp_session",
     }
 
-    diagnosis = gcp_tool._performance_diagnosis(
-        "demo", CALLER_UPN, mapping, snapshot
-    )["diagnosis"]
+    diagnosis = gcp_tool._performance_diagnosis("demo", CALLER_UPN, mapping, snapshot)[
+        "diagnosis"
+    ]
     telemetry = diagnosis["metrics"]["rdp_user_input_delay_ms"]
 
     assert telemetry["status"] == "unavailable"
@@ -494,9 +494,9 @@ def test_inactive_real_session_zero_is_unavailable_and_preserves_record_time(
     assert telemetry_call.kwargs["max_results"] == 1
     assert "servicedesk_rdp_telemetry" in telemetry_call.kwargs["filter_"]
     assert "windows_event_log" in telemetry_call.kwargs["filter_"]
-    assert 'jsonPayload.ProviderName="ServiceDeskVDI"' in telemetry_call.kwargs[
-        "filter_"
-    ]
+    assert (
+        'jsonPayload.ProviderName="ServiceDeskVDI"' in telemetry_call.kwargs["filter_"]
+    )
     assert "jsonPayload.EventID=7101" in telemetry_call.kwargs["filter_"]
     assert "windows_event_log" in events_call.kwargs["filter_"]
     assert 'jsonPayload.Channel="Security"' in events_call.kwargs["filter_"]
@@ -1020,16 +1020,17 @@ def test_public_tool_surface_is_exactly_two_cohesive_diagnostics():
     ]
 
 
-def test_readme_is_truthful_about_unvalidated_recurring_collection():
+def test_readme_distinguishes_recurring_from_active_session_validation():
     readme = Path("README.md").read_text(encoding="utf-8")
-    normalized_readme = " ".join(readme.split())
 
     assert (
-        "Recurring scheduled User Input Delay collection is not yet live-validated."
+        "Recurring scheduled collection and telemetry delivery are live-validated; an"
         in readme
     )
+    assert "active-session User Input Delay value is not yet live-validated." in readme
+    assert "session_count=0" in readme
+    assert "null delay" in readme
     assert "autonomous scheduled cycles verified" not in readme
-    assert "Registration and unit tests are not evidence" in normalized_readme
     assert "aggregation=latest_delta" in readme
 
 
@@ -1135,7 +1136,7 @@ def test_windows_collector_is_one_shot_under_a_repeating_bounded_task():
     assert "$MaximumCollectorRuntimeMilliseconds = 45000" in script
     assert "$RestartDelaySeconds = 2" in script
     assert "$SupervisorExitCode = 0" in script
-    assert '$SupervisorExitCode = 124' in script
+    assert "$SupervisorExitCode = 124" in script
     assert 'Phase "collector_failed"' in script
     assert "exit $SupervisorExitCode" in script
     assert "[int]$MaximumIterations = 0" in script
@@ -1188,12 +1189,12 @@ def test_windows_scheduled_collector_has_bounded_non_sensitive_execution_audit()
     assert "$MaximumAuditFiles = 720" in task_runner
     assert 'Write-CollectorAudit -Phase "started"' in task_runner
     assert 'Write-CollectorAudit -Phase "completed"' in task_runner
-    assert 'rdp_collector_audit_{0}.tmp' in task_runner
-    assert 'rdp_collector_audit_{0}.jsonl' in task_runner
+    assert "rdp_collector_audit_{0}.tmp" in task_runner
+    assert "rdp_collector_audit_{0}.jsonl" in task_runner
     assert "Move-Item -Path $AuditTempPath -Destination $AuditPath" in task_runner
     assert "System.Text.UTF8Encoding($false)" in task_runner
     assert "[System.IO.File]::WriteAllText($AuditTempPath" in task_runner
-    assert '-Source $ServiceDeskEventSource -EventId $AuditEventId' in task_runner
+    assert "-Source $ServiceDeskEventSource -EventId $AuditEventId" in task_runner
     assert "username" not in task_runner.casefold()
     assert "credential" not in task_runner.casefold()
 
@@ -1203,12 +1204,12 @@ def test_windows_collector_atomically_publishes_bounded_telemetry_files():
     collector = script.split("$CollectorScript = @'", 1)[1].split("'@", 1)[0]
 
     assert "$MaximumTelemetryFiles = 360" in collector
-    assert 'rdp_telemetry_{0}.tmp' in collector
-    assert 'rdp_telemetry_{0}.jsonl' in collector
+    assert "rdp_telemetry_{0}.tmp" in collector
+    assert "rdp_telemetry_{0}.jsonl" in collector
     assert "Move-Item -Path $TelemetryTempPath -Destination $TelemetryPath" in collector
     assert "System.Text.UTF8Encoding($false)" in collector
     assert "[System.IO.File]::WriteAllText($TelemetryTempPath" in collector
-    assert '-Source $ServiceDeskEventSource -EventId $TelemetryEventId' in collector
+    assert "-Source $ServiceDeskEventSource -EventId $TelemetryEventId" in collector
     assert 'Filter "rdp_telemetry_*.jsonl"' in collector
     assert "Select-Object -Skip $MaximumTelemetryFiles" in collector
     assert "rdp_telemetry_*.jsonl" in script
