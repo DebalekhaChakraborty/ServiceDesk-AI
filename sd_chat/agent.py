@@ -12,6 +12,7 @@ from .tools.win_tool import time_resync, restart_service, clear_dns_cache, clean
 from .tools.aad_tool import aad_get_my_devices, aad_reset_password
 from .tools.ad_account_tool import ad_account_tools
 from .tools.account_access_orchestrator import account_access_orchestration_tools
+from .tools.gcp_virtual_desktop_tool import gcp_virtual_desktop_tools
 from .tools.policy_tool import check_list
 from .planner.reasoning_composer import propose_plan
 from .tools.sop_retriever import sop_retriever
@@ -112,6 +113,55 @@ If a target_host is required:
    - If ZERO devices exist → STOP and offer guidance or ticket creation.
 
 Any response that asks the user to type a hostname/IP is INVALID.
+
+========================
+GCP VIRTUAL DESKTOP
+========================
+Treat a named Google Cloud virtual-desktop issue as its own system-specific path.
+Semantic references include the user's GCP virtual desktop, Google Cloud desktop,
+Compute Engine Windows desktop, or RDP session on that assigned GCP desktop.
+
+Rules:
+- This named-system path owns the initial diagnosis. Do not route it to generic
+  Account Access, AWS WorkSpaces, HOST login, or another system merely because
+  the user says login, password, access, slow, frozen, lagging, or disconnected.
+- After identity is resolved, call exactly one appropriate GCP diagnostic
+  controller tool. Do not manually call sop_retriever, propose_plan, or check_list
+  for this path: each GCP controller internally enforces mandatory SOP retrieval,
+  the generic planner's exact single expected action, and policy using the
+  planner's verbatim preconditions before any GCP API read. If that internal gate
+  fails, stop and explain or clarify; never retry around or bypass the controller.
+- For a connection, login, authentication, or single-disconnect symptom, the
+  expected controller action is gcp.virtual_desktop.diagnose_login; call
+  gcp_diagnose_virtual_desktop_login with
+  target_upn=identity_context.upn.
+- For slowness, freezing, lag, responsiveness, repeated disconnects, or other
+  performance symptoms, the only expected action is
+  gcp.virtual_desktop.diagnose_performance; call
+  gcp_diagnose_virtual_desktop_performance with
+  target_upn=identity_context.upn.
+- These tools are self-service only and resolve project, zone, VM, and Windows
+  user from a trusted private mapping. Never ask for, accept, infer, or invent a
+  project ID, zone, instance name, Windows username, hostname, or filesystem path.
+- Diagnosis is read-only. Never start or stop a VM, modify firewall/IAM, reset a
+  Windows or AD password, or invoke a generic Windows remediation automatically.
+- Report unavailable evidence as unavailable, never as zero. Preserve actual
+  timestamps and clearly identify whether the backend is gcp or demo.
+- RDP User Input Delay is Windows application/session responsiveness, not network
+  RTT, AWS WorkSpaces latency, or InSessionLatency. Only values greater than 200
+  ms trigger RDP_USER_INPUT_DELAY_ELEVATED; exactly 200 ms does not.
+- CPU, memory, disk, and network values are observations. Do not invent severity
+  thresholds for them.
+- In a GCP performance response, report each available CPU, memory, disk,
+  network, uptime, and RDP User Input Delay value with its evidence timestamp.
+  Never describe those host values as normal, healthy, high, low, elevated, or
+  acceptable unless an approved SOP supplies that exact threshold. If no such
+  threshold exists, call them observations and make no severity classification.
+  A GCP performance response is INVALID if it omits an available metric or its
+  timestamp, or says an observation is/non-critical, concerning, or otherwise
+  assigns severity without an approved threshold.
+- If the GCP tool returns an error or inconclusive finding, explain the limitation
+  and offer escalation. Do not substitute password reset or infrastructure change.
 
 ========================
 SCREENSHOT / IMAGE UPLOAD HANDLING
@@ -527,6 +577,9 @@ OUTPUT STYLE
 
         # Deterministic identity/planning/policy/account-access workflows
         *account_access_orchestration_tools,
+
+        # Read-only, self-service GCP Windows virtual desktop diagnosis
+        *gcp_virtual_desktop_tools,
 
         # Gmail email tool
         gmail_send_email,

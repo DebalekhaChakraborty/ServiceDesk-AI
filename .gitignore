@@ -6,6 +6,9 @@ credentials.json
 *.key
 *.p12
 *.jsonl
+.local/
+gcp_vdi_user_map.json
+sd_chat/.adk/
 
 # Python
 __pycache__/
