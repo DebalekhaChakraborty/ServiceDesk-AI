@@ -75,6 +75,9 @@ _DISCONNECT_FALLBACK_WINDOW_SECONDS = 2.0
 _SECURITY_CHANNEL = "Security"
 _LSM_CHANNEL = "Microsoft-Windows-TerminalServices-LocalSessionManager/Operational"
 _RCM_CHANNEL = "Microsoft-Windows-TerminalServices-RemoteConnectionManager/Operational"
+_APPLICATION_CHANNEL = "Application"
+_SERVICEDESK_EVENT_SOURCE = "ServiceDeskVDI"
+_RDP_TELEMETRY_EVENT_ID = 7101
 _SECURITY_RDP_EVENT_IDS = {4625, 4778, 4779}
 _LSM_RDP_EVENT_IDS = {21, 22, 23, 24, 25, 40}
 _RCM_RDP_EVENT_IDS = {1149}
@@ -733,8 +736,12 @@ def _collect_logs(
     )
     telemetry_filter = (
         resource_filter
-        + f'AND timestamp>="{telemetry_start_iso}" '
-        + f'AND logName="projects/{project_id}/logs/servicedesk_rdp_telemetry"'
+        + f'AND timestamp>="{telemetry_start_iso}" AND ('
+        + f'logName="projects/{project_id}/logs/servicedesk_rdp_telemetry" OR ('
+        + f'logName="projects/{project_id}/logs/windows_event_log" '
+        + f'AND jsonPayload.Channel="{_APPLICATION_CHANNEL}" '
+        + f'AND jsonPayload.ProviderName="{_SERVICEDESK_EVENT_SOURCE}" '
+        + f"AND jsonPayload.EventID={_RDP_TELEMETRY_EVENT_ID}))"
     )
 
     def channel_event_filter(channel: str, event_ids: Iterable[int]) -> str:
@@ -770,6 +777,19 @@ def _collect_logs(
         )
         for entry in telemetry_entries:
             payload = getattr(entry, "payload", {}) or {}
+            if (
+                _find_payload_value(payload, {"ProviderName"})
+                == _SERVICEDESK_EVENT_SOURCE
+                and _as_int(_find_payload_value(payload, {"EventID"}))
+                == _RDP_TELEMETRY_EVENT_ID
+            ):
+                event_message = _find_payload_value(payload, {"Message"})
+                try:
+                    parsed_message = json.loads(event_message)
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    parsed_message = None
+                if isinstance(parsed_message, dict):
+                    payload = parsed_message
             timestamp = _iso_timestamp(getattr(entry, "timestamp", None))
             delay = _find_payload_value(payload, {"max_user_input_delay_ms"})
             session_active = _as_bool(_find_payload_value(payload, {"session_active"}))

@@ -119,6 +119,10 @@ function Write-ExistingTaskDiagnostic {
 
 try {
     Write-ExistingTaskDiagnostic
+    $ServiceDeskEventSource = "ServiceDeskVDI"
+    if (-not [System.Diagnostics.EventLog]::SourceExists($ServiceDeskEventSource)) {
+        New-EventLog -LogName "Application" -Source $ServiceDeskEventSource
+    }
     Write-SetupStatus -Status "running" -Phase "ops_agent" -Message "Checking Google Ops Agent."
     $OpsAgentService = Get-Service -Name "google-cloud-ops-agent" -ErrorAction SilentlyContinue
     if (-not $OpsAgentService) {
@@ -253,6 +257,8 @@ $MaximumTelemetryFiles = 360
 $PublishIntervalSeconds = 30
 $MaximumCounterProbeMilliseconds = 2500
 $Utf8WithoutBom = New-Object System.Text.UTF8Encoding($false)
+$ServiceDeskEventSource = "ServiceDeskVDI"
+$TelemetryEventId = 7101
 
 New-Item -Path $ServiceDeskRoot -ItemType Directory -Force | Out-Null
 
@@ -350,6 +356,7 @@ try {
     $TelemetryJson = $Record | ConvertTo-Json -Compress
     [System.IO.File]::WriteAllText($TelemetryTempPath, $TelemetryJson, $Utf8WithoutBom)
     Move-Item -Path $TelemetryTempPath -Destination $TelemetryPath
+    Write-EventLog -LogName "Application" -Source $ServiceDeskEventSource -EventId $TelemetryEventId -EntryType Information -Message $TelemetryJson
     Get-ChildItem -Path $ServiceDeskRoot -Filter "rdp_telemetry_*.jsonl" -File -ErrorAction SilentlyContinue |
         Sort-Object LastWriteTimeUtc -Descending |
         Select-Object -Skip $MaximumTelemetryFiles |
@@ -370,6 +377,8 @@ $CollectorPath = "C:\ProgramData\ServiceDeskVDI\Collect-RdpUserInputDelay.ps1"
 $ServiceDeskRoot = "C:\ProgramData\ServiceDeskVDI"
 $MaximumAuditFiles = 720
 $Utf8WithoutBom = New-Object System.Text.UTF8Encoding($false)
+$ServiceDeskEventSource = "ServiceDeskVDI"
+$AuditEventId = 7102
 
 function Write-CollectorAudit {
     param(
@@ -389,6 +398,7 @@ function Write-CollectorAudit {
         } | ConvertTo-Json -Compress
         [System.IO.File]::WriteAllText($AuditTempPath, $AuditJson, $Utf8WithoutBom)
         Move-Item -Path $AuditTempPath -Destination $AuditPath
+        Write-EventLog -LogName "Application" -Source $ServiceDeskEventSource -EventId $AuditEventId -EntryType Information -Message $AuditJson
         Get-ChildItem -Path $ServiceDeskRoot -Filter "rdp_collector_audit_*.jsonl" -File -ErrorAction SilentlyContinue |
             Sort-Object LastWriteTimeUtc -Descending |
             Select-Object -Skip $MaximumAuditFiles |
@@ -425,6 +435,8 @@ $TaskRunnerPath = "C:\ProgramData\ServiceDeskVDI\Invoke-RdpTelemetryCollector.ps
 $ServiceDeskRoot = "C:\ProgramData\ServiceDeskVDI"
 $MaximumAuditFiles = 720
 $Utf8WithoutBom = New-Object System.Text.UTF8Encoding($false)
+$ServiceDeskEventSource = "ServiceDeskVDI"
+$AuditEventId = 7102
 $MaximumCollectorRuntimeMilliseconds = 45000
 $RestartDelaySeconds = 2
 $Iteration = 0
@@ -448,6 +460,7 @@ function Write-SupervisorAudit {
         } | ConvertTo-Json -Compress
         [System.IO.File]::WriteAllText($AuditTempPath, $AuditJson, $Utf8WithoutBom)
         Move-Item -Path $AuditTempPath -Destination $AuditPath
+        Write-EventLog -LogName "Application" -Source $ServiceDeskEventSource -EventId $AuditEventId -EntryType Information -Message $AuditJson
         Get-ChildItem -Path $ServiceDeskRoot -Filter "rdp_collector_audit_*.jsonl" -File -ErrorAction SilentlyContinue |
             Sort-Object LastWriteTimeUtc -Descending |
             Select-Object -Skip $MaximumAuditFiles |

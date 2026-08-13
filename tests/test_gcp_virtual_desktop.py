@@ -463,7 +463,11 @@ def test_inactive_real_session_zero_is_unavailable_and_preserves_record_time(
     telemetry_call, events_call = client.list_entries.call_args_list
     assert telemetry_call.kwargs["max_results"] == 1
     assert "servicedesk_rdp_telemetry" in telemetry_call.kwargs["filter_"]
-    assert "windows_event_log" not in telemetry_call.kwargs["filter_"]
+    assert "windows_event_log" in telemetry_call.kwargs["filter_"]
+    assert 'jsonPayload.ProviderName="ServiceDeskVDI"' in telemetry_call.kwargs[
+        "filter_"
+    ]
+    assert "jsonPayload.EventID=7101" in telemetry_call.kwargs["filter_"]
     assert "windows_event_log" in events_call.kwargs["filter_"]
     assert 'jsonPayload.Channel="Security"' in events_call.kwargs["filter_"]
     assert (
@@ -513,6 +517,40 @@ def test_newer_rdp_connection_event_supersedes_negative_session_sample(monkeypat
     assert telemetry["session_count"] is None
     assert telemetry["reason"] == "session_state_changed_after_sample_latest_session"
     assert events[0]["category"] == "session"
+    assert errors == []
+
+
+def test_application_event_telemetry_message_is_parsed(monkeypatch):
+    entry = SimpleNamespace(
+        payload={
+            "Channel": "Application",
+            "ProviderName": "ServiceDeskVDI",
+            "EventID": 7101,
+            "Message": json.dumps(
+                {
+                    "timestamp": "2030-01-01T00:02:00Z",
+                    "session_active": True,
+                    "session_count": 1,
+                    "counter_available": True,
+                    "max_user_input_delay_ms": 17.0,
+                }
+            ),
+        },
+        timestamp="2030-01-01T00:03:00Z",
+        log_name="projects/fake-vdi-project/logs/windows_event_log",
+    )
+    client = Mock()
+    client.list_entries.side_effect = [[entry], []]
+    monkeypatch.setattr("google.cloud.logging_v2.Client", Mock(return_value=client))
+
+    telemetry, events, errors = gcp_tool._collect_logs("fake-vdi-project", "123")
+
+    assert telemetry["status"] == "available"
+    assert telemetry["value"] == 17.0
+    assert telemetry["session_active"] is True
+    assert telemetry["session_count"] == 1
+    assert telemetry["timestamp"] == "2030-01-01T00:02:00Z"
+    assert events == []
     assert errors == []
 
 
@@ -1125,6 +1163,7 @@ def test_windows_scheduled_collector_has_bounded_non_sensitive_execution_audit()
     assert "Move-Item -Path $AuditTempPath -Destination $AuditPath" in task_runner
     assert "System.Text.UTF8Encoding($false)" in task_runner
     assert "[System.IO.File]::WriteAllText($AuditTempPath" in task_runner
+    assert '-Source $ServiceDeskEventSource -EventId $AuditEventId' in task_runner
     assert "username" not in task_runner.casefold()
     assert "credential" not in task_runner.casefold()
 
@@ -1139,6 +1178,7 @@ def test_windows_collector_atomically_publishes_bounded_telemetry_files():
     assert "Move-Item -Path $TelemetryTempPath -Destination $TelemetryPath" in collector
     assert "System.Text.UTF8Encoding($false)" in collector
     assert "[System.IO.File]::WriteAllText($TelemetryTempPath" in collector
+    assert '-Source $ServiceDeskEventSource -EventId $TelemetryEventId' in collector
     assert 'Filter "rdp_telemetry_*.jsonl"' in collector
     assert "Select-Object -Skip $MaximumTelemetryFiles" in collector
     assert "rdp_telemetry_*.jsonl" in script
