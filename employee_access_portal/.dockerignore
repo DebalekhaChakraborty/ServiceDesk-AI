@@ -1,0 +1,17 @@
+# Keep the build context minimal and credential-free.
+node_modules
+npm-debug.log*
+coverage
+
+# Never copy environment files into an image, template included.
+.env
+.env.*
+
+# Not needed at runtime.
+test
+scripts
+README.md
+.git
+.gitignore
+.dockerignore
+Dockerfile

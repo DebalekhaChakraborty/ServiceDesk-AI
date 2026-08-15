@@ -1,0 +1,9 @@
+node_modules/
+coverage/
+npm-debug.log*
+
+# Real environment files never belong in Git. The placeholder template does.
+.env
+.env.local
+.env.*.local
+!.env.example
