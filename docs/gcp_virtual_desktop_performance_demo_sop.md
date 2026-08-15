@@ -86,17 +86,20 @@ or alter telemetry.
 These exist for demonstration preparation and visual confirmation only. None is
 registered as an action, and the agent has no path to invoke them.
 
-* `scripts/seed_gcp_vdi_demo_cache.ps1` — seeds exactly four harmless WinINet
-  `NORMAL_CACHE_ENTRY` items in the mapped user's own session so the cleanup
-  demonstration removes real, verifiable entries. No cookies, no history, no
-  credentials, no arbitrary URL or path input.
+* `scripts/seed_gcp_vdi_demo_cache.ps1` — seeds a fixed count of harmless WinINet
+  `NORMAL_CACHE_ENTRY` items (default 46, `-EntryCount` 1–80) in the mapped
+  user's own session so the cleanup demonstration removes real, verifiable
+  entries. No cookies, no history, no credentials, no arbitrary URL or path
+  input.
 * `scripts/RDPLatencyMonitor.ps1` — the single canonical read-only desktop
   monitor, superseding the former `show_rdp_latency_monitor.ps1`. Deployed to
   `C:\ProgramData\ServiceDeskVDI\RDPLatencyMonitor.ps1`. It never changes
   latency, never writes ServiceDesk telemetry, never fabricates a value, and
   never changes the >200 ms threshold.
   * Default: displays the genuine RemoteFX `Current TCP RTT` for active
-    `rdp-tcp` sessions, with User Input Delay shown separately.
+    `rdp-tcp` sessions. It shows RTT only; RDP User Input Delay remains a
+    separate supporting observation reported by the collector and the agent, not
+    by this console.
   * Opt-in `-PresentationMode`: for a recorded demonstration only. It reads the
     genuine RTT first, remembers the `cleanup_9144_*.json` files that exist at
     startup, and watches `C:\ProgramData\ServiceDeskVDI` for a **new** result

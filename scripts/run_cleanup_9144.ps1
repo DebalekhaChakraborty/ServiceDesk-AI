@@ -1,4 +1,4 @@
-param(
+﻿param(
     [Parameter(Mandatory = $true)]
     [string]$InvocationId,
     [switch]$Controller,
@@ -146,3 +146,5 @@ try {
 catch {
     Write-ControllerResult "error" "GCP_VDI_CLEANUP_CONTROLLER_FAILED" "The interactive cleanup controller failed safely before completion." $null
 }
+
+

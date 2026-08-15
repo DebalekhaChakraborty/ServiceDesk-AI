@@ -1,0 +1,39 @@
+# managed-by: ServiceDeskVDI
+logging:
+  receivers:
+    windows_event_log:
+      type: windows_event_log
+      channels:
+          - 'System'
+          - 'Application'
+          - 'Security'
+          - 'Microsoft-Windows-TerminalServices-LocalSessionManager/Operational'
+          - 'Microsoft-Windows-TerminalServices-RemoteConnectionManager/Operational'
+      receiver_version: 2
+    servicedesk_rdp_telemetry:
+      type: files
+      include_paths:
+        - 'C:\ProgramData\ServiceDeskVDI\rdp_telemetry.jsonl'
+        - 'C:\ProgramData\ServiceDeskVDI\rdp_telemetry_*.jsonl'
+      record_log_file_path: false
+      wildcard_refresh_interval: 10s
+    servicedesk_rdp_collector_audit:
+      type: files
+      include_paths:
+        - 'C:\ProgramData\ServiceDeskVDI\rdp_collector_audit.jsonl'
+        - 'C:\ProgramData\ServiceDeskVDI\rdp_collector_audit_*.jsonl'
+      record_log_file_path: false
+      wildcard_refresh_interval: 10s
+  processors:
+    servicedesk_rdp_json:
+      type: parse_json
+  service:
+    pipelines:
+      default_pipeline:
+        receivers: [windows_event_log]
+      servicedesk_rdp_telemetry:
+        receivers: [servicedesk_rdp_telemetry]
+        processors: [servicedesk_rdp_json]
+      servicedesk_rdp_collector_audit:
+        receivers: [servicedesk_rdp_collector_audit]
+        processors: [servicedesk_rdp_json]

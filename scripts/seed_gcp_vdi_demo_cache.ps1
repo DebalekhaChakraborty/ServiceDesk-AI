@@ -25,8 +25,8 @@ What this NEVER does:
 #>
 [CmdletBinding()]
 param(
-    [ValidateRange(1, 8)]
-    [int]$EntryCount = 4
+    [ValidateRange(1, 80)]
+    [int]$EntryCount = 46
 )
 
 $ErrorActionPreference = "Stop"
@@ -86,7 +86,7 @@ for ($i = 1; $i -le $EntryCount; $i++) {
     Write-Host ("  seeded [{0}/{1}] {2}" -f $created, $EntryCount, $url) -ForegroundColor Green
 }
 
+
 Write-Host ""
-Write-Host ("Seeded {0} Temporary Internet Files entries as user '{1}'." -f `
-    $created, [Environment]::UserName) -ForegroundColor Cyan
+Write-Host ("Seeded {0} Temporary Internet Files entries as user '{1}'." -f $created, [Environment]::UserName) -ForegroundColor Cyan
 Write-Host "System File Cleanup should now report this many eligible items." -ForegroundColor Gray

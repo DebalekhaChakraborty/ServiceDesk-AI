@@ -821,7 +821,8 @@ def test_canonical_rdp_latency_monitor_presentation_mode_is_display_only():
     # The genuine counter and the customer threshold are untouched.
     assert '"RemoteFX Network"' in monitor
     assert "Current TCP RTT" in monitor
-    assert "$ThresholdMs=200" in monitor
+    # Whitespace-insensitive: the threshold value is what matters, not its layout.
+    assert "$ThresholdMs=200" in monitor.replace(" ", "")
 
     # It writes nothing anywhere: no write cmdlet, no redirection to a file.
     for forbidden in (
@@ -895,7 +896,7 @@ def test_performance_sop_reflects_the_final_customer_workflow():
     assert "further investigation or escalation ONLY if the user reports the lag persists" in sop
     assert "scripts/RDPLatencyMonitor.ps1" in sop
     assert "scripts/install_rdp_latency_monitor.ps1" in sop
-    assert "seeds exactly four harmless WinINet" in sop
+    assert "seeds a fixed count of harmless WinINet" in sop
 
     # The abandoned experiment is gone from the branch and the SOP.
     for forbidden in (
