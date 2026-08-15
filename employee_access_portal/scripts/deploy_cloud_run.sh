@@ -51,11 +51,29 @@ require_env() {
 
 runtime_sa_email() { printf '%s@%s.iam.gserviceaccount.com' "${RUNTIME_SA}" "${PROJECT_ID}"; }
 
+# Cloud Run serves a service on more than one hostname, and `status.url` can
+# report the legacy `<service>-<hash>-<region>.a.run.app` form while `gcloud run
+# deploy` reports the canonical `<service>-<project-number>.<region>.run.app`
+# form. The redirect URI must be pinned to exactly one of them, so the URL that
+# the deploy itself reports is treated as authoritative and `status.url` is only
+# a fallback for describing an already-deployed service.
+DEPLOYED_URL=""
+
 service_url() {
+  if [[ -n "${DEPLOYED_URL}" ]]; then
+    printf '%s' "${DEPLOYED_URL}"
+    return
+  fi
   gcloud run services describe "${SERVICE}" \
     --project "${PROJECT_ID}" --region "${REGION}" \
     --format 'value(status.url)' 2>/dev/null || true
 }
+
+# Google's frontend reserves the bare path /healthz on *.run.app and answers it
+# with its own 404 without ever forwarding the request to the container. The
+# application does serve /healthz correctly - Cloud Run's own probes reach it
+# directly - but an external check has to use the trailing-slash form.
+health_url() { printf '%s/healthz/' "$1"; }
 
 # -----------------------------------------------------------------------------
 # bootstrap-secrets: create the empty secrets and the least-privilege identity.
@@ -113,6 +131,7 @@ EOF
 deploy() {
   local base_url="$1"
   local sa; sa="$(runtime_sa_email)"
+  local out; out="$(mktemp)"
 
   gcloud run deploy "${SERVICE}" \
     --source "${APP_DIR}" \
@@ -128,7 +147,13 @@ deploy() {
     `# The application itself is protected by Microsoft Entra, not by GCP IAM.` \
     --allow-unauthenticated \
     --set-env-vars "ENTRA_PORTAL_TENANT_ID=${ENTRA_PORTAL_TENANT_ID},ENTRA_PORTAL_CLIENT_ID=${ENTRA_PORTAL_CLIENT_ID},PORTAL_BASE_URL=${base_url}" \
-    --set-secrets "ENTRA_PORTAL_CLIENT_SECRET=${CLIENT_SECRET_NAME}:latest,PORTAL_SESSION_SECRET=${SESSION_SECRET_NAME}:latest"
+    --set-secrets "ENTRA_PORTAL_CLIENT_SECRET=${CLIENT_SECRET_NAME}:latest,PORTAL_SESSION_SECRET=${SESSION_SECRET_NAME}:latest" \
+    2>&1 | tee "${out}"
+
+  # Pin the canonical hostname reported by the deploy itself.
+  DEPLOYED_URL="$(grep -oE 'https://[A-Za-z0-9.-]+\.run\.app' "${out}" | tail -1)"
+  rm -f "${out}"
+  [[ -n "${DEPLOYED_URL}" ]] || die "could not determine the Cloud Run service URL from the deploy output."
 }
 
 # -----------------------------------------------------------------------------
@@ -146,8 +171,8 @@ phase_a() {
   note "Rewriting PORTAL_BASE_URL to the real service URL"
   deploy "${url}"
 
-  note "Verifying /healthz"
-  curl -fsS "${url}/healthz" && printf '\n'
+  note "Verifying health (trailing-slash form; Google's frontend eats bare /healthz)"
+  curl -fsS "$(health_url "${url}")" && printf '\n'
 
   cat <<EOF
 
@@ -186,8 +211,8 @@ phase_b() {
   note "Phase B deploy with PORTAL_BASE_URL=${url}"
   deploy "${url}"
 
-  note "Smoke test: /healthz must return 200 without authentication"
-  curl -fsS "${url}/healthz" && printf '\n'
+  note "Smoke test: health endpoint must return 200 without authentication"
+  curl -fsS "$(health_url "${url}")" && printf '\n'
 
   note "Smoke test: / must return the sign-in landing page"
   curl -fsS -o /dev/null -w 'landing page HTTP %{http_code}\n' "${url}/"

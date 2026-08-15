@@ -150,6 +150,14 @@ session-store dependency. `npm audit` reports 0 vulnerabilities.
 | `GET /auth/error` | public | branded authentication failure page |
 | `GET /healthz` | public | `200 {"status":"ok",...}`, no Entra round trip |
 
+> **Cloud Run caveat.** Google's frontend reserves the bare path `/healthz` on
+> `*.run.app` and answers it with its own 404 without forwarding the request to
+> the container. The application serves `/healthz` correctly — Cloud Run's own
+> startup and liveness probes reach the container directly and are unaffected —
+> but an *external* check over the public hostname must use the trailing-slash
+> form `/healthz/`, which Express matches to the same route. The deploy script
+> does this automatically.
+
 ### Verify Corporate Access
 
 This is the route the demonstration depends on. Pressing the button causes the
@@ -307,8 +315,14 @@ export ENTRA_PORTAL_CLIENT_ID=<client-guid>
 ```
 
 This deploys the service, reads the real URL, redeploys with
-`PORTAL_BASE_URL` set to it, verifies `/healthz`, and then **stops** and prints
-the exact redirect URI to register.
+`PORTAL_BASE_URL` set to it, verifies health, and then **stops** and prints the
+exact redirect URI to register.
+
+> Cloud Run serves the service on more than one hostname, and `status.url` can
+> report the legacy `<service>-<hash>-<region>.a.run.app` form while the deploy
+> reports the canonical `<service>-<project-number>.<region>.run.app` form. The
+> redirect URI must be pinned to exactly one, so the script treats the URL
+> printed by `gcloud run deploy` as authoritative.
 
 **Human action required.** In the Entra admin center → the portal app
 registration → *Authentication* → add a **Web** platform with exactly:
