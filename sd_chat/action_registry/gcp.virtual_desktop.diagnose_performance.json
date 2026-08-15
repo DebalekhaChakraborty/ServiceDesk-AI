@@ -1,0 +1,14 @@
+{
+  "id": "gcp.virtual_desktop.diagnose_performance",
+  "title": "Check GCP Windows virtual desktop performance and RDP responsiveness",
+  "description": "Check the GCP virtual desktop's host performance and Remote Desktop responsiveness.",
+  "inputs": ["target_upn"],
+  "outputs": ["diagnosis.metrics", "diagnosis.finding_code", "diagnosis.message"],
+  "preconditions": [],
+  "effects": ["read_only_diagnosis(${target_upn})"],
+  "tool": "gcp_virtual_desktop_tool",
+  "action": "diagnose_virtual_desktop_performance",
+  "args_template": {
+    "target_upn": "${target_upn}"
+  }
+}

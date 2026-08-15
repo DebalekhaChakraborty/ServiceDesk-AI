@@ -1,5 +1,20 @@
 # ServiceDesk AI
 
+## Runtime environment
+
+This project uses the shared application interpreter:
+
+```
+/home/AI_POC/venvs/debalekha/bin/python
+/home/AI_POC/venvs/debalekha/bin/python -m pip install -r requirements-gcp-vdi.txt
+```
+
+Installing into `debalekha` is fine — it is the application environment.
+
+**Never install packages into `/home/AI_POC/venvs/tactics`.** That interpreter is
+the frozen scientific environment; adding ServiceDesk dependencies would invalidate
+its exact-runtime provenance.
+
 ## Account Access backend
 
 Account Access defaults to the non-executing `AD_ACCOUNT_MODE=off` mode. Use the
@@ -57,3 +72,149 @@ corroboration verifies that the claimed UPN/object exists and matches, but it is
 a replacement for interactive user authentication. A production deployment must
 populate that persona from validated Entra ID authentication claims at the backend
 trust boundary.
+
+## GCP Windows virtual desktop PoC
+
+This proof of concept treats a Windows VM on Google Compute Engine as a single-user
+virtual desktop. It is not Google Workspace and it does not reuse the AWS WorkSpaces
+diagnostic model. The portal performs read-only login and performance diagnosis
+against real Compute Engine, Cloud Monitoring, and Cloud Logging evidence.
+
+### Authentication and assignment
+
+Local real-mode validation uses Google Application Default Credentials. The VM uses
+a keyless service account limited to writing Ops Agent logs and metrics. Chat input
+cannot supply a project, zone, VM name, Windows username, or filesystem path. Those
+values come from a private mapping outside Git:
+
+```ini
+GCP_VDI_MODE=gcp
+GCP_VDI_MAPPING_PATH=/secure/local/path/gcp_vdi_user_map.json
+```
+
+The authenticated `identity_context.upn` must exactly match the requested user and
+an entry in that mapping. Current scope is self-service only. `off` is the safe
+default, `demo` uses fake test fixtures, and `gcp` uses real APIs. A real API failure
+never falls back to demo success.
+
+The mapping may contain an optional safe `display_name`; otherwise the portal uses
+`Shared Virtual Workstation`. Raw project, zone, instance name, numeric instance ID,
+and private IP remain controller-only. A fake tracked contract example is provided
+at `examples/gcp_vdi_user_map.example.json`.
+
+### Evidence and threshold
+
+Host CPU, memory, disk, and network are observations from Cloud Monitoring. The
+Compute Engine received/sent byte counters are DELTA metrics: the result labels
+them `aggregation=latest_delta`, includes their observed 60-second period, and
+does not call them bandwidth, throughput, or a lookback-window total. VM running
+duration is calculated from Compute Engine's `last_start_timestamp`, not
+misreported from a latest 60-second uptime-delta bucket.
+Windows and RDP session events come from Cloud Logging through Google Ops Agent.
+The collector publishes its identity-free JSON through the fixed `ServiceDeskVDI`
+Windows Application event source (telemetry event `7101`, execution audit event
+`7102`); bounded atomic files under `C:\ProgramData\ServiceDeskVDI` remain local
+diagnostic evidence. Missing evidence remains unavailable rather than becoming zero.
+
+The bootstrap validates one bounded 30-second collector window synchronously and
+then registers a one-minute repeating task. `IgnoreNew` is intended to prevent
+parallel collectors, and every collector child is capped at 45 seconds. The task's
+first trigger is given a two-minute registration runway and must have a future
+`NextRunTime`; its repetition plus the VM have a three-hour safety boundary.
+
+One-time read-only live discovery validated the Windows `RemoteFX Network(*)\Current
+TCP RTT` counter with an active RDP session. Recurring telemetry and production
+diagnosis preserve unavailable values as null; portal conversational behavior still
+requires manual validation after deployment.
+
+With no active session, the collector publishes capability/session state without
+querying the session counter. Each native session/counter read runs in its own
+5-second bounded child and is terminated as a process tree if Windows session
+query or PDH stalls. Wildcard counter-set discovery occurs only once during
+bootstrap; the validated `User Input Delay per Session` and `RemoteFX Network(*)\Current
+TCP RTT` paths are persisted locally and reused by child probes. A probe identifies
+active `rdp-tcp` sessions and matches each counter's documented instance form.
+Those IDs are used only in process memory and are never written to telemetry or
+audit output. The probe emits no user or session identity.
+The collector records only timestamp, active-session count, counter availability,
+maximum **RDP TCP RTT**, and maximum **RDP User Input Delay**. It does not record usernames, keystrokes, clipboard
+content, credentials, or user input. User Input Delay is queued Windows application
+input responsiveness, not network RTT or AWS WorkSpaces `InSessionLatency`.
+The collector's bounded execution audit records timestamps, phases, exit codes,
+and sanitized ServiceDesk task metadata. Unexpected action/principal values are
+redacted. It contains no user or session identity.
+
+User Input Delay remains a supporting responsiveness observation and never
+qualifies cleanup. The only explicit customer-aligned performance boundary is:
+
+```text
+RDP TCP RTT > 200 ms
+```
+
+Exactly 200 ms is not a breach. The PoC does not invent CPU, memory, disk, or
+network severity thresholds.
+
+### Shared lab-machine boundary
+
+The reused Windows lab VM also supports SCCM/ConfigMgr and infra-domain testing.
+The PoC bootstrap must not modify domain membership, SCCM services/configuration,
+endpoint-management policy, DNS, Windows firewall, registered devices, or existing
+test data. Its in-guest footprint is limited to Google Ops Agent configuration and
+the separate `C:\ProgramData\ServiceDeskVDI` telemetry collector/scheduled task.
+Before the bootstrap first changes Ops Agent user configuration, it makes a
+rollback-safe backup. It updates the file only when it is empty, exactly matches
+the legacy ServiceDesk configuration, or exactly matches the ServiceDesk-owned
+snapshot. An unrelated or subsequently modified user configuration is preserved
+and causes a safe stop requiring an explicit merge; it is never overwritten.
+
+### Cost and lifecycle
+
+The PoC uses one `e2-medium` Windows VM with a 50 GB balanced persistent disk, no
+GPU, no static IP, and a three-hour maximum run duration whose action is `STOP`.
+The VM is reached through IAP TCP forwarding; TCP 3389 must not be made public for
+the PoC. No user-defined Monitoring metric is created.
+
+Start and stop an approved mapped demo VM explicitly:
+
+```bash
+gcloud compute instances start INSTANCE --project=PROJECT --zone=ZONE
+gcloud compute instances stop INSTANCE --project=PROJECT --zone=ZONE
+```
+
+Real validation requires ADC, a private mapping, a secure Windows credential created
+outside chat, a genuine IAP/RDP session, and `GCP_VDI_MODE=gcp`. Known limitations are
+that diagnosis is read-only, an inactive RDP session has no User Input Delay value,
+and inconclusive evidence requires escalation rather than automatic password reset
+or infrastructure remediation.
+
+### Governed System File Cleanup
+
+When genuine RDP TCP RTT is strictly greater than 200 ms, the performance
+controller creates a ten-minute, caller- and mapping-bound System File Cleanup
+offer. A later confirmation invokes one
+GCP-specific controller; it revalidates the mapping, retrieves its SOP, requires
+the exact `gcp.virtual_desktop.system_file_cleanup` planner action, runs
+`check_list` once, and collects fresh evidence. It never uses generic
+`cleanup_temp_files`.
+
+The fixed guest worker runs in the mapped user's verified interactive session and
+accepts only its controller-owned invocation and result paths. Its customer-visible
+scope is exactly `Downloaded Program Files` and `Temporary Internet Files`.
+Temporary Internet Files cleanup enumerates WinINet content entries and deletes
+only eligible `NORMAL_CACHE_ENTRY` URLs; cookie, history, sticky, and edited cache
+entries are excluded. Downloaded Program Files inspection is non-recursive and
+limited to legacy ActiveX/Java payloads in the dedicated Windows folder. No eligible
+items is a successful category result. The worker does not invoke Disk Cleanup,
+DISM, or the `IEmptyVolumeCache` COM interfaces. It never targets user folders,
+browser profiles, Outlook data, SCCM content, networking, domain membership, or
+Windows services. The controller resolves the mapped VM's Compute Engine private
+IP and invokes the fixed controller through the existing ServiceDesk
+`win_tool.execute_winrm_ps` transport and `WINRM_*` runtime identity. The model
+supplies neither the host nor PowerShell. No second transport, public IP, public
+RDP, or public WinRM is added.
+
+For a rehearsal that needs an elevated branch, use `GCP_VDI_MODE=demo` and
+`GCP_VDI_DEMO_SCENARIO=kb0019144_high_latency`. This produces a clearly labelled
+demo-only 243-ms RDP TCP RTT. For a genuine lab measurement, an operator
+may run `scripts/gcp_vdi_demo_fault.ps1` through their existing secure guest
+session; it is bounded to 60–120 seconds and is never exposed to chat.

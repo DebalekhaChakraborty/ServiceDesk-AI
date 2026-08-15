@@ -1,0 +1,14 @@
+{
+  "id": "gcp.virtual_desktop.diagnose_login",
+  "title": "Validate GCP Windows virtual desktop login and RDP session health",
+  "description": "Validate the GCP virtual desktop state and recent RDP login/session health.",
+  "inputs": ["target_upn"],
+  "outputs": ["diagnosis.finding_code", "diagnosis.message"],
+  "preconditions": [],
+  "effects": ["read_only_diagnosis(${target_upn})"],
+  "tool": "gcp_virtual_desktop_tool",
+  "action": "diagnose_virtual_desktop_login",
+  "args_template": {
+    "target_upn": "${target_upn}"
+  }
+}

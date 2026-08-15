@@ -1,0 +1,10 @@
+# GCP Windows virtual desktop PoC dependencies.
+#
+# Install only into the shared ServiceDesk application interpreter:
+#   /home/AI_POC/venvs/debalekha/bin/python -m pip install -r requirements-gcp-vdi.txt
+#
+# Do not install these packages into /home/AI_POC/venvs/tactics.
+
+google-cloud-compute==1.42.0
+google-cloud-logging==3.12.1
+google-cloud-monitoring==2.28.0

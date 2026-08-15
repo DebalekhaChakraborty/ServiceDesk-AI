@@ -516,6 +516,44 @@ def check_list(
                     },
                 }
 
+        # ------------------------------------------------------------------
+        # Isolated GCP shared-workstation cleanup authorization.
+        # ------------------------------------------------------------------
+        elif cond == "shared_workstation_cleanup_is_authorized":
+            binding = (
+                state.get("endpoint_target_binding") if state is not None else None
+            )
+            offer = (
+                state.get("gcp_vdi_cleanup_offer") if state is not None else None
+            )
+            ok = bool(
+                isinstance(binding, dict)
+                and isinstance(offer, dict)
+                and binding.get("target_scope") == "shared_virtual_workstation"
+                and binding.get("source")
+                == "trusted_shared_workstation_mapping"
+                and offer.get("phase") == "confirmed"
+                and offer.get("target_scope") == "shared_virtual_workstation"
+                and offer.get("action_id")
+                == "gcp.virtual_desktop.system_file_cleanup"
+                and offer.get("finding_code") == "HIGH_SESSION_RTT"
+                and bool(offer.get("offer_id"))
+                and bool(offer.get("evidence_timestamp"))
+                and bool(offer.get("mapping_fingerprint"))
+                and offer.get("mapping_fingerprint")
+                == binding.get("mapping_fingerprint")
+                and _norm_upn(str(offer.get("caller_upn") or ""))
+                == _norm_upn(str(binding.get("caller_upn") or ""))
+                == _norm_upn(caller_upn)
+            )
+            details["shared_workstation_cleanup_is_authorized"] = ok
+            if not ok:
+                return {
+                    "status": "error",
+                    "message": "The retained shared-workstation cleanup grant is invalid.",
+                    "details": details,
+                }
+
 
         # ------------------------------------------------------------------
         # Unknown preconditions must fail closed. A generated or paraphrased
