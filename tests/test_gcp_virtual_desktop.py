@@ -2050,3 +2050,177 @@ def test_windows_bootstrap_does_not_modify_sccm_domain_or_network_configuration(
         "netsh advfirewall",
     ):
         assert forbidden not in script
+
+
+# ---------------------------------------------------------------------------
+# Presentation contract: System File Cleanup may only be surfaced when the
+# deterministic controller actually returns a cleanup_offer.
+#
+# Regression: a real portal response reported repeated disconnects with RTT
+# unavailable, and the root LLM volunteered "Since the RDP TCP RTT is
+# unavailable, I cannot offer System File Cleanup." That wrongly implies
+# cleanup treats disconnects and that a subsystem denied it.
+# ---------------------------------------------------------------------------
+
+
+def _snapshot_with(rdp_tcp_rtt=None, rdp_telemetry=None, events=None):
+    mapping = gcp_tool._mapping_for(CALLER_UPN)
+    snapshot = gcp_tool._load_demo_snapshot(mapping)
+    if rdp_tcp_rtt is not None:
+        snapshot["rdp_tcp_rtt"] = rdp_tcp_rtt
+    if rdp_telemetry is not None:
+        snapshot["rdp_telemetry"] = rdp_telemetry
+    if events is not None:
+        snapshot["events"] = events
+    return mapping, snapshot
+
+
+def _diagnose_snapshot(mapping, snapshot):
+    return gcp_tool._performance_diagnosis(
+        "demo", CALLER_UPN, mapping, snapshot
+    )["diagnosis"]
+
+
+_TWO_DISCONNECT_EPISODES = [
+    {"timestamp": "2030-01-01T00:00:00Z", "event_id": 24,
+     "category": "disconnect", "_correlation": "a"},
+    {"timestamp": "2030-01-01T00:05:00Z", "event_id": 24,
+     "category": "disconnect", "_correlation": "b"},
+]
+
+_RTT_UNAVAILABLE = {
+    "status": "unavailable",
+    "value": None,
+    "timestamp": None,
+    "session_active": True,
+    "reason": "counter_value_unavailable",
+}
+
+
+def test_A_repeated_disconnects_with_unavailable_rtt_never_qualifies_cleanup():
+    """Reported failure: disconnects + unavailable RTT must not discuss cleanup."""
+    mapping, snapshot = _snapshot_with(
+        rdp_tcp_rtt=dict(_RTT_UNAVAILABLE), events=_TWO_DISCONNECT_EPISODES
+    )
+    context = _offer_context()
+
+    diagnosis = _diagnose_snapshot(mapping, snapshot)
+
+    assert diagnosis["finding_code"] == "RDP_RECENT_DISCONNECTS"
+    assert diagnosis["recent_disconnect_count"] == 2
+    assert diagnosis["metrics"]["rdp_tcp_rtt_ms"]["status"] == "unavailable"
+    assert diagnosis["metrics"]["rdp_tcp_rtt_ms"]["value"] is None
+    # Guidance steers to investigation/escalation, never to cleanup.
+    assert diagnosis["response_guidance"] == "investigate_or_escalate_disconnects"
+    # The controller must not mint an offer for a disconnect finding.
+    assert (
+        gcp_tool._create_cleanup_offer(CALLER_UPN, mapping, diagnosis, context)
+        is None
+    )
+    assert context.state[gcp_tool.GCP_VDI_CLEANUP_OFFER_STATE_KEY] is None
+
+
+def test_B_high_session_rtt_with_offer_permits_cleanup(monkeypatch):
+    monkeypatch.setenv("GCP_VDI_DEMO_SCENARIO", "delay_above_200")
+    context = _offer_context()
+
+    result = _performance(context)
+
+    assert result["diagnosis"]["finding_code"] == "HIGH_SESSION_RTT"
+    assert result["cleanup_offer"] is not None
+    assert result["cleanup_offer"]["action"] == "System File Cleanup"
+    assert result["diagnosis"]["response_guidance"] == "offer_cleanup"
+
+
+def test_C_unavailable_rtt_without_disconnects_reports_unavailable_only():
+    mapping, snapshot = _snapshot_with(rdp_tcp_rtt=dict(_RTT_UNAVAILABLE), events=[])
+    context = _offer_context()
+
+    diagnosis = _diagnose_snapshot(mapping, snapshot)
+
+    assert diagnosis["finding_code"] == "RDP_TCP_RTT_UNAVAILABLE"
+    assert diagnosis["response_guidance"] == "escalate_if_issue_persists"
+    assert diagnosis["rdp_tcp_rtt_unavailable_reason"] == "counter_value_unavailable"
+    assert (
+        gcp_tool._create_cleanup_offer(CALLER_UPN, mapping, diagnosis, context)
+        is None
+    )
+
+
+def test_D_available_input_delay_never_substitutes_for_unavailable_rtt():
+    mapping, snapshot = _snapshot_with(
+        rdp_tcp_rtt=dict(_RTT_UNAVAILABLE),
+        rdp_telemetry={
+            "status": "available",
+            "value": 350.0,
+            "timestamp": "2030-01-01T00:08:00Z",
+            "session_active": True,
+            "source": "windows_user_input_delay",
+        },
+        events=[],
+    )
+    context = _offer_context()
+
+    diagnosis = _diagnose_snapshot(mapping, snapshot)
+
+    # Input delay is available and far above 200, but it is not RTT.
+    assert diagnosis["metrics"]["rdp_user_input_delay_ms"]["value"] == 350.0
+    assert diagnosis["metrics"]["rdp_tcp_rtt_ms"]["status"] == "unavailable"
+    assert diagnosis["finding_code"] == "RDP_TCP_RTT_UNAVAILABLE"
+    assert diagnosis["finding_code"] != "HIGH_SESSION_RTT"
+    assert (
+        gcp_tool._create_cleanup_offer(CALLER_UPN, mapping, diagnosis, context)
+        is None
+    )
+
+
+def test_E_rtt_exactly_at_threshold_yields_no_cleanup(monkeypatch):
+    monkeypatch.setenv("GCP_VDI_DEMO_SCENARIO", "delay_exactly_200")
+    context = _offer_context()
+
+    result = _performance(context)
+
+    assert result["diagnosis"]["metrics"]["rdp_tcp_rtt_ms"]["value"] == 200.0
+    assert result["diagnosis"]["finding_code"] == "NO_HIGH_SESSION_RTT"
+    assert result["cleanup_offer"] is None
+    assert result["diagnosis"]["response_guidance"] == "report_threshold_not_exceeded"
+
+
+def test_F_rtt_above_threshold_yields_cleanup_offer(monkeypatch):
+    monkeypatch.setenv("GCP_VDI_DEMO_SCENARIO", "delay_above_200")
+    context = _offer_context()
+
+    result = _performance(context)
+
+    assert result["diagnosis"]["metrics"]["rdp_tcp_rtt_ms"]["value"] == 201.0
+    assert result["diagnosis"]["finding_code"] == "HIGH_SESSION_RTT"
+    assert result["cleanup_offer"] is not None
+
+
+def test_response_guidance_is_inert_and_derived_from_finding_code():
+    """The hint is a label only: it must never carry executable intent."""
+    for finding, guidance in gcp_tool._RESPONSE_GUIDANCE_BY_FINDING.items():
+        assert isinstance(guidance, str)
+        assert guidance.replace("_", "").isalpha()
+        assert finding.isupper()
+    # No guidance value may name a tool, command, or action id.
+    joined = " ".join(gcp_tool._RESPONSE_GUIDANCE_BY_FINDING.values())
+    for forbidden in ("gcp.", "(", "exec", "run_", "winrm", "powershell"):
+        assert forbidden not in joined
+
+
+def test_agent_instruction_forbids_proactive_cleanup_without_offer():
+    normalized = " ".join(sd_chat.instruction.split())
+
+    assert "CLEANUP MENTION CONTRACT" in normalized
+    assert (
+        "If cleanup_offer is null or absent, you MUST NOT mention System File "
+        "Cleanup at all" in normalized
+    )
+    # The exact misleading phrasing observed in production is called out.
+    assert "since RTT is unavailable I cannot offer System File Cleanup" in normalized
+    # Disconnect handling must not borrow cleanup as a remedy.
+    assert "cleanup treats disconnects" in normalized
+    # RTT absence must never be rendered as zero or swapped for input delay.
+    assert "Never report it as zero" in normalized
+    assert "Never substitute RDP User Input Delay" in normalized

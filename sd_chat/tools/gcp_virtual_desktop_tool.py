@@ -31,6 +31,20 @@ from .sop_retriever import sop_retriever as _sop_retriever
 SUPPORTED_MODES = {"off", "demo", "gcp"}
 IAP_TCP_SOURCE_RANGE = "35.235.240.0/20"
 RDP_TCP_RTT_THRESHOLD_MS = 200.0
+
+# Deterministic presentation hints derived only from finding_code. These are
+# inert labels for rendering: they never authorize, execute, or gate anything.
+# Cleanup eligibility remains owned solely by _create_cleanup_offer().
+_RESPONSE_GUIDANCE_BY_FINDING = {
+    "HIGH_SESSION_RTT": "offer_cleanup_only_if_cleanup_offer_present",
+    "RDP_RECENT_DISCONNECTS": "investigate_or_escalate_disconnects",
+    "RDP_TCP_RTT_UNAVAILABLE": "escalate_if_issue_persists",
+    "NO_ACTIVE_RDP_SESSION": "explain_measurement_unavailable",
+    "NO_HIGH_SESSION_RTT": "report_threshold_not_exceeded",
+    "VDI_INSTANCE_NOT_FOUND": "explain_measurement_unavailable",
+    "VDI_INSTANCE_NOT_RUNNING": "explain_measurement_unavailable",
+}
+_DEFAULT_RESPONSE_GUIDANCE = "report_observations_only"
 DEFAULT_LOOKBACK_MINUTES = 30
 DEFAULT_TELEMETRY_FRESHNESS_MINUTES = 10
 DEFAULT_LOG_LIMIT = 100
@@ -1467,8 +1481,15 @@ def _performance_diagnosis(
             "threshold_rule": "RDP TCP RTT > 200 ms",
             "threshold_source": "customer KB performance threshold",
             "message": message,
+            "response_guidance": _RESPONSE_GUIDANCE_BY_FINDING.get(
+                finding, _DEFAULT_RESPONSE_GUIDANCE
+            ),
         }
     )
+    # Bounded, identity-free reason so the response can say *why* RTT is
+    # unavailable without inventing a more specific cause than was observed.
+    if rtt_telemetry.get("status") != "available":
+        diagnosis["rdp_tcp_rtt_unavailable_reason"] = rtt_telemetry.get("reason")
     return {"status": "ok", "diagnosis": diagnosis}
 
 
@@ -1516,6 +1537,12 @@ def _diagnose(
             normalized_upn, mapping, result["diagnosis"], tool_context
         )
         result["cleanup_offer"] = _cleanup_offer_public(offer) if offer else None
+        # Resolve the conditional hint once the controller has decided whether a
+        # cleanup offer actually exists. Cleanup may only be mentioned when it does.
+        if result["diagnosis"].get("finding_code") == "HIGH_SESSION_RTT":
+            result["diagnosis"]["response_guidance"] = (
+                "offer_cleanup" if offer else "escalate_if_issue_persists"
+            )
     return result
 
 
