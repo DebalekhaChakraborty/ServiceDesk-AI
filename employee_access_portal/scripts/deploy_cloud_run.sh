@@ -60,10 +60,28 @@ runtime_sa_email() { printf '%s@%s.iam.gserviceaccount.com' "${RUNTIME_SA}" "${P
 DEPLOYED_URL=""
 
 service_url() {
+  # 1. A deploy in this invocation reported the canonical URL: trust it.
   if [[ -n "${DEPLOYED_URL}" ]]; then
     printf '%s' "${DEPLOYED_URL}"
     return
   fi
+
+  # 2. phase-b runs without a prior deploy in the same process, so reconstruct
+  #    the canonical <service>-<project-number>.<region>.run.app form and use it
+  #    only if it genuinely serves. Falling through to status.url here would
+  #    silently pin the legacy hostname and break the registered redirect URI.
+  local project_number candidate
+  project_number="$(gcloud projects describe "${PROJECT_ID}" \
+    --format 'value(projectNumber)' 2>/dev/null || true)"
+  if [[ -n "${project_number}" ]]; then
+    candidate="https://${SERVICE}-${project_number}.${REGION}.run.app"
+    if curl -fsS -o /dev/null --max-time 15 "$(health_url "${candidate}")" 2>/dev/null; then
+      printf '%s' "${candidate}"
+      return
+    fi
+  fi
+
+  # 3. Older projects only ever get the legacy hostname.
   gcloud run services describe "${SERVICE}" \
     --project "${PROJECT_ID}" --region "${REGION}" \
     --format 'value(status.url)' 2>/dev/null || true
