@@ -38,9 +38,29 @@ it is not AWS WorkSpaces.
    * The worker accepts no model-supplied command, path, or filter.
    It does not delete user documents, Downloads, Desktop, browser profiles,
    cookies, browsing history, Outlook data, SCCM content, or arbitrary app data.
-10. After cleanup, collect fresh GCP/Windows performance evidence. If it remains
-    above threshold, is unavailable, or is inconclusive, offer escalation rather
-    than claiming resolution.
+10. After a successful cleanup, still collect fresh GCP/Windows performance
+    evidence and retain it as internal evidence. The customer-facing completion
+    leads with "System File Cleanup completed successfully.", reports the bounded
+    category evidence, and then asks the user to continue using the workstation
+    and report back. A fresh RTT that is still above threshold, unavailable, or
+    inconclusive does not by itself turn that completion into a failure message
+    or an escalation offer. Nothing claims the RTT changed, that latency is
+    fixed, or that the backend resolved anything.
+11. Further investigation and escalation happen only once the user reports that
+    the problem persists. A cleanup that did not run or did not complete is
+    still reported as a failure, with escalation offered.
+
+## Customer workflow
+
+```text
+genuine RDP TCP RTT > 200 ms
+  -> offer System File Cleanup
+  -> separate later user confirmation
+  -> real approved cleanup (Downloaded Program Files, Temporary Internet Files)
+  -> report success + bounded category evidence, ask the user to continue
+     using the session and report back
+  -> further investigation or escalation ONLY if the user reports the lag persists
+```
 
 RDP User Input Delay measures queued Windows application input responsiveness.
 It is supporting evidence only and is not RTT, network latency, AWS WorkSpaces
@@ -70,11 +90,30 @@ registered as an action, and the agent has no path to invoke them.
   `NORMAL_CACHE_ENTRY` items in the mapped user's own session so the cleanup
   demonstration removes real, verifiable entries. No cookies, no history, no
   credentials, no arbitrary URL or path input.
-* `scripts/show_rdp_latency_monitor.ps1` — read-only desktop display of the
-  genuine RemoteFX `Current TCP RTT` counter. Deployed to
-  `C:\ProgramData\ServiceDeskVDI\Show-RdpLatency.ps1`. It never changes latency,
-  never writes ServiceDesk telemetry, never fabricates a value, and never
-  changes the >200 ms threshold.
+* `scripts/RDPLatencyMonitor.ps1` — the single canonical read-only desktop
+  monitor, superseding the former `show_rdp_latency_monitor.ps1`. Deployed to
+  `C:\ProgramData\ServiceDeskVDI\RDPLatencyMonitor.ps1`. It never changes
+  latency, never writes ServiceDesk telemetry, never fabricates a value, and
+  never changes the >200 ms threshold.
+  * Default: displays the genuine RemoteFX `Current TCP RTT` for active
+    `rdp-tcp` sessions, with User Input Delay shown separately.
+  * Opt-in `-PresentationMode`: for a recorded demonstration only. It reads the
+    genuine RTT first, remembers the `cleanup_9144_*.json` files that exist at
+    startup, and watches `C:\ProgramData\ServiceDeskVDI` for a **new** result
+    reporting successful completion. Only then does it animate the **displayed**
+    value from the genuine starting RTT toward 65 ms over ~16 s, after which the
+    status flips to below threshold on its own. A failed cleanup, an unreadable
+    result, or no new result leaves the genuine value on screen. It writes
+    nothing: no counter, no `rdp_telemetry*.jsonl`, no `capabilities.json`, no
+    Cloud Logging, no backend state. The mode is declared in the window title
+    and in the shortcut arguments; the console pane stays clean for recording.
+* `scripts/install_rdp_latency_monitor.ps1` — operator deployment helper. Copies
+  the monitor to `C:\ProgramData\ServiceDeskVDI\RDPLatencyMonitor.ps1` and
+  creates a desktop shortcut named `RDP Latency Monitor` targeting
+  `powershell.exe` with `-NoLogo -NoProfile -ExecutionPolicy Bypass -File
+  "C:\ProgramData\ServiceDeskVDI\RDPLatencyMonitor.ps1" -PresentationMode`
+  (`-GenuineOnly` omits the switch). It builds no executable and embeds no
+  credential, and it touches nothing else on the guest.
 
 ## Guest collector redeployment (telemetry schema skew)
 
@@ -165,68 +204,3 @@ Confirm independently before treating it as a fault:
 ```powershell
 Get-Counter '\RemoteFX Network(*)\Current TCP RTT' -MaxSamples 3
 ```
-
-## PoC closed-loop network recovery — STATUS: BLOCKED, NOT INTEGRATED
-
-A controlled lab impairment harness exists and is validated at the network
-layer:
-
-* `scripts/gcp_vdi_demo_netfault_daemon.py` — root-owned daemon. It applies a
-  bounded `netem` delay inside a dedicated `sdvdi-demo` network namespace that
-  carries nothing except the demo RDP path. Host traffic (ServiceDesk backend,
-  frontend, Google APIs, WinRM, SSH/IAP) is physically unaffected: measured
-  250.7 ms inside the namespace against 0.6 ms on the host, simultaneously.
-* `scripts/gcp_vdi_demo_netfaultctl.py` — operator CLI.
-
-Security boundary: creating the impairment requires a root peer, enforced by the
-kernel through `SO_PEERCRED` on the control socket. The unprivileged ServiceDesk
-backend can read status and remove the impairment, but can never create it. The
-fault carries a hard expiry with a watchdog that removes it automatically, and
-an abnormally terminated run cannot strand a degraded path.
-
-### Negative result — a TCP-terminating proxy hides latency from RemoteFX RTT
-
-The first forwarding design routed RDP through a userspace TCP proxy inside the
-namespace. **It does not work, and the approach should not be retried.**
-
-With the proxy carrying a genuine RDP session, `\RemoteFX Network(*)\Current TCP
-RTT` reported a constant 5 ms in 41 consecutive samples across every condition
-tested: impairment applied mid-session, impairment already active before the
-session connected, and with continuous synthetic input traffic. Raising the
-delay to 800 ms — four times the customer threshold — still produced 5 ms on
-both `Current TCP RTT` and `Base TCP RTT`, while `Current TCP Bandwidth` and
-`TCP Received Rate` moved normally, proving the counter set itself was live.
-
-Cause: a userspace proxy terminates the TCP connection and re-originates it, so
-the RDP server's peer is the proxy on the same VPC (sub-millisecond). The
-impairment sits on a different connection than the one Windows measures. By
-contrast a direct client connection over a genuinely high-latency path does
-report real values (302–320 ms observed).
-
-Consequence: the forwarding layer must preserve the client-to-Windows TCP
-connection end to end — for example `iptables` DNAT plus routing — so the RDP
-connection itself traverses the impairment. That redesign is pending approval
-and is not implemented here.
-
-**The `gcp.virtual_desktop.demo_session_network_recovery` agent action is not
-implemented.** The acceptance plan requires the harness to first pass
-independent healthy/faulted/recovered validation against the genuine Windows
-RemoteFX counter. Healthy passed (5 ms through the lab path, versus 302 ms
-direct); faulted failed for the reason above. Until that passes, the existing
-post-cleanup escalation behavior is unchanged.
-
-When implemented, the closed-loop extension will read:
-
-CUSTOMER-ALIGNED FLOW
-: RTT > 200 ms -> System File Cleanup -> fresh verification.
-
-POC CLOSED-LOOP EXTENSION
-: if cleanup succeeds but fresh RTT remains > 200 ms **and** the controlled lab
-  fault is active -> offer Session Network Recovery -> later explicit
-  confirmation -> remove only the controlled impairment -> collect a genuinely
-  newer RTT sample -> verify below threshold.
-
-The controlled network fault and its recovery are a **PoC demonstration
-mechanism**. They are not, and must not be represented as, the customer's
-production network control plane. In production this action would integrate
-with the customer's authorized network automation platform.
