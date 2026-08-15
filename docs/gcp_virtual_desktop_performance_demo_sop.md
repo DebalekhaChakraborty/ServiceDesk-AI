@@ -76,6 +76,96 @@ registered as an action, and the agent has no path to invoke them.
   never writes ServiceDesk telemetry, never fabricates a value, and never
   changes the >200 ms threshold.
 
+## Guest collector redeployment (telemetry schema skew)
+
+### When this is needed
+
+The guest telemetry contract is versioned by
+`servicedesk_vdi_telemetry_schema_version` in
+`C:\ProgramData\ServiceDeskVDI\capabilities.json`.
+
+| Version | Capability contract |
+| --- | --- |
+| absent / 0 | User Input Delay only. Cannot sample RDP TCP RTT. |
+| 2 | Adds `rdp_tcp_rtt_counter_set_available` / `_set` / `_paths`. |
+
+A guest below version 2 never samples `RemoteFX Network(*)\Current TCP RTT`,
+even when Windows exposes a perfectly valid value. It publishes
+`rdp_tcp_rtt_counter_available=false` with a null RTT, so the controller reports
+RTT as unavailable and — correctly — creates no cleanup offer.
+
+The backend now separates the two cases. An outdated guest yields the bounded
+reason `collector_capability_schema_outdated` and an explicit collection
+limitation, instead of being silently reported as a missing counter. The backend
+never repairs the guest, never infers a value, and never treats stale telemetry
+as a measurement.
+
+**Redeployment is an operator action. It is not automated, and the agent has no
+path to trigger it.**
+
+### Procedure (idempotent)
+
+Deploy the reviewed repository assets together — they are one unit, and a
+partial copy reintroduces skew:
+
+```
+scripts/configure_gcp_vdi_windows.ps1
+scripts/run_cleanup_9144.ps1
+scripts/ServiceDeskFixedCleanup.cs
+```
+
+From an elevated PowerShell session on the PoC guest, reached through the
+operator's existing secure administrative access:
+
+```powershell
+# 1. Stage the three reviewed assets together.
+$Root = "C:\ProgramData\ServiceDeskVDI"
+New-Item -Path $Root -ItemType Directory -Force | Out-Null
+Copy-Item .\run_cleanup_9144.ps1        -Destination $Root -Force
+Copy-Item .\ServiceDeskFixedCleanup.cs  -Destination $Root -Force
+
+# 2. Re-run the bootstrap. It is idempotent: it rediscovers counters, rewrites
+#    capabilities.json with the current schema version, and re-registers the
+#    recurring task in place.
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\configure_gcp_vdi_windows.ps1
+```
+
+Do **not** hand-edit `capabilities.json`. It is generated from live counter
+discovery; editing it by hand fabricates capability claims.
+
+The bootstrap preserves the existing safety boundaries: no domain membership
+change, no SCCM/ConfigMgr change, no firewall change, no endpoint-management
+change, no public RDP, and no fabricated telemetry.
+
+### Post-deployment verification
+
+```powershell
+Get-Content C:\ProgramData\ServiceDeskVDI\capabilities.json
+
+Get-ScheduledTask -TaskName "ServiceDeskVDI-RdpTelemetry" |
+    Get-ScheduledTaskInfo
+
+Get-Content C:\ProgramData\ServiceDeskVDI\rdp_telemetry.jsonl -Tail 5
+```
+
+Expected, when an RDP session is active and Windows exposes the counter:
+
+* `capabilities.json` contains `servicedesk_vdi_telemetry_schema_version: 2`,
+  `rdp_tcp_rtt_counter_set_available: true`, `rdp_tcp_rtt_counter_set:
+  "RemoteFX Network"`, and a non-empty `rdp_tcp_rtt_counter_paths`.
+* The scheduled task shows a recent `LastRunTime` and `LastTaskResult` 0.
+* Recent telemetry records carry
+  `servicedesk_vdi_telemetry_schema_version: 2`,
+  `rdp_tcp_rtt_counter_available: true`, and a numeric `rdp_tcp_rtt_ms`.
+
+`rdp_tcp_rtt_counter_set_available: false` is a legitimate result when Windows
+genuinely does not expose the counter — for example with no active RDP session.
+Confirm independently before treating it as a fault:
+
+```powershell
+Get-Counter '\RemoteFX Network(*)\Current TCP RTT' -MaxSamples 3
+```
+
 ## PoC closed-loop network recovery — STATUS: BLOCKED, NOT INTEGRATED
 
 A controlled lab impairment harness exists and is validated at the network
