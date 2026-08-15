@@ -94,13 +94,14 @@ GCP_VDI_MAPPING_PATH=/secure/local/path/gcp_vdi_user_map.json
 
 The authenticated `identity_context.upn` must exactly match the requested user and
 an entry in that mapping. Current scope is self-service only. `off` is the safe
-default, `demo` uses fake test fixtures, and `gcp` uses real APIs. A real API failure
+default, `demo` uses dummy test fixtures, and `gcp` uses real APIs. A real API failure
 never falls back to demo success.
 
 The mapping may contain an optional safe `display_name`; otherwise the portal uses
 `Shared Virtual Workstation`. Raw project, zone, instance name, numeric instance ID,
-and private IP remain controller-only. A fake tracked contract example is provided
-at `examples/gcp_vdi_user_map.example.json`.
+and private IP remain controller-only. A sample tracked contract is provided
+at `examples/gcp_vdi_user_map.example.json`. It documents the schema only and is
+never loaded at runtime; the live mapping is read from `GCP_VDI_MAPPING_PATH`.
 
 ### Evidence and threshold
 
