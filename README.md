@@ -101,7 +101,8 @@ The mapping may contain an optional safe `display_name`; otherwise the portal us
 `Shared Virtual Workstation`. Raw project, zone, instance name, numeric instance ID,
 and private IP remain controller-only. A sample tracked contract is provided
 at `examples/gcp_vdi_user_map.example.json`. It documents the schema only and is
-never loaded at runtime; the live mapping is read from `GCP_VDI_MAPPING_PATH`.
+never loaded at runtime. The real mapping is stored under `.local/`, which is
+outside Git, and is resolved through `GCP_VDI_MAPPING_PATH`.
 
 ### Evidence and threshold
 
