@@ -32,6 +32,14 @@ SUPPORTED_MODES = {"off", "demo", "gcp"}
 IAP_TCP_SOURCE_RANGE = "35.235.240.0/20"
 RDP_TCP_RTT_THRESHOLD_MS = 200.0
 
+# Minimum guest telemetry contract version that discovers and samples the
+# RemoteFX Network(*)\Current TCP RTT counter. A guest reporting less than this
+# cannot produce RTT at all, regardless of whether the Windows counter exists.
+# Keep in step with $TelemetrySchemaVersion in
+# scripts/configure_gcp_vdi_windows.ps1.
+RDP_TCP_RTT_MIN_SCHEMA_VERSION = 2
+COLLECTOR_SCHEMA_OUTDATED_REASON = "collector_capability_schema_outdated"
+
 # Deterministic presentation hints derived only from finding_code. These are
 # inert labels for rendering: they never authorize, execute, or gate anything.
 # Cleanup eligibility remains owned solely by _create_cleanup_offer().
@@ -939,6 +947,20 @@ def _collect_logs(
                 "source": "windows_user_input_delay",
                 "reason": reason,
             }
+            # A guest whose bootstrap predates RDP TCP RTT discovery publishes
+            # rdp_tcp_rtt_counter_available=false and a null RTT, which is
+            # indistinguishable from a genuinely missing counter. The schema
+            # version separates the two so an outdated collector is reported as
+            # a deployment limitation rather than as a measurement.
+            collector_schema_version = _as_int(
+                _find_payload_value(
+                    payload, {"servicedesk_vdi_telemetry_schema_version"}
+                )
+            )
+            collector_outdated = (
+                collector_schema_version is None
+                or collector_schema_version < RDP_TCP_RTT_MIN_SCHEMA_VERSION
+            )
             rtt_available = (
                 session_active is True
                 and rtt_counter_available is not False
@@ -946,6 +968,9 @@ def _collect_logs(
             )
             if session_active is not True:
                 rtt_reason = "no_active_rdp_session"
+            elif collector_outdated and numeric_rtt is None:
+                # Never treated as a measurement, and never auto-repaired.
+                rtt_reason = COLLECTOR_SCHEMA_OUTDATED_REASON
             elif rtt_counter_available is False or numeric_rtt is None:
                 rtt_reason = "counter_value_unavailable"
             else:
@@ -1490,6 +1515,19 @@ def _performance_diagnosis(
     # unavailable without inventing a more specific cause than was observed.
     if rtt_telemetry.get("status") != "available":
         diagnosis["rdp_tcp_rtt_unavailable_reason"] = rtt_telemetry.get("reason")
+
+    # An outdated guest collector is a deployment limitation, not a measurement.
+    # Surface it explicitly so the absence of RTT is not mistaken for a healthy
+    # or genuinely uninstrumented workstation. Nothing here repairs the guest.
+    if rtt_telemetry.get("reason") == COLLECTOR_SCHEMA_OUTDATED_REASON:
+        diagnosis["collector_capability_schema_outdated"] = True
+        limitation = (
+            "The Windows telemetry collector on this workstation predates RDP "
+            "TCP round-trip time discovery, so RTT cannot be sampled until the "
+            "guest telemetry bootstrap is redeployed."
+        )
+        if limitation not in diagnosis["collection_limitations"]:
+            diagnosis["collection_limitations"].append(limitation)
     return {"status": "ok", "diagnosis": diagnosis}
 
 

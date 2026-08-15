@@ -2224,3 +2224,239 @@ def test_agent_instruction_forbids_proactive_cleanup_without_offer():
     # RTT absence must never be rendered as zero or swapped for input delay.
     assert "Never report it as zero" in normalized
     assert "Never substitute RDP User Input Delay" in normalized
+
+
+# ---------------------------------------------------------------------------
+# Deployment version skew: a Windows guest whose bootstrap predates RDP TCP RTT
+# discovery publishes rdp_tcp_rtt_counter_available=false and a null RTT. That
+# is indistinguishable from a genuinely missing counter unless the collector
+# reports its telemetry schema version.
+#
+# Real incident: the guest's capabilities.json contained only the User Input
+# Delay fields, so the collector never sampled a perfectly valid ~323 ms
+# RemoteFX RTT and the controller correctly saw RTT as unavailable.
+# ---------------------------------------------------------------------------
+
+
+def _telemetry_entry(**payload_overrides):
+    payload = {
+        "timestamp": "2030-01-01T00:02:00Z",
+        "session_active": True,
+        "session_count": 1,
+        "counter_available": True,
+        "max_user_input_delay_ms": 0.0,
+    }
+    payload.update(payload_overrides)
+    return SimpleNamespace(
+        payload={
+            "Channel": "Application",
+            "ProviderName": "ServiceDeskVDI",
+            "EventID": 7101,
+            "Message": json.dumps(payload),
+        },
+        timestamp="2030-01-01T00:03:00Z",
+        log_name="projects/fake-vdi-project/logs/windows_event_log",
+    )
+
+
+def _collect(entry, monkeypatch):
+    client = Mock()
+    client.list_entries.side_effect = [[entry], []]
+    monkeypatch.setattr("google.cloud.logging_v2.Client", Mock(return_value=client))
+    return gcp_tool._collect_logs("fake-vdi-project", "123")
+
+
+def test_skew_1_stale_collector_capabilities_are_identified_not_guessed(monkeypatch):
+    """Old schema: input delay fields only, no RTT capability fields."""
+    entry = _telemetry_entry(
+        # No servicedesk_vdi_telemetry_schema_version at all, exactly as the
+        # deployed guest publishes it.
+        rdp_tcp_rtt_counter_available=False,
+        rdp_tcp_rtt_ms=None,
+    )
+
+    telemetry, _events, _errors = _collect(entry, monkeypatch)
+    rtt = telemetry["rdp_tcp_rtt"]
+
+    assert rtt["status"] == "unavailable"
+    assert rtt["value"] is None
+    assert rtt["reason"] == gcp_tool.COLLECTOR_SCHEMA_OUTDATED_REASON
+    # Distinguished from a genuinely absent counter.
+    assert rtt["reason"] != "counter_value_unavailable"
+
+
+def test_skew_2_current_collector_reports_schema_and_samples_rtt(monkeypatch):
+    entry = _telemetry_entry(
+        servicedesk_vdi_telemetry_schema_version=gcp_tool.RDP_TCP_RTT_MIN_SCHEMA_VERSION,
+        rdp_tcp_rtt_counter_available=True,
+        rdp_tcp_rtt_ms=323.0,
+        rdp_tcp_rtt_source="windows_remotefx_network_current_tcp_rtt",
+    )
+
+    telemetry, _events, _errors = _collect(entry, monkeypatch)
+    rtt = telemetry["rdp_tcp_rtt"]
+
+    assert rtt["status"] == "available"
+    assert rtt["value"] == 323.0
+    assert rtt["reason"] is None
+
+
+def test_skew_9_stale_collector_is_never_auto_repaired_or_fabricated(monkeypatch):
+    entry = _telemetry_entry(rdp_tcp_rtt_counter_available=False, rdp_tcp_rtt_ms=None)
+    mapping = gcp_tool._mapping_for(CALLER_UPN)
+    snapshot = gcp_tool._load_demo_snapshot(mapping)
+    telemetry, _events, _errors = _collect(entry, monkeypatch)
+    snapshot["rdp_tcp_rtt"] = telemetry["rdp_tcp_rtt"]
+    snapshot["events"] = []
+    context = _offer_context()
+
+    diagnosis = gcp_tool._performance_diagnosis(
+        "gcp", CALLER_UPN, mapping, snapshot
+    )["diagnosis"]
+
+    assert diagnosis["collector_capability_schema_outdated"] is True
+    assert any(
+        "predates RDP TCP round-trip time discovery" in item
+        for item in diagnosis["collection_limitations"]
+    )
+    # No invented measurement, and no cleanup eligibility.
+    assert diagnosis["metrics"]["rdp_tcp_rtt_ms"]["value"] is None
+    assert diagnosis["finding_code"] != "HIGH_SESSION_RTT"
+    assert (
+        gcp_tool._create_cleanup_offer(CALLER_UPN, mapping, diagnosis, context)
+        is None
+    )
+    # The limitation names no host, project, zone, user or path.
+    serialized = json.dumps(diagnosis["collection_limitations"])
+    for secret in ("fake-vdi-project", "us-central1", "fakeuser", "C:\\", "10."):
+        assert secret not in serialized
+
+
+@pytest.mark.parametrize(
+    ("rtt_value", "expected_finding", "expects_offer"),
+    [
+        (199.0, "NO_HIGH_SESSION_RTT", False),
+        (200.0, "NO_HIGH_SESSION_RTT", False),
+        (201.0, "HIGH_SESSION_RTT", True),
+        (323.0, "HIGH_SESSION_RTT", True),
+    ],
+)
+def test_skew_345_threshold_rule_unchanged_by_schema_work(
+    rtt_value, expected_finding, expects_offer
+):
+    mapping = gcp_tool._mapping_for(CALLER_UPN)
+    snapshot = gcp_tool._load_demo_snapshot(mapping)
+    snapshot["rdp_tcp_rtt"] = {
+        "status": "available",
+        "value": rtt_value,
+        "timestamp": "2030-01-01T00:08:00Z",
+        "session_active": True,
+        "reason": None,
+    }
+    snapshot["events"] = []
+    context = _offer_context()
+
+    diagnosis = gcp_tool._performance_diagnosis(
+        "gcp", CALLER_UPN, mapping, snapshot
+    )["diagnosis"]
+    offer = gcp_tool._create_cleanup_offer(CALLER_UPN, mapping, diagnosis, context)
+
+    assert diagnosis["finding_code"] == expected_finding
+    assert (offer is not None) is expects_offer
+    assert gcp_tool.RDP_TCP_RTT_THRESHOLD_MS == 200.0
+
+
+def test_skew_6_input_delay_cannot_substitute_for_stale_rtt(monkeypatch):
+    entry = _telemetry_entry(
+        max_user_input_delay_ms=350.0,
+        rdp_tcp_rtt_counter_available=False,
+        rdp_tcp_rtt_ms=None,
+    )
+
+    telemetry, _events, _errors = _collect(entry, monkeypatch)
+
+    # Input delay is available and far above 200; RTT stays unavailable.
+    assert telemetry["status"] == "available"
+    assert telemetry["value"] == 350.0
+    assert telemetry["rdp_tcp_rtt"]["status"] == "unavailable"
+    assert telemetry["rdp_tcp_rtt"]["value"] is None
+    assert telemetry["value"] != telemetry["rdp_tcp_rtt"]["value"]
+
+
+def test_skew_7_disconnects_with_stale_rtt_keep_disconnect_finding():
+    mapping, snapshot = _snapshot_with(
+        rdp_tcp_rtt={
+            "status": "unavailable",
+            "value": None,
+            "timestamp": None,
+            "session_active": True,
+            "reason": gcp_tool.COLLECTOR_SCHEMA_OUTDATED_REASON,
+        },
+        events=_TWO_DISCONNECT_EPISODES,
+    )
+    context = _offer_context()
+
+    diagnosis = _diagnose_snapshot(mapping, snapshot)
+
+    assert diagnosis["finding_code"] == "RDP_RECENT_DISCONNECTS"
+    assert diagnosis["recent_disconnect_count"] == 2
+    assert diagnosis["response_guidance"] == "investigate_or_escalate_disconnects"
+    assert (
+        gcp_tool._create_cleanup_offer(CALLER_UPN, mapping, diagnosis, context)
+        is None
+    )
+
+
+def test_skew_8_real_rtt_takes_precedence_over_disconnects():
+    """Once the collector is current, the real ~323 ms drives the flow."""
+    mapping, snapshot = _snapshot_with(
+        rdp_tcp_rtt={
+            "status": "available",
+            "value": 323.0,
+            "timestamp": "2030-01-01T00:08:00Z",
+            "session_active": True,
+            "reason": None,
+        },
+        events=_TWO_DISCONNECT_EPISODES,
+    )
+    context = _offer_context()
+
+    diagnosis = _diagnose_snapshot(mapping, snapshot)
+    offer = gcp_tool._create_cleanup_offer(CALLER_UPN, mapping, diagnosis, context)
+
+    assert diagnosis["finding_code"] == "HIGH_SESSION_RTT"
+    assert diagnosis["recent_disconnect_count"] == 2
+    assert offer is not None
+    assert offer["rdp_tcp_rtt_ms"] == 323.0
+    assert offer["action_id"] == "gcp.virtual_desktop.system_file_cleanup"
+
+
+def test_skew_10_governed_cleanup_boundaries_unchanged():
+    """The repair must not relax any controller security boundary."""
+    mapping = gcp_tool._mapping_for(CALLER_UPN)
+    snapshot = gcp_tool._load_demo_snapshot(mapping)
+    snapshot["rdp_tcp_rtt"] = {
+        "status": "available", "value": 323.0,
+        "timestamp": "2030-01-01T00:08:00Z", "session_active": True, "reason": None,
+    }
+    context = _offer_context()
+    diagnosis = gcp_tool._performance_diagnosis(
+        "gcp", CALLER_UPN, mapping, snapshot
+    )["diagnosis"]
+    offer = gcp_tool._create_cleanup_offer(CALLER_UPN, mapping, diagnosis, context)
+
+    # Offer stays caller-, scope-, mapping- and action-bound with a TTL.
+    assert offer["caller_upn"] == CALLER_UPN
+    assert offer["target_scope"] == "shared_virtual_workstation"
+    assert offer["mapping_fingerprint"]
+    assert offer["created_invocation_id"] == "offer-turn"
+    assert offer["expires_at"] > offer["created_at"]
+    assert offer["phase"] == "offered"
+    # Bootstrap still discovers the genuine counter and hard-codes no RTT.
+    bootstrap = Path("scripts/configure_gcp_vdi_windows.ps1").read_text()
+    assert 'Get-Counter -ListSet "RemoteFX Network"' in bootstrap
+    assert '\\Current TCP RTT$' in bootstrap
+    for fabricated in ("rdp_tcp_rtt_ms = 323", "rdp_tcp_rtt_ms = 320", "= 323.0"):
+        assert fabricated not in bootstrap
+    # RTT is never sourced from ping or substituted by another metric.
+    assert "Test-Connection" not in bootstrap

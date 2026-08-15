@@ -24,6 +24,14 @@ $OpsAgentManagedSnapshotPath = Join-Path $ServiceDeskRoot "ops_agent_servicedesk
 $OpsAgentOwnershipMarker = "# managed-by: ServiceDeskVDI"
 $TaskName = "ServiceDeskVDI-RdpTelemetry"
 
+# ServiceDesk VDI guest telemetry contract version.
+#   1 = user input delay capabilities only (no RDP TCP RTT discovery)
+#   2 = adds rdp_tcp_rtt_counter_set_available / _set / _paths
+# Bump only when the capability or published telemetry contract changes, and
+# keep sd_chat/tools/gcp_virtual_desktop_tool.py in step. A guest reporting an
+# older version is reported as an outdated collector, never as a measurement.
+$TelemetrySchemaVersion = 2
+
 New-Item -Path $ServiceDeskRoot -ItemType Directory -Force | Out-Null
 
 # This fixed guest-side script is the PoC-only analogue of KB0019144's native
@@ -732,6 +740,13 @@ try {
     $RttCounterAvailable = $RttCounterPaths.Count -gt 0
 
     [ordered]@{
+        # Schema version of the capability contract this bootstrap writes.
+        # Version 2 introduced the rdp_tcp_rtt_* capability fields. A guest whose
+        # capabilities.json lacks this key predates them, so its collector can
+        # never sample RTT. The backend uses this to distinguish a genuinely
+        # unavailable counter from an outdated collector rather than silently
+        # degrading both to "RTT unavailable".
+        servicedesk_vdi_telemetry_schema_version = $TelemetrySchemaVersion
         timestamp = (Get-Date).ToUniversalTime().ToString("o")
         available_event_channels = $AvailableChannels
         unavailable_event_channels = $UnavailableChannels
@@ -856,15 +871,24 @@ New-Item -Path $ServiceDeskRoot -ItemType Directory -Force | Out-Null
 
 $CounterAvailable = $false
 $RttCounterAvailable = $false
+# 0 means the capability file was unreadable or predates the versioned contract.
+# It is reported verbatim so the backend can tell an outdated collector apart
+# from a genuinely unavailable counter. The collector never invents the field.
+$CapabilitySchemaVersion = 0
 try {
     $Capabilities = Get-Content -Path $CapabilityPath -Raw -ErrorAction Stop |
         ConvertFrom-Json -ErrorAction Stop
     $CounterAvailable = $Capabilities.user_input_delay_counter_set_available -eq $true
     $RttCounterAvailable = $Capabilities.rdp_tcp_rtt_counter_set_available -eq $true
+    $ReportedVersion = $Capabilities.servicedesk_vdi_telemetry_schema_version
+    if ($ReportedVersion -is [int] -or $ReportedVersion -match "^\d+$") {
+        $CapabilitySchemaVersion = [int]$ReportedVersion
+    }
 }
 catch {
     $CounterAvailable = $false
     $RttCounterAvailable = $false
+    $CapabilitySchemaVersion = 0
 }
 
 $WindowEnds = (Get-Date).AddSeconds($PublishIntervalSeconds)
@@ -943,6 +967,9 @@ if ($RttSamples.Count -gt 0) {
 
 $Record = [ordered]@{
     timestamp = (Get-Date).ToUniversalTime().ToString("o")
+    # Echoed from capabilities.json so the backend can detect a guest whose
+    # bootstrap predates RDP TCP RTT discovery. 0 = missing/unreadable.
+    servicedesk_vdi_telemetry_schema_version = $CapabilitySchemaVersion
     session_active = ($MaximumActiveSessions -gt 0)
     session_count = $MaximumActiveSessions
     counter_available = $CounterAvailable
