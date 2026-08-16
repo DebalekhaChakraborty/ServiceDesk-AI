@@ -10,6 +10,8 @@ const { createEntraClient } = require('./entra');
 const { requestLogger, log } = require('./logger');
 const { healthRoutes } = require('./routes/health');
 const { authRoutes } = require('./routes/auth');
+const { voiceRoutes } = require('./routes/voice');
+const { recoveryRoutes } = require('./routes/recovery');
 const { portalRoutes } = require('./routes/portal');
 const { authErrorPage } = require('./views/authError');
 
@@ -18,19 +20,54 @@ const PUBLIC_DIR = path.join(__dirname, '..', 'public');
 /**
  * Response headers applied to every route.
  *
- * The CSP is restrictive because the portal ships no client-side JavaScript at
- * all: pages are server-rendered, so `script-src 'none'` costs nothing and
- * removes an entire class of token-stealing bugs.
+ * The portal was written with NO client-side JavaScript, so `default-src 'none'`
+ * cost nothing and removed an entire class of token-stealing bugs.
+ *
+ * The Dograh voice widget breaks that assumption: it is third-party script
+ * running on an authenticated page that holds a session cookie. The allowances
+ * below are therefore the narrowest that let the widget work, and they are only
+ * emitted when the voice channel is actually configured — a portal without
+ * voice keeps the original `default-src 'none'` policy byte-for-byte.
+ *
+ * Specifically NOT used: wildcards of any kind, 'unsafe-eval', and
+ * 'unsafe-inline' for scripts. The bootstrap is served from /voice-widget.js as
+ * a same-origin file precisely so no inline script is needed.
+ *
+ * The session cookie stays httpOnly, so widget script cannot read it even
+ * though it shares the page.
  */
 function securityHeaders(config) {
-  const csp = [
-    "default-src 'none'",
-    "style-src 'self'",
-    "img-src 'self' data:",
-    "form-action 'self'",
-    "frame-ancestors 'none'",
-    "base-uri 'none'",
-  ].join('; ');
+  const voice = config.voice?.enabled ? config.voice : null;
+
+  // Exact origins parsed from configuration; never interpolated user input.
+  const widgetOrigin = voice ? new URL(voice.embedOrigin).origin : null;
+  const apiOrigin = voice ? new URL(voice.apiEndpoint).origin : null;
+  const wsOrigin = apiOrigin ? apiOrigin.replace(/^http/, 'ws') : null;
+
+  const directives = {
+    'default-src': ["'none'"],
+    'style-src': ["'self'"],
+    'img-src': ["'self'", 'data:'],
+    'form-action': ["'self'"],
+    'frame-ancestors': ["'none'"],
+    'base-uri': ["'none'"],
+  };
+
+  if (voice) {
+    // Widget bootstrap is same-origin; the widget itself comes from Dograh.
+    directives['script-src'] = ["'self'", widgetOrigin];
+    // Embed init + signalling. WebRTC media itself is not governed by CSP.
+    directives['connect-src'] = ["'self'", apiOrigin, wsOrigin];
+    // Remote audio arrives as a MediaStream/blob, not a network fetch.
+    directives['media-src'] = ["'self'", 'blob:'];
+    directives['worker-src'] = ["'self'", 'blob:'];
+    // The widget injects its own UI; allow its stylesheet, still no wildcard.
+    directives['style-src'] = ["'self'", "'unsafe-inline'", widgetOrigin];
+  }
+
+  const csp = Object.entries(directives)
+    .map(([name, values]) => `${name} ${values.join(' ')}`)
+    .join('; ');
 
   return function applySecurityHeaders(req, res, next) {
     res.setHeader('Content-Security-Policy', csp);
@@ -82,6 +119,8 @@ function createApp({ config = loadConfig(), entraClient } = {}) {
   );
 
   app.use(authRoutes({ config, sessions, entra }));
+  app.use(voiceRoutes({ config, sessions }));
+  app.use(recoveryRoutes({ config, sessions }));
   app.use(portalRoutes({ config, sessions }));
 
   // Unknown path.

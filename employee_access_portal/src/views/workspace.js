@@ -21,7 +21,7 @@ const TILES = [
  * issued. Nothing here is inferred, cached from a previous visit, or read from
  * local configuration: if the page renders, Entra authenticated this employee.
  */
-function workspacePage({ session, csrfToken }) {
+function workspacePage({ session, csrfToken, voiceEnabled = false }) {
   const tiles = TILES.map(
     (tile) => `      <article class="tile">
         <h3 class="tile__name">${escapeHtml(tile.name)}</h3>
@@ -64,6 +64,18 @@ ${tiles}
     </div>
   </section>
 
+${voiceEnabled ? `  <section class="voice" aria-labelledby="voice-title">
+    <h2 class="section__title" id="voice-title">Talk to the Service Desk</h2>
+    <button class="button button--primary" type="button" id="voice-start"
+            data-csrf="${escapeHtml(csrfToken)}">Start voice call</button>
+    <p class="voice__status" id="voice-status" role="status" aria-live="polite"></p>
+    <p class="verify__note">
+      Your identity is confirmed by this signed-in session. Nothing you type or
+      say sets who you are.
+    </p>
+  </section>
+  <script src="/voice-widget.js" defer></script>
+` : ''}
   <section class="verify">
     <form method="post" action="/auth/verify">
       <input type="hidden" name="csrf_token" value="${escapeHtml(csrfToken)}">

@@ -143,16 +143,24 @@ class ServiceDeskClient:
             raise ServiceDeskUnavailable() from exc
         return resp.status_code == 200
 
-    async def create_session(self, adk_session_id: str) -> None:
-        """Create the session with EMPTY state.
+    async def create_session(
+        self, adk_session_id: str, persona: Optional[dict] = None
+    ) -> None:
+        """Create the session, optionally seeding a VERIFIED persona.
 
-        Seeding state is deliberately avoided: injecting a persona here would
-        silently change identity_context_tool's behaviour and manufacture an
-        identity the voice channel has not verified.
+        With persona=None the state stays empty, so identity_context_tool
+        reports ok=false exactly as it does for an anonymous caller. A persona
+        is passed ONLY after a portal-signed identity token has been verified;
+        it is never built from anything the browser or the LLM supplied.
+
+        The ADK create endpoint treats the request body AS the session state
+        (verified against the running server: posting {"state": {...}} nests a
+        literal "state" key and identity_context_tool then finds no persona).
         """
         client = await self._get_client()
+        body = {"persona": persona} if persona else {}
         try:
-            resp = await client.post(self._session_url(adk_session_id), json={})
+            resp = await client.post(self._session_url(adk_session_id), json=body)
         except httpx.TimeoutException as exc:
             raise ServiceDeskTimeout() from exc
         except httpx.HTTPError as exc:

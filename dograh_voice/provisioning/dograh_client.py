@@ -176,6 +176,18 @@ class DograhClient:
             "GET", "/api/v1/organizations/model-configurations/v2/defaults"
         )
 
+    # -- embed tokens ------------------------------------------------------
+    def get_embed_tokens(self, workflow_id: Any) -> Any:
+        return self._request("GET", f"/api/v1/workflow/{workflow_id}/embed-token")
+
+    def create_embed_token(self, workflow_id: Any, payload: dict) -> dict:
+        return self._request(
+            "POST", f"/api/v1/workflow/{workflow_id}/embed-token", json=payload
+        )
+
+    def delete_embed_token(self, workflow_id: Any) -> Any:
+        return self._request("DELETE", f"/api/v1/workflow/{workflow_id}/embed-token")
+
     def get_credits(self) -> dict:
         return self._request("GET", "/api/v1/organizations/billing/credits")
 

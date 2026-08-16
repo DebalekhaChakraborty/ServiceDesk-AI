@@ -96,16 +96,31 @@ test('the portal contains no Microsoft Graph endpoint or mutation surface', () =
   }
 });
 
-test('the portal makes no outbound HTTP calls of its own', () => {
-  // MSAL performs the token exchange. The portal itself never becomes an API
-  // client, which is what keeps it incapable of administering a directory.
+test('only the recovery route makes an outbound call, and only to the gateway', () => {
+  // MSAL performs the token exchange. The portal itself never became an API
+  // client, which is what kept it incapable of administering a directory.
+  //
+  // Phase 6 opens exactly ONE hole: recovery.js calls the voice gateway on the
+  // private bridge to create and verify TOTP enrollments. That is deliberate
+  // and is confined here - the guard now proves the exception has not spread
+  // to any other file, rather than being deleted.
   const forbidden = [/\bfetch\s*\(/, /require\(['"]node:https?['"]\)/, /require\(['"]axios['"]\)/, /node-fetch/];
+  const ALLOWED_CALLER = 'routes/recovery.js';
 
   for (const { file, text } of readSourceFiles()) {
     for (const pattern of forbidden) {
+      if (file === ALLOWED_CALLER && pattern.source.includes('fetch')) continue;
       assert.ok(!pattern.test(text), `src/${file} must not perform its own HTTP calls (${pattern})`);
     }
   }
+
+  // The one permitted caller must still not pull in an HTTP client library.
+  const recovery = readSourceFiles().find((f) => f.file === ALLOWED_CALLER);
+  assert.ok(recovery, 'recovery route not found');
+  assert.ok(!/axios|node-fetch|require\(['"]node:https?['"]\)/.test(recovery.text));
+  // ...and it must never call anything but the configured gateway.
+  assert.ok(!/fetch\(\s*['"`]http/.test(recovery.text),
+    'recovery.js must not fetch a hard-coded URL; the gateway comes from config');
 });
 
 test('no directory or HTTP client dependency is declared', () => {
@@ -122,7 +137,11 @@ test('the portal talks to no host other than Microsoft', () => {
   // The two systems share an identity provider but stay independently
   // authorized. Portal sign-in must never become an authorization signal for
   // ServiceDesk AI, so the portal knows no ServiceDesk address or setting.
-  const allowedHosts = new Set(['login.microsoftonline.com', 'localhost', '127.0.0.1']);
+  // 172.18.0.1 is the private Docker bridge address of the voice gateway.
+  // It is not routable off this host, and it is the ONLY new host Phase 6 adds.
+  const allowedHosts = new Set([
+    'login.microsoftonline.com', 'localhost', '127.0.0.1', '172.18.0.1',
+  ]);
 
   for (const { file, text } of readSourceFiles()) {
     for (const match of text.match(/https?:\/\/[A-Za-z0-9.:\-]+/g) || []) {
@@ -305,4 +324,90 @@ test('security headers are applied to employee-facing pages', async () => {
   assert.equal(res.headers['referrer-policy'], 'no-referrer');
   assert.match(res.headers['strict-transport-security'], /max-age=31536000/);
   assert.equal(res.headers['x-powered-by'], undefined);
+});
+
+// --- Phase 7: Duo recovery -------------------------------------------------
+
+test('the public recovery page collects no identifying input at all', async () => {
+  // Recovery needs the voice channel configured, so build the app explicitly
+  // rather than relying on the default auth-only test fixture.
+  const { createApp } = require('../src/app');
+  const app = createApp({
+    config: loadConfig({
+      ...testEnv(),
+      VOICE_IDENTITY_SIGNING_SECRET: 'voice-signing-secret-for-tests-0123456789abcdef',
+      DOGRAH_EMBED_TOKEN: 'emb_test_token_value',
+      DOGRAH_EMBED_ORIGIN: 'http://localhost:3010',
+      DOGRAH_API_ENDPOINT: 'http://localhost:8001',
+      RECOVERY_ADMIN_KEY: 'test-admin-key-0123456789',
+    }),
+  });
+  const response = await request(app).get('/recovery');
+  assert.equal(response.status, 200);
+
+  // An input here would be a probe: type an address, watch the response. The
+  // caller states an identifier by voice instead, where Duo gates the answer.
+  assert.ok(!/<input/i.test(response.text),
+    'the public recovery page must not collect an identifier');
+  for (const name of ['claimed_upn', 'employee_id', 'upn', 'email', 'mobile']) {
+    assert.ok(!response.text.includes(name),
+      `the public recovery page must not reference ${name}`);
+  }
+});
+
+test('recovery start sends no caller-supplied identifier to the gateway', () => {
+  const recovery = readSourceFiles().find((f) => f.file === 'routes/recovery.js');
+  const startHandler = recovery.text.slice(recovery.text.indexOf("router.post('/recovery/start'"));
+
+  // Everything posted to /recovery/start is ignored. Reading req.body in this
+  // handler would be the first step back towards an enumeration oracle.
+  assert.ok(!/req\.body/.test(startHandler),
+    '/recovery/start must not read anything from the request body');
+});
+
+test('duo enrollment identity comes only from the sealed session', () => {
+  const recovery = readSourceFiles().find((f) => f.file === 'routes/recovery.js');
+  const identityFn = recovery.text.slice(
+    recovery.text.indexOf('function sessionIdentity'),
+    recovery.text.indexOf('// --- Duo enrollment'),
+  );
+  assert.ok(identityFn.includes('session.tenantId'));
+  assert.ok(identityFn.includes('session.objectId'));
+  assert.ok(identityFn.includes('session.username'));
+  assert.ok(!/req\.body/.test(identityFn),
+    'enrollment identity must never be read from a form field');
+});
+
+test('the enrollment page renders a QR only from an inline data: URI', () => {
+  const { enrollPage } = require('../src/views/recovery');
+  const session = { username: 'employee@example.com', csrf: 'x' };
+
+  // A remote src would mean adding Duo to img-src, and letting the browser talk
+  // to Duo directly. The gateway fetches the image; the page only inlines it.
+  const hostile = enrollPage({
+    session, csrfToken: 'x', activationCode: 'abc',
+    qrDataUri: 'https://api-abcd1234.duosecurity.com/frame/qr?value=x',
+  });
+  assert.ok(!hostile.includes('<img'), 'a non-data: QR source must not render');
+
+  const inline = enrollPage({
+    session, csrfToken: 'x', activationCode: 'abc',
+    qrDataUri: 'data:image/png;base64,iVBORw0KGgo=',
+  });
+  assert.ok(inline.includes('<img src="data:image/png;base64,'));
+});
+
+test('the portal never handles a Duo secret, user id, or passcode', () => {
+  // "passcode" appears in page copy telling the employee what to expect, which
+  // is fine. What must not exist is code that reads, stores or forwards one -
+  // so the check is for identifiers and property access, not for the word.
+  const handling = [
+    /DUO_SKEY/, /DUO_IKEY/, /duo_user_id/, /\btxid\b/,
+    /\bpasscode\s*[:=]/, /\.passcode\b/, /\bactivation_barcode\b/,
+  ];
+  for (const { file, text } of readSourceFiles()) {
+    for (const pattern of handling) {
+      assert.ok(!pattern.test(text), `${file} must not handle ${pattern}`);
+    }
+  }
 });

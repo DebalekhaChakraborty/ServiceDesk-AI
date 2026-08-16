@@ -19,6 +19,10 @@ DEFAULT_USER_ID = "voice-channel"
 
 DEFAULT_POC_SESSION_ID = "dograh-poc-voice"
 
+# Session id prefix for authenticated calls, kept distinct from the PoC prefix
+# so the two can never collide in the ADK session namespace.
+AUTH_SESSION_PREFIX = "voice-auth-"
+
 
 def _env_bool(name: str, default: bool = False) -> bool:
     raw = os.getenv(name)
@@ -39,6 +43,16 @@ class Settings:
     log_utterances: bool
     poc_single_session: bool
     poc_session_id: str
+    require_authenticated_identity: bool
+    identity_token_max_ttl_seconds: int
+    # Which MFA provider performs recovery authentication. "duo" is the only
+    # supported value; "totp" selects the retired self-hosted verifier and is
+    # kept solely so the pre-Duo path can be re-enabled during acceptance.
+    recovery_provider: str = "duo"
+    # ESCAPE HATCH — tests and local experiments only. Permits the retired
+    # pre-Phase-5 behaviour where the caller supplies its own voice_session_id
+    # with no identity proof. Never set by any launch script or deployment.
+    allow_legacy_unauthenticated: bool = False
 
     def is_loopback_bind(self) -> bool:
         try:
@@ -83,4 +97,19 @@ def load_settings() -> Settings:
         # PoC SINGLE SESSION MODE — single tester only. See README warning.
         poc_single_session=_env_bool("VOICE_GATEWAY_POC_SINGLE_SESSION", False),
         poc_session_id=os.getenv("VOICE_GATEWAY_POC_SESSION_ID", DEFAULT_POC_SESSION_ID),
+        # AUTHENTICATED MODE (default ON). Every turn must carry a call_id and a
+        # portal-signed identity token. Turning this off drops the gateway back
+        # to the unauthenticated PoC behaviour and is refused whenever
+        # poc_single_session is also off, so there is no anonymous multi-caller
+        # configuration.
+        require_authenticated_identity=_env_bool(
+            "VOICE_GATEWAY_REQUIRE_AUTH", True
+        ),
+        identity_token_max_ttl_seconds=int(
+            os.getenv("VOICE_GATEWAY_IDENTITY_MAX_TTL", "900")
+        ),
+        allow_legacy_unauthenticated=_env_bool(
+            "VOICE_GATEWAY_ALLOW_LEGACY_UNAUTHENTICATED", False
+        ),
+        recovery_provider=os.getenv("RECOVERY_PROVIDER", "duo").strip().lower(),
     )

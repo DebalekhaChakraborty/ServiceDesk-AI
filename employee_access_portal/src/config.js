@@ -95,6 +95,35 @@ function loadConfig(env = process.env) {
     sessionSecret,
     secureCookies,
     port: Number(env.PORT || 8080),
+    // Voice channel. Disabled unless a dedicated signing secret is present, so
+    // the portal can never mint an unsigned or weakly-signed assertion.
+    // VOICE_IDENTITY_SIGNING_SECRET must NOT be PORTAL_SESSION_SECRET, the
+    // Entra client secret, the Graph secret, the TURN secret, or the Dograh key.
+    voice: (() => {
+      const secret = (env.VOICE_IDENTITY_SIGNING_SECRET || '').trim();
+      const embedToken = (env.DOGRAH_EMBED_TOKEN || '').trim();
+      const embedOrigin = (env.DOGRAH_EMBED_ORIGIN || '').trim();
+      if (secret && secret === (env.PORTAL_SESSION_SECRET || '').trim()) {
+        throw new Error('VOICE_IDENTITY_SIGNING_SECRET must differ from PORTAL_SESSION_SECRET');
+      }
+      if (secret && secret.length < 32) {
+        throw new Error('VOICE_IDENTITY_SIGNING_SECRET must be at least 32 characters');
+      }
+      return {
+        enabled: Boolean(secret && embedToken && embedOrigin),
+        signingSecret: secret,
+        embedToken,
+        embedOrigin,
+        // Dograh API the widget talks to. Separate from embedOrigin: the script
+        // is served by the Dograh UI while the API lives on another port.
+        apiEndpoint: (env.DOGRAH_API_ENDPOINT || 'http://localhost:8001').trim(),
+        tokenTtlSeconds: Number(env.VOICE_IDENTITY_TTL_SECONDS || 300),
+      };
+    })(),
+    recovery: {
+      gatewayUrl: (env.VOICE_GATEWAY_URL || 'http://172.18.0.1:8010').replace(/\/+$/, ''),
+      adminKey: (env.RECOVERY_ADMIN_KEY || '').trim(),
+    },
     sessionTtlMs: SESSION_TTL_MS,
     authTxnTtlMs: AUTH_TXN_TTL_MS,
   });

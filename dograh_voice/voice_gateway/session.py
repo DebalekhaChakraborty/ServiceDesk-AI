@@ -32,6 +32,29 @@ def adk_session_id(voice_session_id: str) -> str:
     return f"{_PREFIX}{readable}-{digest}" if readable else f"{_PREFIX}{digest}"
 
 
+def auth_session_id(call_id: str) -> str:
+    """Map ONE authenticated voice call to ONE ServiceDesk session.
+
+    Keyed on call_id, never on UPN: one employee may hold several calls, and
+    keying by identity would splice separate conversations together. Two
+    different calls therefore always get different ADK sessions, and the same
+    call always resumes its own.
+
+    The id is a pure digest with no readable component, because call_id is
+    itself unguessable material that should not be echoed into session names
+    or logs.
+    """
+    if not call_id or not call_id.strip():
+        raise ValueError("call_id must be non-empty")
+    digest = hashlib.sha256(call_id.strip().encode("utf-8")).hexdigest()[:32]
+    return f"voice-auth-{digest}"
+
+
+def redact_call_id(call_id: str) -> str:
+    """Log-safe handle for a call id."""
+    return hashlib.sha256(call_id.encode("utf-8")).hexdigest()[:12]
+
+
 def redact_session_id(voice_session_id: str) -> str:
     """Log-safe handle: a short digest, never the raw call id."""
     return hashlib.sha256(voice_session_id.encode("utf-8")).hexdigest()[:12]

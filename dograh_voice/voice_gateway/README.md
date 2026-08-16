@@ -308,3 +308,58 @@ curl -s http://127.0.0.1:8000/apps/sd_chat/users/voice-channel/sessions
 Caller identity verification, TOTP/OTP, account enable/disable, password reset,
 Graph or ServiceNow mutation, telephony, public exposure, TURN/IAP/firewall
 changes, and any change to `sd_chat/`.
+
+## Duo recovery (Phase 7)
+
+Cisco Duo **Auth API** is the active recovery MFA provider. The Admin API is not
+used and must not be: it is unavailable on Duo Free and carries directory-wide
+write authority this flow has no need for.
+
+### Configuration
+
+Environment first, then a 0600 file in `dograh_voice/runtime/`. Never argv.
+
+| Setting | Env | File | Secret? |
+|---|---|---|---|
+| Integration key | `DUO_IKEY` | `.duo_ikey` | no |
+| Secret key | `DUO_SKEY` | `.duo_skey` | **yes** |
+| API hostname | `DUO_HOST` | `.duo_host` | no |
+| Signature algorithm | `DUO_SIGNATURE_ALGORITHM` | — | no (default `sha512`) |
+| Provider selection | `RECOVERY_PROVIDER` | — | no (default `duo`) |
+| Identity map path | `RECOVERY_IDENTITY_DB` | — | no |
+| Default calling code | `RECOVERY_DEFAULT_CALLING_CODE` | — | no |
+
+`DUO_HOST` must match `api-XXXXXXXX.duosecurity.com` (or `.duofederal.com`).
+Anything else is refused at construction, so no caller- or model-supplied
+hostname can ever be signed with our integration key.
+
+`GET /auth/v2/check` runs at startup. If it fails, recovery is **disabled** —
+a half-working MFA path looks like a recovery route and is not one.
+
+Optional read-only Graph corroboration:
+`RECOVERY_GRAPH_TENANT_ID`, `RECOVERY_GRAPH_CLIENT_ID`, and
+`RECOVERY_GRAPH_CLIENT_SECRET` (or `.recovery_graph_client_secret`, 0600).
+Unset means corroboration is reported as unavailable, not skipped silently.
+
+### Identity map
+
+`dograh_voice/runtime/recovery_identity.db` — SQLite, mode 0600, git-ignored,
+schema v1. Provisioned from a shell on the host only:
+
+```
+python -m voice_gateway.identity_map_admin upsert \
+    --employee-id 1798283 --tenant <guid> --object-id <oid> \
+    --upn person@example.com --mobile +14155550123 --display-name "Name"
+```
+
+Canonical corporate identity is `entra_tenant_id + entra_object_id`; the
+canonical Duo binding is `duo_user_id`. `employee_id`, `upn` and `mobile_e164`
+are **lookup aliases only** and authenticate nobody.
+
+### Known limitation, unchanged from Phase 6
+
+Dograh v1.45.0 builds `AudioBufferProcessor` and registers the audio data
+handler unconditionally, and `transcript_configuration` exposes only
+`include_end_timestamps`. **A spoken Duo passcode therefore appears in the call
+recording and transcript, and no supported setting disables that.** Duo Push
+avoids the issue entirely and is the preferred factor for this reason.

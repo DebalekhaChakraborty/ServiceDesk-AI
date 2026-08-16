@@ -88,6 +88,27 @@ def desired_tool_payload() -> dict[str, Any]:
                 "url": GATEWAY_URL,
                 "headers": {"Content-Type": "application/json"},
                 "timeout_ms": TOOL_TIMEOUT_MS,
+                # SERVER-RESOLVED, never LLM-filled. The namespaced form
+                # {{initial_context.x}} is used deliberately: Dograh's render
+                # context is {**initial_context, **gathered_context,
+                # "initial_context": ..., "gathered_context": ...}, so the bare
+                # {{call_id}} would be SHADOWED by a gathered_context variable
+                # of the same name — and gathered_context is influenced by the
+                # LLM. The namespaced path cannot be overridden that way.
+                "preset_parameters": [
+                    {
+                        "name": "call_id",
+                        "type": "string",
+                        "value_template": "{{initial_context.call_id}}",
+                        "required": True,
+                    },
+                    {
+                        "name": "voice_identity_token",
+                        "type": "string",
+                        "value_template": "{{initial_context.voice_identity_token}}",
+                        "required": True,
+                    },
+                ],
                 "parameters": [
                     {
                         "name": "text",

@@ -34,6 +34,11 @@ def make_settings(**overrides) -> Settings:
         log_utterances=False,
         poc_single_session=False,
         poc_session_id="dograh-poc-voice",
+        # Existing tests cover the unauthenticated PoC paths; authenticated
+        # mode has its own suite in test_authenticated_identity.py.
+        require_authenticated_identity=False,
+        identity_token_max_ttl_seconds=900,
+        allow_legacy_unauthenticated=True,
     )
     base.update(overrides)
     return Settings(**base)
@@ -294,7 +299,21 @@ def test_only_expected_routes_exist():
         client=httpx.AsyncClient(transport=httpx.MockTransport(lambda r: httpx.Response(200, json={}))),
     ))
     paths = {r.path for r in app.routes if hasattr(r, "path")}
-    assert paths == {"/health", "/voice/turn"}, f"unexpected routes: {paths}"
+    # Enumerated deliberately: this guard exists so a new route cannot appear
+    # on the gateway unnoticed. The /recovery/enroll/* routes ALL require an
+    # admin key, because the gateway's bridge address is reachable by every
+    # container on the host - including Dograh, which runs LLM-driven tool code.
+    # The duo/* pair is the active provider; the other two are the retired TOTP
+    # path, kept until Duo acceptance completes.
+    assert paths == {
+        "/health",
+        "/voice/turn",
+        "/recovery/enroll/duo/begin",
+        "/recovery/enroll/duo/status",
+        "/recovery/enroll/begin",
+        "/recovery/enroll/confirm",
+        "/recovery/start",
+    }, f"unexpected routes: {paths}"
 
 
 def test_no_api_docs_or_schema_exposed():
@@ -308,10 +327,42 @@ def test_no_privileged_tool_references_in_source():
         "enable_account", "reset_password", "graph_patch", "aad_tool",
         "ad_account_tool", "win_tool", "graph.microsoft.com", "servicenow",
     ]
+    # ONE deliberate exception. graph_corroboration.py talks to Graph so a
+    # Duo-verified identity can be checked against the directory before it is
+    # used. Its read-only nature is asserted below rather than assumed, so this
+    # exemption cannot quietly grow into a write path.
+    exempt = {"graph_corroboration.py": {"graph.microsoft.com"}}
+
     for py in GATEWAY_DIR.glob("*.py"):
         source = py.read_text().lower()
+        allowed = exempt.get(py.name, set())
         for term in forbidden:
+            if term in allowed:
+                continue
             assert term not in source, f"{py.name} references privileged tool {term!r}"
+
+
+def test_graph_corroboration_is_read_only():
+    """The gateway's only Graph capability must be a GET, and nothing else."""
+    source = (GATEWAY_DIR / "graph_corroboration.py").read_text()
+
+    # The single POST is the token request to login.microsoftonline.com; every
+    # Graph call itself is a GET.
+    graph_calls = [line for line in source.splitlines() if "GRAPH_BASE_URL" in line]
+    assert graph_calls, "expected at least one Graph call"
+
+    for verb in (".post(", ".patch(", ".put(", ".delete("):
+        for line in source.splitlines():
+            if verb in line:
+                assert "login.microsoftonline.com" in source, verb
+                assert "oauth2/v2.0/token" in source, verb
+
+    # No Graph write scope is ever requested, and no mutation endpoint named.
+    lowered = source.lower()
+    assert ".default" in lowered
+    for term in ("readwrite", "accountenabled\":", "$batch",
+                 "authentication/methods", "revokesigninsessions"):
+        assert term not in lowered, f"graph_corroboration.py names {term!r}"
 
 
 def test_gateway_never_imports_sd_chat():
