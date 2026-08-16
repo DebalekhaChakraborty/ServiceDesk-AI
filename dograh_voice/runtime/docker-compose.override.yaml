@@ -1,0 +1,114 @@
+# Dograh LOCAL PoC — safe host-port override for the shared ADK Debian VM.
+#
+# Upstream docker-compose.yaml (tag dograh-v1.45.0, commit 48aa0f6) is left
+# byte-for-byte unmodified; every binding change lives here.
+#
+# WHY `!override` IS MANDATORY HERE
+# ---------------------------------
+# Compose MERGES `ports` lists by APPENDING, it does not replace them. A plain
+# override of `ports:` would therefore yield BOTH the upstream mapping and ours
+# — meaning upstream's "8000:8000" would survive and collide head-on with the
+# existing ServiceDesk listener on host port 8000.
+#
+# The `!override` tag (Compose >= 2.24.4; we run 2.25.0) replaces the upstream
+# list outright. Every effective binding below is verified with
+# `docker compose config` before anything is started.
+#
+# NOT STARTED IN THIS PHASE (all are profile-gated upstream, so they stay down
+# as long as no --profile flag is passed):
+#   nginx        profiles: ["remote"]
+#   coturn       profiles: ["remote", "local-turn"]
+#   dograh-init  profiles: ["remote", "local-turn"]
+#   cloudflared  profiles: ["tunnel"]
+#
+# Start command is therefore a bare `docker compose up -d` with NO profiles.
+# Note this deliberately differs from upstream scripts/start_docker.sh, which
+# ends with `docker compose --profile tunnel up` — we do not want cloudflared.
+
+services:
+
+  # ServiceDesk (sd_chat/server_with_upload.py) owns host 0.0.0.0:8000 and must
+  # not be disturbed. Dograh's API keeps listening on 8000 INSIDE the container;
+  # only the host-side publication moves to 8001, loopback-only.
+  api:
+    ports: !override
+      - "127.0.0.1:8001:8000"
+
+    # ---------------------------------------------------------------------
+    # LOCAL-IAP-POC ONLY — REMOVE BEFORE ENABLING THE "tunnel" PROFILE
+    # ---------------------------------------------------------------------
+    # Dograh v1.45.0 treats a localhost/private BACKEND_API_ENDPOINT as
+    # non-public and therefore probes http://cloudflared:2000/metrics during
+    # /api/v1/health to discover a quick-tunnel URL.
+    #
+    # This PoC deliberately does not run cloudflared, so that name does not
+    # resolve on app-network and the probe hangs on a DNS/connect timeout —
+    # pushing /health to ~5s. The UI's /api/config/version backend check gives
+    # up after 3s, so the UI renders the backend as unreachable even though it
+    # is perfectly healthy.
+    #
+    # Pinning the name to the API container's own loopback makes the probe fail
+    # instantly with ECONNREFUSED instead of timing out. Nothing listens on
+    # 127.0.0.1:2000 inside this container, which is exactly the point.
+    #
+    # !! If cloudflared is ever enabled (compose --profile tunnel), this entry
+    # !! MUST be deleted — it would shadow the real Docker service name and
+    # !! silently break tunnel URL discovery.
+    extra_hosts:
+      - "cloudflared:127.0.0.1"
+
+    # ---------------------------------------------------------------------
+    # GCP Application Default Credentials (Phase 4C) — read-only, api only
+    # ---------------------------------------------------------------------
+    # Every Vertex workload on this host (sd_chat and the other ADK agents)
+    # authenticates through the operator's gcloud user ADC, NOT through the
+    # GCE metadata service. Proven empirically, same endpoint, same minute:
+    #
+    #   user ADC        -> HTTP 200  (us-central1 and us-east4)
+    #   metadata token  -> HTTP 403  "insufficient authentication scopes"
+    #
+    # The VM's attached service account carries only 6 scopes and lacks
+    # cloud-platform. Widening it needs an instance stop, which would kill
+    # ServiceDesk — so this deployment follows the host's existing pattern
+    # instead. No VM scope change, no service-account JSON key.
+    #
+    # WHY A COPY RATHER THAN MOUNTING ~/.config/gcloud DIRECTLY
+    # ---------------------------------------------------------
+    # The canonical file is mode 0600 owned by host uid 1000; this container
+    # runs as uid 999(dograh), so a direct bind mount would be unreadable and
+    # the only fix would be loosening the canonical file — not acceptable.
+    # runtime/adc/ therefore holds a copy owned by uid 999, mode 0400. Host
+    # uid 999 is unassigned, so no host account can read it, and the
+    # canonical ADC keeps mode 0600 untouched.
+    #
+    # The copy is git-ignored (runtime/* rule) and is NOT baked into any
+    # image — it exists only as this read-only bind mount.
+    volumes:
+      - ./adc/application_default_credentials.json:/var/run/gcp/adc.json:ro
+    environment:
+      GOOGLE_APPLICATION_CREDENTIALS: /var/run/gcp/adc.json
+
+  # Host 3000 belongs to the existing Next.js dev server — untouched.
+  # Dograh UI keeps container port 3010, published on loopback only.
+  ui:
+    ports: !override
+      - "127.0.0.1:3010:3010"
+
+  # Upstream publishes "5432:5432" on 0.0.0.0. Combined with the VPC rule
+  # default-allow-internal (10.128.0.0/9, all TCP/UDP), that would expose the
+  # transcript/user database to every VM in the VPC. Host publication removed
+  # entirely — the api container reaches it as postgres:5432 over app-network.
+  postgres:
+    ports: !override []
+
+  # Same defect upstream ("6379:6379" on 0.0.0.0). Host publication removed —
+  # the api container reaches it as redis:6379 over app-network.
+  redis:
+    ports: !override []
+
+  # Upstream already binds MinIO to loopback only, which is correct. Restated
+  # explicitly so the effective binding is auditable in one place.
+  minio:
+    ports: !override
+      - "127.0.0.1:9000:9000"
+      - "127.0.0.1:9001:9001"
