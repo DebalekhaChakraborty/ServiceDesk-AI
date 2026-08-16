@@ -355,6 +355,32 @@ test('the public recovery page collects no identifying input at all', async () =
   }
 });
 
+test('the public voice page is a Service Desk line, not a password-reset feature', async () => {
+  // The caller is outside the portal because they could not sign in. That says
+  // nothing about what they want, so the page must not narrow the offer — and
+  // must not promise a reset the Service Desk has not agreed to.
+  const { createApp } = require('../src/app');
+  const app = createApp({
+    config: loadConfig({
+      ...testEnv(),
+      VOICE_IDENTITY_SIGNING_SECRET: 'voice-signing-secret-for-tests-0123456789abcdef',
+      DOGRAH_EMBED_TOKEN: 'emb_test_token_value',
+      DOGRAH_EMBED_ORIGIN: 'http://localhost:3010',
+      DOGRAH_API_ENDPOINT: 'http://localhost:8001',
+      RECOVERY_ADMIN_KEY: 'test-admin-key-0123456789',
+    }),
+  });
+  const response = await request(app).get('/recovery').expect(200);
+
+  assert.match(response.text, /Talk to ServiceDesk/);
+  assert.ok(!/password/i.test(response.text),
+    'the public voice page must not promise a password reset');
+  assert.ok(!/Account Recovery/i.test(response.text),
+    'the public voice page must not be titled as account recovery');
+  // It still says identity gets checked, because it does.
+  assert.match(response.text, /Duo/);
+});
+
 test('recovery start sends no caller-supplied identifier to the gateway', () => {
   const recovery = readSourceFiles().find((f) => f.file === 'routes/recovery.js');
   const startHandler = recovery.text.slice(recovery.text.indexOf("router.post('/recovery/start'"));

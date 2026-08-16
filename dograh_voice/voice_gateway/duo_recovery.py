@@ -1,11 +1,22 @@
-"""Duo-backed voice recovery: the deterministic pre-ServiceDesk state machine.
+"""ServiceDesk Voice AI: the deterministic pre-ServiceDesk state machine.
+
+This is the external, unauthenticated voice line. It is NOT an account-recovery
+bot — a caller may reach it for a locked account, a forgotten password, VPN, a
+printer, software, an incident, a request, or anything else the Service Desk
+handles. They are outside the Entra-protected portal because they often cannot
+sign in, and that says nothing at all about what they want. Duo is the identity
+check that stands between them and sd_chat; it is not the purpose of the call.
 
 Owned entirely by Python. Dograh transcribes speech and speaks replies; it never
 decides who the caller is, never sees a Duo transaction id, never sees a
 passcode, and never chooses a factor. Until the machine reaches
 SERVICEDESK_ACTIVE, the caller's words are consumed here and are NOT forwarded
-to sd_chat — which is what keeps a spoken passcode out of the agent entirely.
+to sd_chat — which is what keeps a spoken passcode out of the agent entirely,
+and what keeps an unauthenticated stranger out of it.
 
+    AWAITING_REQUEST               (every external call starts here)
+        -> AWAITING_REQUEST            (greeting, or identifier volunteered early)
+        -> AWAITING_IDENTIFIER         (a ServiceDesk request was stated)
     AWAITING_IDENTIFIER
         -> AWAITING_FACTOR_CHOICE      (exactly one map record, Duo preauth ok)
         -> AWAITING_PASSCODE           (no push-capable device)
@@ -13,11 +24,22 @@ to sd_chat — which is what keeps a spoken passcode out of the agent entirely.
         -> PUSH_PENDING | AWAITING_PASSCODE
     PUSH_PENDING / AWAITING_PASSCODE
         -> VERIFIED -> SERVICEDESK_ACTIVE
+        -> SERVICEDESK_ACTIVE          (direct, carrying the pending request)
         -> FAILED_LOCKED
+        -> FAILED_UNAVAILABLE
 
 The identifier a caller speaks selects a candidate row and does nothing else.
 Authentication is Duo's `result=allow`, and the identity that leaves this module
 is read back from the row bound to `duo_user_id` — never from what was spoken.
+
+A Duo `allow` is necessary but NOT sufficient. VERIFIED additionally requires a
+live, uncontradicted Graph read of the mapped object id; without one the call
+ends in FAILED_UNAVAILABLE and no identity is built. See `_verified`.
+
+The caller's original request is held in `pending_request` for the whole of that
+journey and released to sd_chat exactly once, at the moment an identity is
+built. It is a problem statement and nothing more: it never influences the
+lookup, never influences authentication, and cannot itself cause a forward.
 """
 
 from __future__ import annotations
@@ -25,13 +47,19 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Any, Optional
 
-from .graph_corroboration import GraphCorroborator, NullGraphCorroborator
+from .conversation import classify_opening
+from .graph_corroboration import (
+    CorroborationResult,
+    GraphCorroborator,
+    NullGraphCorroborator,
+)
 from .identifiers import (
     IdentifierError,
+    SpokenIdentifier,
     extract_identifier,
     parse_factor_choice,
 )
@@ -66,9 +94,18 @@ PUSH_TURN_BUDGET_SECONDS = 20.0
 PUSH_POLL_INTERVAL_SECONDS = 2.0
 MAX_POLLS_PER_TURN = 12
 
+# An opening utterance longer than this is not stored as the pending request.
+# The gateway's own max_text_chars gate runs AFTER this module, so without a
+# bound here an unbounded transcript could sit in process memory for the whole
+# session TTL. A caller who genuinely says this much is asked to be brief.
+MAX_REQUEST_CHARS = 1000
+
 
 class DuoRecoveryState(str, Enum):
     RECOVERY_STARTED = "RECOVERY_STARTED"
+    # Where every external call now begins: the caller says what they need
+    # before anyone asks who they are.
+    AWAITING_REQUEST = "AWAITING_REQUEST"
     AWAITING_IDENTIFIER = "AWAITING_IDENTIFIER"
     AWAITING_FACTOR_CHOICE = "AWAITING_FACTOR_CHOICE"
     PUSH_PENDING = "PUSH_PENDING"
@@ -76,10 +113,35 @@ class DuoRecoveryState(str, Enum):
     VERIFIED = "VERIFIED"
     SERVICEDESK_ACTIVE = "SERVICEDESK_ACTIVE"
     FAILED_LOCKED = "FAILED_LOCKED"
+    # Terminal, but NOT an authentication failure: our own dependency could not
+    # answer. Kept distinct from FAILED_LOCKED so the caller is told to try
+    # again rather than that they are locked out, and so an outage never
+    # charges an account a failure it did not commit.
+    FAILED_UNAVAILABLE = "FAILED_UNAVAILABLE"
 
 
+# The first thing an external caller hears. It identifies the line as the
+# Service Desk, asks nothing about identity, and assumes nothing about intent.
+WELCOME_PROMPT = "Welcome to ServiceDesk. How can I help you today?"
+# A greeting is answered, not authenticated. Saying "hello" must never send a
+# Duo Push.
+SMALL_TALK_REPLY = "Yes, I'm here. How can I help you today?"
+# Nothing usable was said at all.
+WELCOME_RETRY = "Sorry, I didn't catch that. How can I help you today?"
+# Said when a caller opens with their employee ID because an older script
+# taught them to. The identifier is kept; the question is what they need.
+REQUEST_PROMPT_AFTER_IDENTIFIER = (
+    "Thank you. Before I look anything up — how can I help you today?"
+)
+# Neutral acknowledgement. It deliberately claims NO diagnosis: sd_chat has not
+# seen the request yet, so the line must not imply it has found or understood
+# anything.
+VERIFY_FIRST_ACK = (
+    "I can help with that. Since you're calling without signing in, "
+    "I need to verify your identity first."
+)
 IDENTIFIER_PROMPT = (
-    "To get started, please tell me your employee ID. "
+    "Please tell me your employee ID. "
     "You can also give your work email address or your registered mobile number."
 )
 IDENTIFIER_RETRY = (
@@ -102,9 +164,26 @@ FACTOR_PROMPT_PASSCODE_ONLY = (
     "To verify your identity, please open Duo Mobile and speak the "
     "six-digit passcode."
 )
+# Push-capable device that does NOT advertise mobile_otp. The passcode is not
+# mentioned at all: naming a factor the device cannot perform invites the
+# caller to read a code nothing can generate.
+FACTOR_PROMPT_PUSH_ONLY = (
+    "To verify your identity, I can send a Duo Push notification to your "
+    "device. Say \"push\" when you are ready."
+)
 FACTOR_RETRY = (
     "Sorry, I did not catch that. Say \"push\" to receive a Duo Push "
     "notification, or \"passcode\" to speak a code from Duo Mobile."
+)
+FACTOR_RETRY_PUSH_ONLY = (
+    "Sorry, I did not catch that. Say \"push\" to receive a Duo Push "
+    "notification in Duo Mobile."
+)
+# Spoken when a caller asks for a passcode on a device that cannot produce one.
+# A misunderstanding, not a failed authentication - it costs no attempt budget.
+PASSCODE_NOT_AVAILABLE = (
+    "Your device is not set up to generate passcodes. I can send a Duo Push "
+    "notification instead. Say \"push\" when you are ready."
 )
 PUSH_SENT_MESSAGE = (
     "I've sent a verification request to your Duo Mobile app. "
@@ -117,6 +196,10 @@ PUSH_WAITING_MESSAGE = (
 PUSH_TIMEOUT_MESSAGE = (
     "I did not receive an approval in time. "
     "Would you like me to send another push, or would you prefer to speak a passcode?"
+)
+PUSH_TIMEOUT_MESSAGE_PUSH_ONLY = (
+    "I did not receive an approval in time. "
+    "Would you like me to send another push?"
 )
 PASSCODE_PROMPT = (
     "Please open Duo Mobile and speak the six-digit passcode."
@@ -134,20 +217,45 @@ LOCKED_MESSAGE = (
     "Please contact the Service Desk by another channel."
 )
 VERIFIED_MESSAGE = (
-    "Thank you. Your identity has been verified for account recovery. "
-    "How can I help?"
+    "Thank you. I've verified your identity. How can I help you today?"
+)
+# Said when the caller already told us what they need. It promises to look, not
+# to have looked: the sd_chat reply is appended to this sentence by the gateway,
+# so nothing here may pre-empt what that reply turns out to say.
+VERIFIED_CONTINUING = (
+    "Thank you, your identity is verified. Let me pick up where we left off."
 )
 PROVIDER_UNAVAILABLE = (
-    "Account recovery is not available right now. "
+    "I can't verify your identity right now. "
     "Please contact the Service Desk by another channel."
+)
+# Spoken when corroboration could not be obtained. Deliberately says nothing
+# about which dependency failed, and deliberately does not say "locked": the
+# caller did nothing wrong and a later call may well succeed.
+CORROBORATION_UNAVAILABLE = (
+    "I can't complete verification right now. Please try your call again in a "
+    "few minutes, or contact the Service Desk by another channel."
 )
 
 
 @dataclass
 class DuoRecoverySession:
     call_id: str
-    state: DuoRecoveryState = DuoRecoveryState.AWAITING_IDENTIFIER
+    state: DuoRecoveryState = DuoRecoveryState.AWAITING_REQUEST
     created_at: float = field(default_factory=time.time)
+
+    # What the caller said they need, VERBATIM. Server-side only: it is never
+    # placed in the signed bootstrap, never returned to Dograh, never a preset
+    # parameter, and never supplied by browser initialization. It is a problem
+    # statement and carries no authority whatsoever — it cannot select an
+    # account, cannot bypass a factor, and cannot on its own cause a forward.
+    pending_request: Optional[str] = None
+    # Released to sd_chat exactly once, at the moment an identity is built.
+    pending_request_forwarded: bool = False
+
+    # An identifier the caller volunteered before being asked. Untrusted, and
+    # nothing more than a lookup key held so they need not repeat it.
+    candidate_identifier: Optional[SpokenIdentifier] = None
 
     # Candidate selected by a spoken identifier. NOT an authenticated identity.
     employee_id: Optional[str] = None
@@ -165,13 +273,19 @@ class DuoRecoverySession:
     auth_method: Optional[str] = None
     verified_identity: Optional[dict] = None
 
+    # What a terminal FAILED_UNAVAILABLE session keeps saying. Held so the
+    # sentence a caller hears on the turn AFTER the failure matches the one
+    # that ended the call, rather than switching to a different explanation.
+    terminal_message: Optional[str] = None
+
     def expired(self, now: Optional[float] = None) -> bool:
         return (now or time.time()) - self.created_at > SESSION_TTL_SECONDS
 
     def public_state(self) -> dict[str, Any]:
         """Everything about this session that may be shown outside the gateway.
 
-        The txid is deliberately absent.
+        The txid is deliberately absent, and so is the pending request: the
+        caller's own words are theirs, not telemetry.
         """
         return {"call_id": self.call_id, "state": self.state.value}
 
@@ -203,10 +317,12 @@ class DuoRecoveryManager:
 
     # -- lifecycle ---------------------------------------------------------
     def start(self, call_id: str) -> DuoRecoverySession:
-        """Begin a recovery call.
+        """Begin an external ServiceDesk call.
 
         Nothing is looked up here and no identifier is accepted from the web
         page, so this endpoint reveals nothing at all about who is enrolled.
+        The call opens in AWAITING_REQUEST, not AWAITING_IDENTIFIER: the line
+        asks what the caller needs before it asks who they are.
         """
         with self._lock:
             session = DuoRecoverySession(call_id=call_id)
@@ -242,11 +358,17 @@ class DuoRecoveryManager:
 
             if session.state is DuoRecoveryState.FAILED_LOCKED:
                 return TurnOutcome(speak=LOCKED_MESSAGE)
+            if session.state is DuoRecoveryState.FAILED_UNAVAILABLE:
+                return TurnOutcome(
+                    speak=session.terminal_message or CORROBORATION_UNAVAILABLE
+                )
             if session.expired(moment):
                 session.state = DuoRecoveryState.FAILED_LOCKED
                 return TurnOutcome(speak=LOCKED_MESSAGE)
 
             try:
+                if session.state is DuoRecoveryState.AWAITING_REQUEST:
+                    return self._handle_request(session, utterance, moment)
                 if session.state is DuoRecoveryState.AWAITING_IDENTIFIER:
                     return self._handle_identifier(session, utterance, moment)
                 if session.state is DuoRecoveryState.AWAITING_FACTOR_CHOICE:
@@ -263,6 +385,62 @@ class DuoRecoveryManager:
 
             return TurnOutcome(speak=GENERIC_LOOKUP_FAILURE)
 
+    # -- step 0: what does the caller need? --------------------------------
+    def _handle_request(self, session: DuoRecoverySession, utterance: str,
+                        moment: float) -> TurnOutcome:
+        """Capture the caller's ServiceDesk request. Forwards NOTHING.
+
+        This is the turn that makes the line ServiceDesk-first rather than
+        recovery-first, and it is also the turn most likely to be mistaken for
+        a security shortcut. It is not one: the request is stored locally, the
+        state advances only as far as "now prove who you are", and no byte of
+        what was said here reaches sd_chat until Duo and Graph have both
+        passed. The caller has, at this point, established nothing.
+        """
+        if len(utterance or "") > MAX_REQUEST_CHARS:
+            logger.info("duo recovery call=%s opening=too_long", session.call_id[:8])
+            return TurnOutcome(speak=WELCOME_RETRY)
+
+        opening = classify_opening(utterance, self._map.default_calling_code)
+        # The caller's words are never logged; only what they were shaped like.
+        logger.info("duo recovery call=%s opening %s",
+                    session.call_id[:8], opening.redacted())
+
+        if opening.request is None:
+            if opening.identifier is not None:
+                # Backward compatible with the older identifier-first script.
+                # Retained as an untrusted lookup candidate ONLY, so the caller
+                # is not made to say it twice. It selects nobody until a
+                # request arrives and the lookup actually runs.
+                session.candidate_identifier = opening.identifier
+                return TurnOutcome(speak=REQUEST_PROMPT_AFTER_IDENTIFIER)
+            # A greeting, or noise. Neither starts authentication, and neither
+            # is stored: "hello" must never send a Duo Push. The caller is
+            # asked again, bounded only by the session TTL — nothing here
+            # costs an attempt, contacts Duo, or reaches sd_chat, so there is
+            # no budget for a re-prompt to protect.
+            return TurnOutcome(speak=SMALL_TALK_REPLY if opening.small_talk
+                               else WELCOME_RETRY)
+
+        session.pending_request = opening.request
+
+        # An identifier spoken in the SAME breath is used; otherwise one kept
+        # from an earlier identifier-first opening is. Either way it is only a
+        # lookup key, and it is consumed here so it can never be reused.
+        identifier = opening.identifier or session.candidate_identifier
+        session.candidate_identifier = None
+        session.state = DuoRecoveryState.AWAITING_IDENTIFIER
+
+        if identifier is None:
+            return TurnOutcome(speak=f"{VERIFY_FIRST_ACK} {IDENTIFIER_PROMPT}")
+
+        # The retained identifier goes through the SAME resolution path as a
+        # spoken one, attempt budget included, so preserving it grants nothing.
+        outcome = self._resolve_identifier(session, identifier, moment)
+        if outcome.speak:
+            return replace(outcome, speak=f"{VERIFY_FIRST_ACK} {outcome.speak}")
+        return outcome
+
     # -- step 1: identifier ------------------------------------------------
     def _handle_identifier(self, session: DuoRecoverySession, utterance: str,
                            moment: float) -> TurnOutcome:
@@ -278,6 +456,12 @@ class DuoRecoveryManager:
                         session.call_id[:8], exc.category)
             return TurnOutcome(speak=IDENTIFIER_RETRY, state=None)
 
+        return self._resolve_identifier(session, identifier, moment)
+
+    def _resolve_identifier(self, session: DuoRecoverySession,
+                            identifier: SpokenIdentifier,
+                            moment: float) -> TurnOutcome:
+        """Turn one normalised identifier into a candidate row, or nothing."""
         session.identifier_attempts += 1
         if session.identifier_attempts > MAX_IDENTIFIER_ATTEMPTS:
             session.state = DuoRecoveryState.FAILED_LOCKED
@@ -324,28 +508,72 @@ class DuoRecoveryManager:
                     session.call_id[:8], record.redacted(),
                     bool(session.push_device_id), session.passcode_capable)
 
-        if session.push_device_id:
+        return self._offer_factors(session, record)
+
+    def _offer_factors(self, session: DuoRecoverySession,
+                       record: EmployeeRecord) -> TurnOutcome:
+        """Offer exactly the factors THIS device advertises, and nothing else.
+
+        Capability comes from the live preauth response and never from the local
+        map, which stores a mobile number as a lookup alias and knows nothing
+        about what the device can do.
+
+        Offering an unusable factor is not a cosmetic problem. A caller who
+        accepts it is sent to read a code no device can generate, and every
+        attempt charges the ACCOUNT a failure - so an option we should never
+        have mentioned walks a legitimate caller into a lockout.
+        """
+        has_push = bool(session.push_device_id)
+        has_otp = session.passcode_capable
+
+        if has_push and has_otp:
             session.state = DuoRecoveryState.AWAITING_FACTOR_CHOICE
             return TurnOutcome(speak=FACTOR_PROMPT)
 
-        # No push-capable device: offer the passcode rather than a dead choice.
-        session.state = DuoRecoveryState.AWAITING_PASSCODE
-        return TurnOutcome(speak=FACTOR_PROMPT_PASSCODE_ONLY)
+        if has_push:
+            session.state = DuoRecoveryState.AWAITING_FACTOR_CHOICE
+            return TurnOutcome(speak=FACTOR_PROMPT_PUSH_ONLY)
+
+        if has_otp:
+            session.state = DuoRecoveryState.AWAITING_PASSCODE
+            return TurnOutcome(speak=FACTOR_PROMPT_PASSCODE_ONLY)
+
+        # Enrolled, but nothing on the account can actually authenticate. The
+        # caller has attempted nothing, so no failure is charged. The wording is
+        # the one used for a Duo outage on purpose: "enrolled with no usable
+        # device" must not be distinguishable from "Duo is unreachable".
+        logger.error("duo recovery call=%s FAIL_CLOSED no_usable_factor account=%s",
+                     session.call_id[:8], record.redacted())
+        session.state = DuoRecoveryState.FAILED_UNAVAILABLE
+        session.terminal_message = PROVIDER_UNAVAILABLE
+        return TurnOutcome(speak=PROVIDER_UNAVAILABLE)
 
     # -- step 2: factor choice --------------------------------------------
     def _handle_factor_choice(self, session: DuoRecoverySession, utterance: str,
                               moment: float) -> TurnOutcome:
         choice = parse_factor_choice(utterance)
         if choice is None:
-            return TurnOutcome(speak=FACTOR_RETRY)
+            return TurnOutcome(speak=FACTOR_RETRY if session.passcode_capable
+                               else FACTOR_RETRY_PUSH_ONLY)
 
         if choice == "passcode":
+            if not session.passcode_capable:
+                # Asking for a factor the device cannot perform is a
+                # misunderstanding, not a failed authentication: the state does
+                # not move and no attempt budget is spent.
+                logger.info("duo recovery call=%s passcode_requested_unavailable",
+                            session.call_id[:8])
+                return TurnOutcome(speak=PASSCODE_NOT_AVAILABLE)
             session.state = DuoRecoveryState.AWAITING_PASSCODE
             return TurnOutcome(speak=PASSCODE_PROMPT)
 
         if not session.push_device_id:
-            session.state = DuoRecoveryState.AWAITING_PASSCODE
-            return TurnOutcome(speak=FACTOR_PROMPT_PASSCODE_ONLY)
+            if session.passcode_capable:
+                session.state = DuoRecoveryState.AWAITING_PASSCODE
+                return TurnOutcome(speak=FACTOR_PROMPT_PASSCODE_ONLY)
+            session.state = DuoRecoveryState.FAILED_UNAVAILABLE
+            session.terminal_message = PROVIDER_UNAVAILABLE
+            return TurnOutcome(speak=PROVIDER_UNAVAILABLE)
 
         handle = self._provider.start_push(session.duo_user_id, session.push_device_id)
         session.txid = handle.txid          # never leaves this process
@@ -408,7 +636,8 @@ class DuoRecoveryManager:
             if session.state is DuoRecoveryState.FAILED_LOCKED:
                 return TurnOutcome(speak=LOCKED_MESSAGE)
             session.state = DuoRecoveryState.AWAITING_FACTOR_CHOICE
-            return TurnOutcome(speak=PUSH_TIMEOUT_MESSAGE)
+            return TurnOutcome(speak=PUSH_TIMEOUT_MESSAGE if session.passcode_capable
+                               else PUSH_TIMEOUT_MESSAGE_PUSH_ONLY)
 
         session.state = DuoRecoveryState.PUSH_PENDING
         return TurnOutcome(speak=PUSH_SENT_MESSAGE if first_turn else PUSH_WAITING_MESSAGE)
@@ -416,6 +645,17 @@ class DuoRecoveryManager:
     # -- step 3b: spoken passcode -----------------------------------------
     def _handle_passcode(self, session: DuoRecoverySession, utterance: str,
                          moment: float) -> TurnOutcome:
+        if not session.passcode_capable:
+            # Unreachable through _offer_factors and _handle_factor_choice, and
+            # asserted here anyway: this is the single line standing between a
+            # push-only caller and an account failure charged for a code their
+            # device cannot produce. It must never depend on callers upstream
+            # having got the capability check right.
+            logger.warning("duo recovery call=%s passcode_state_without_capability",
+                           session.call_id[:8])
+            session.state = DuoRecoveryState.AWAITING_FACTOR_CHOICE
+            return TurnOutcome(speak=PASSCODE_NOT_AVAILABLE)
+
         try:
             passcode = parse_spoken_code(utterance)
         except SpokenCodeError as exc:
@@ -452,25 +692,63 @@ class DuoRecoveryManager:
     # -- verified ----------------------------------------------------------
     def _verified(self, session: DuoRecoverySession, method: str,
                   moment: float) -> TurnOutcome:
-        """Build the trusted identity. Only reachable from Duo result=allow.
+        """Build the trusted identity. Duo `allow` is necessary, not sufficient.
 
-        The identity is read back from the record bound to `duo_user_id`, NOT
-        from `session.employee_id` and certainly not from anything the caller
-        spoke. If the binding no longer resolves, the call fails closed.
+        Two independent gates must both pass:
+
+        1. the `duo_user_id` binding still resolves to a recovery-ready row -
+           the identity is read back from THAT row, not from
+           `session.employee_id` and certainly not from anything the caller
+           spoke;
+        2. Microsoft Graph confirms, live, that the mapped object id still
+           exists in the expected tenant.
+
+        Gate 2 fails closed on BOTH contradiction and unavailability. A Duo
+        allow on its own establishes no identity_context: it proves possession
+        of the enrolled phone, and nothing about whether the local row is still
+        true. The two failures are distinguished only in what the caller hears
+        and in whether the session is treated as an authentication failure.
         """
         record = self._map.by_duo_user_id(session.duo_user_id or "")
         if record is None or not record.recovery_ready():
             logger.error("duo recovery call=%s verified but binding missing",
                          session.call_id[:8])
+            session.txid = None
             session.state = DuoRecoveryState.FAILED_LOCKED
             return TurnOutcome(speak=LOCKED_MESSAGE)
 
-        corroboration = self._corroborator.corroborate(
-            record.entra_tenant_id, record.entra_object_id, record.upn
-        )
-        if corroboration.available and not corroboration.ok:
+        try:
+            corroboration = self._corroborator.corroborate(
+                record.entra_tenant_id, record.entra_object_id, record.upn
+            )
+        except Exception as exc:
+            # A corroborator that raises is an unavailable corroborator. It must
+            # never become an implicit pass by escaping to a caller that only
+            # knows how to report a provider outage.
+            logger.warning("duo recovery call=%s corroboration_raised=%s",
+                           session.call_id[:8], type(exc).__name__)
+            corroboration = CorroborationResult(
+                available=False, ok=False, reason="corroborator_error"
+            )
+
+        if not corroboration.establishes_identity():
+            session.txid = None
+            if not corroboration.available:
+                # Our own dependency is down, or was never configured. The
+                # caller is not at fault, so no account failure is charged and
+                # nothing is said about being locked out - but no identity is
+                # built either.
+                logger.error(
+                    "duo recovery call=%s FAIL_CLOSED corroboration_unavailable "
+                    "reason=%s account=%s",
+                    session.call_id[:8], corroboration.reason, record.redacted(),
+                )
+                session.state = DuoRecoveryState.FAILED_UNAVAILABLE
+                session.terminal_message = CORROBORATION_UNAVAILABLE
+                return TurnOutcome(speak=CORROBORATION_UNAVAILABLE)
+
             # The directory contradicts the map: wrong tenant, or the object is
-            # gone. Fail closed - this is not an outage.
+            # gone. Terminal, and not something a retry can fix.
             logger.warning("duo recovery call=%s corroboration_failed reason=%s",
                            session.call_id[:8], corroboration.reason)
             session.state = DuoRecoveryState.FAILED_LOCKED
@@ -499,6 +777,23 @@ class DuoRecoveryManager:
             session.call_id[:8], record.redacted(), method,
             corroboration.available and corroboration.ok,
         )
+
+        # The caller already told us what they need, so they are not asked to
+        # say it again. This is the ONLY place the pending request is released,
+        # it is reachable only past both gates above, and the flag makes it a
+        # one-shot: every later turn forwards what the caller actually says.
+        if session.pending_request and not session.pending_request_forwarded:
+            session.pending_request_forwarded = True
+            session.state = DuoRecoveryState.SERVICEDESK_ACTIVE
+            logger.info("duo recovery call=%s pending_request forwarded=true",
+                        session.call_id[:8])
+            return TurnOutcome(
+                speak=VERIFIED_CONTINUING,
+                forward=True,
+                forward_text=session.pending_request,
+                identity=session.verified_identity,
+            )
+
         return TurnOutcome(speak=VERIFIED_MESSAGE, identity=session.verified_identity)
 
 

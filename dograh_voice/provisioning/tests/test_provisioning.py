@@ -371,3 +371,135 @@ def test_api_key_is_never_logged(capsys):
     out = capsys.readouterr().out
     assert "test-key-not-real" not in out
     assert "X-API-Key" not in out
+
+
+# ------------------------------------------- developer recovery bootstrap ----
+#
+# The canonical journey is an EXTERNAL caller with no corporate identity. The
+# developer bootstrap must be indistinguishable from that caller: same signing
+# path, same claim set, same two context keys, and no identity anywhere. Its
+# whole risk is that it mints an unauthenticated recovery bootstrap, so the
+# containment below is the point of the feature, not decoration.
+
+import base64
+
+from provisioning import recovery_test_bootstrap as devboot
+from voice_gateway.identity import (
+    PURPOSE_RECOVERY,
+    load_signing_secret,
+    verify_recovery_bootstrap,
+)
+
+DEV_ON = {devboot.MODE_ENV: "true"}
+SECRET = "d" * 48
+
+
+def claims_of(token: str) -> dict:
+    part = token.split(".")[1]
+    return json.loads(base64.urlsafe_b64decode(part + "=" * (-len(part) % 4)))
+
+
+def test_dev_mode_is_off_unless_exactly_true():
+    for value in ("", "false", "0", "1", "yes", "on", "development", "True-ish"):
+        assert devboot.dev_mode_enabled({devboot.MODE_ENV: value}) is False, value
+    assert devboot.dev_mode_enabled({devboot.MODE_ENV: "true"}) is True
+    assert devboot.dev_mode_enabled({devboot.MODE_ENV: "TRUE"}) is True
+
+
+def test_dev_mode_is_not_enabled_by_unrelated_environment():
+    """A recovery-bootstrap minter must not switch on as a side effect."""
+    for env in ({"NODE_ENV": "development"}, {"ENVIRONMENT": "local"},
+                {"DEBUG": "1"}, {"CI": "true"}, {}):
+        assert devboot.dev_mode_enabled(env) is False
+
+
+def test_dev_bootstrap_refuses_when_mode_disabled(monkeypatch):
+    monkeypatch.delenv(devboot.MODE_ENV, raising=False)
+    with pytest.raises(devboot.DevModeDisabled):
+        devboot.mint_dev_recovery_context(secret=SECRET)
+    assert devboot.main(["--workflow-id", "1"]) == 2      # CLI exits non-zero
+
+
+def test_dev_bootstrap_mints_fresh_call_id_and_valid_token(monkeypatch):
+    monkeypatch.setenv(devboot.MODE_ENV, "true")
+    first = devboot.mint_dev_recovery_context(secret=SECRET)
+    second = devboot.mint_dev_recovery_context(secret=SECRET)
+
+    assert sorted(first) == ["call_id", "voice_identity_token"]
+    assert first["call_id"] != second["call_id"]          # fresh every time
+    assert first["call_id"].startswith("voice_")
+    # Verifies under the gateway's own verifier, bound to its own call_id.
+    payload = verify_recovery_bootstrap(
+        first["voice_identity_token"], SECRET, first["call_id"])
+    assert payload["purpose"] == PURPOSE_RECOVERY
+
+
+def test_dev_bootstrap_carries_no_employee_identity(monkeypatch):
+    monkeypatch.setenv(devboot.MODE_ENV, "true")
+    context = devboot.mint_dev_recovery_context(secret=SECRET)
+    claims = claims_of(context["voice_identity_token"])
+
+    assert sorted(claims) == ["aud", "call_id", "exp", "iat", "purpose", "ver"]
+    for forbidden in ("upn", "oid", "object_id", "employee_id", "mobile",
+                      "name", "mail", "displayName", "claimed_upn_hint"):
+        assert forbidden not in claims
+    # Nor anywhere else in the context the workflow will receive.
+    assert "1999" not in json.dumps(context)
+
+
+def test_dev_bootstrap_token_is_call_bound(monkeypatch):
+    """A bootstrap minted for one test call cannot be replayed into another."""
+    from voice_gateway.identity import IdentityTokenError
+    monkeypatch.setenv(devboot.MODE_ENV, "true")
+    a = devboot.mint_dev_recovery_context(secret=SECRET)
+    b = devboot.mint_dev_recovery_context(secret=SECRET)
+    with pytest.raises(IdentityTokenError):
+        verify_recovery_bootstrap(a["voice_identity_token"], SECRET, b["call_id"])
+
+
+def test_dev_bootstrap_ttl_is_short(monkeypatch):
+    monkeypatch.setenv(devboot.MODE_ENV, "true")
+    context = devboot.mint_dev_recovery_context(secret=SECRET)
+    claims = claims_of(context["voice_identity_token"])
+    assert 0 < claims["exp"] - claims["iat"] <= devboot.DEV_TTL_SECONDS
+
+
+def test_dev_bootstrap_sends_the_tokens_allowed_origin():
+    """Dograh enforces allowed_domains on Origin; a wrong one is a 403."""
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["origin"] = request.headers.get("Origin")
+        seen["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"workflow_run_id": 99,
+                                         "session_token": "s"})
+
+    transport = httpx.MockTransport(handler)
+    with httpx.Client(transport=transport) as c:
+        original = devboot.httpx.post
+        devboot.httpx.post = lambda url, **kw: c.post(url, **kw)
+        try:
+            devboot.init_embed_session(
+                "embed-tok", {"call_id": "cid", "voice_identity_token": "t"},
+                "http://localhost:8080")
+        finally:
+            devboot.httpx.post = original
+
+    assert seen["origin"] == "http://localhost:8080"
+    assert sorted(seen["body"]["context_variables"]) == [
+        "call_id", "voice_identity_token"]
+
+
+def test_native_run_endpoint_cannot_carry_context():
+    """Why the dev bootstrap exists at all, pinned as an assertion.
+
+    Dograh v1.45's CreateWorkflowRunRequest accepts only mode and name, so the
+    admin console Test button physically cannot supply initial_context. If a
+    future Dograh version adds one, this test fails and we revisit the design
+    rather than keeping a helper nobody needs.
+    """
+    spec = Path(__file__).resolve().parent / "dograh_v145_schemas.json"
+    schemas = json.loads(spec.read_text())["components"]["schemas"]
+    props = set(schemas["CreateWorkflowRunRequest"]["properties"])
+    assert props == {"mode", "name"}
+    assert "context_variables" in schemas["InitEmbedRequest"]["properties"]

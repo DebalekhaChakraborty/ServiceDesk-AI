@@ -42,9 +42,9 @@ from .models import (
 )
 from .duo_recovery import DuoRecoveryManager
 from .duo_provider import DuoRecoveryProvider, load_duo_config
-from .graph_corroboration import load_corroborator
+from .graph_corroboration import NullGraphCorroborator, load_corroborator
 from .identifiers import IdentifierError, normalize_upn
-from .identity_map import EmployeeIdentityMap
+from .identity_map import STATUS_ACTIVE, EmployeeIdentityMap
 from .mfa_provider import MfaProviderError
 from .recovery import RecoveryManager, RecoveryState, recovery_persona
 from .totp import DIGITS, PERIOD_SECONDS
@@ -55,7 +55,7 @@ from .servicedesk_client import (
 )
 from .totp import SpokenCodeError, parse_spoken_code
 from .recovery import PROMPT_FOR_OTP
-from .duo_recovery import IDENTIFIER_PROMPT as DUO_IDENTIFIER_PROMPT
+from .duo_recovery import WELCOME_PROMPT as DUO_WELCOME_PROMPT
 from .recovery_store import enrollment_admin_key
 from .recovery_store import redact_account as _redact_account
 from .session import (
@@ -132,6 +132,18 @@ def _build_recovery(settings: Settings):
         return None
 
     corroborator = load_corroborator()
+    if isinstance(corroborator, NullGraphCorroborator):
+        # Corroboration is a hard requirement for building a recovery persona,
+        # so an unconfigured corroborator means no call can ever succeed. Refuse
+        # here for the same reason a failed Duo /check refuses: a route that
+        # looks like recovery and always fails at the last step is worse than a
+        # route that is plainly switched off.
+        logger.warning(
+            "recovery DISABLED: Graph corroboration is not configured "
+            "(set RECOVERY_GRAPH_TENANT_ID / _CLIENT_ID / _CLIENT_SECRET)"
+        )
+        return None
+
     logger.info(
         "recovery provider=duo ENABLED config=%s corroboration=%s",
         config.redacted(), type(corroborator).__name__,
@@ -353,7 +365,18 @@ def create_app(
             return _error("NOT_AUTHORISED", "Not authorised.", 403)
 
         record = _matched_record(manager, req)
-        if record is None or not record.duo_user_id or not record.duo_activation_code:
+        if record is None or not record.duo_user_id:
+            return _error("ENROLLMENT_NOT_CONFIRMED",
+                          "Enrollment has not been started.", 400)
+
+        if record.duo_enrollment_status == STATUS_ACTIVE and record.recovery_enabled:
+            # Already activated, which is precisely why there is no activation
+            # code left to present. Answered from the record so that destroying
+            # the code on success does not make a repeat poll look like a
+            # broken enrollment.
+            return DuoEnrollStatusResponse(status="active")
+
+        if not record.duo_activation_code:
             return _error("ENROLLMENT_NOT_CONFIRMED",
                           "Enrollment has not been started.", 400)
 
@@ -367,16 +390,25 @@ def create_app(
                           "Recovery enrollment is not available right now.", 502)
 
         if status.state == "success":
-            # The ONLY path that switches recovery on for an employee.
+            # The ONLY path that switches recovery on for an employee. It also
+            # destroys the activation code: enrollment is over and the code is
+            # spent, so it stops being stored at the moment it stops being
+            # needed.
             manager.identity_map.activate_duo(record.employee_id)
             logger.info("duo enroll status account=%s status=active", record.redacted())
             return DuoEnrollStatusResponse(status="active")
 
-        logger.info("duo enroll status account=%s status=%s",
-                    record.redacted(), status.state)
-        return DuoEnrollStatusResponse(
-            status="waiting" if status.state == "waiting" else "invalid"
-        )
+        if status.state != "waiting":
+            # Terminal the other way: Duo says the code is invalid or expired.
+            # It can never activate anything now, so it is destroyed too. Only
+            # "waiting" - an enrollment still genuinely in progress - retains it.
+            manager.identity_map.invalidate_duo_enrollment(record.employee_id)
+            logger.info("duo enroll status account=%s status=invalid",
+                        record.redacted())
+            return DuoEnrollStatusResponse(status="invalid")
+
+        logger.info("duo enroll status account=%s status=waiting", record.redacted())
+        return DuoEnrollStatusResponse(status="waiting")
 
     # --- TOTP enrollment (retired provider, reachable only via RECOVERY_PROVIDER=totp)
 
@@ -438,8 +470,13 @@ def create_app(
             # Under Duo the caller identifies themselves by voice, so no
             # identifier is accepted here at all and any claimed_upn on the wire
             # is discarded rather than stored.
+            #
+            # The opening prompt is a ServiceDesk greeting, NOT a request for an
+            # employee ID. The caller is outside the portal because they often
+            # cannot sign in, which says nothing about what they need; asking
+            # for identity first framed the whole line as a recovery bot.
             recovery.start(req.call_id)
-            return {"status": "ok", "prompt": DUO_IDENTIFIER_PROMPT}
+            return {"status": "ok", "prompt": DUO_WELCOME_PROMPT}
 
         recovery.start(req.call_id, req.claimed_upn or "")
         # Identical response whether or not the account is enrolled.
@@ -454,11 +491,19 @@ def create_app(
         # tool parameters via the LLM, and an LLM must never choose the session
         # a conversation belongs to.
         persona = None
+        # Set only when the state machine releases a request the caller made
+        # BEFORE authenticating; it replaces this turn's utterance.
+        forward_text: str | None = None
+        # Spoken by the gateway on its own behalf and prepended to the
+        # ServiceDesk reply, so one turn can both confirm verification and
+        # answer the original question.
+        speak_prefix: str | None = None
 
         # --- RECOVERY INTERCEPT ------------------------------------------
-        # A recovery call is handled entirely here until TOTP succeeds. While
-        # WAITING_FOR_OTP the utterance carries the spoken code, so it is
-        # consumed by the state machine and NEVER forwarded to sd_chat.
+        # An external call is handled entirely here until identity is proven.
+        # Every utterance before that - the caller's request, their identifier,
+        # their factor choice, a spoken passcode - is consumed by the state
+        # machine and NEVER forwarded to sd_chat.
         recovery_call = (
             recovery.get(req.call_id.strip())
             if (recovery is not None and req.call_id) else None
@@ -488,9 +533,15 @@ def create_app(
             persona = recovery.persona_for(identity)
             voice_session_id = call_id
             sd_session = auth_session_id(call_id)
+            # Both are chosen by the state machine, which only reaches this
+            # branch past Duo AND Graph. Neither is caller-supplied.
+            forward_text = outcome.forward_text
+            speak_prefix = outcome.speak
             logger.info(
-                "turn call=%s recovery_state=%s forwarded=true auth_method=%s",
+                "turn call=%s recovery_state=%s forwarded=true auth_method=%s "
+                "carried_request=%s",
                 handle, state_value, identity.get("auth_method"),
+                forward_text is not None,
             )
 
         elif settings.require_authenticated_identity:
@@ -537,7 +588,10 @@ def create_app(
                 422,
             )
 
-        text = req.text.strip()
+        # A released pending request stands in for this turn's utterance, and is
+        # then held to the SAME length and emptiness gates as anything a caller
+        # says live — it was, after all, something a caller said.
+        text = (forward_text if forward_text is not None else req.text).strip()
         if not text:
             logger.info("turn session=%s rejected=EMPTY_UTTERANCE", handle)
             return _error(
@@ -626,6 +680,11 @@ def create_app(
                 "GATEWAY_ERROR", "The Service Desk service is unavailable.", 502
             )
 
+        if speak_prefix:
+            # One spoken turn: "your identity is verified" followed by the real
+            # ServiceDesk answer to the question they asked before verifying.
+            reply = f"{speak_prefix} {reply}"
+
         duration_ms = int((time.monotonic() - started) * 1000)
         logger.info(
             "turn session=%s status=ok duration_ms=%d reply_chars=%d",
@@ -643,7 +702,34 @@ def create_app(
     return app
 
 
-app = create_app()
+# `uvicorn voice_gateway.app:app` still resolves, but the app is built on first
+# ACCESS rather than on import (PEP 562).
+#
+# Building it at import time gave the module heavyweight side effects: reading
+# the Duo credentials off disk, signing a live `/auth/v2/check` to the real
+# tenant, and creating the real identity map — all triggered by nothing more
+# than `from voice_gateway.app import create_app`. That made every test module
+# a client of the production Duo integration the moment this host was
+# provisioned, and no fixture could prevent it, because it happened during
+# import before any fixture could run.
+_app = None
+
+
+def _asgi_app():
+    """The one process-wide app instance, built on first use."""
+    global _app
+    if _app is None:
+        _app = create_app()
+    return _app
+
+
+def __getattr__(name: str):
+    # PEP 562 covers ATTRIBUTE access on the module (`voice_gateway.app:app`,
+    # which is how uvicorn resolves it). It does not cover a bare `app` global
+    # read inside this module, so main() goes through _asgi_app() directly.
+    if name == "app":
+        return _asgi_app()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def main() -> None:
@@ -655,7 +741,8 @@ def main() -> None:
             f"refusing to bind {settings.host!r}: the voice gateway must never be "
             "reachable beyond loopback or a private bridge address"
         )
-    uvicorn.run(app, host=settings.host, port=settings.port, log_level="info")
+    uvicorn.run(_asgi_app(), host=settings.host, port=settings.port,
+                log_level="info")
 
 
 if __name__ == "__main__":

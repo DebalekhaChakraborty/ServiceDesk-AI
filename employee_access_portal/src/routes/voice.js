@@ -70,6 +70,10 @@ function voiceRoutes({ config, sessions }) {
       expires_at: minted.expiresAt,
       embed_token: config.voice.embedToken,
       embed_origin: config.voice.embedOrigin,
+      // The widget builds its script URL from this. Omitting it silently
+      // produced `apiEndpoint=undefined`, which is why the authenticated voice
+      // path failed while /recovery — which always returned it — worked.
+      api_endpoint: config.voice.apiEndpoint,
     });
   });
 

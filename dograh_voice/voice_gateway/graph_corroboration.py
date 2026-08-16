@@ -14,14 +14,23 @@ because "the directory says this oid is now bob@" must not turn a recovery call
 for one person into a recovery call for another. Reconciling the alias is an
 administrative action, taken between calls.
 
-Availability and contradiction are treated very differently:
+EVERY outcome other than a live, uncontradicted read fails closed:
 
-    contradiction (object missing / wrong tenant)  -> fail closed
-    unavailable   (no credentials / Graph down)    -> proceed, marked explicitly
+    contradiction (object missing / wrong tenant)  -> fail closed, terminal
+    unavailable   (no credentials / Graph down)    -> fail closed, retry later
 
-Failing closed on unavailability would make an unrelated outage indistinguishable
-from an attack while adding nothing: this phase is read-only self-diagnosis, and
-sd_chat performs its own live Graph read immediately afterwards.
+Corroboration is a REQUIRED second opinion, not a diagnostic. A Duo `allow`
+proves only that somebody holds the enrolled phone; it says nothing about
+whether the local row still describes a real, current employee in the expected
+tenant. Treating an outage as a pass would mean an attacker who can make Graph
+unreachable — or who simply calls during an incident — gets a recovery persona
+on Duo alone, from a map row nobody re-checked. So availability and correctness
+are BOTH required, and the two are still distinguished, but only to choose
+between "this is over" and "try again later".
+
+`available` therefore records whether a live answer was obtained, and `ok`
+records whether identity may be established from it. Nothing sets `ok` true
+without a live, affirmative directory read.
 """
 
 from __future__ import annotations
@@ -43,14 +52,25 @@ TIMEOUT_SECONDS = 20.0
 
 @dataclass(frozen=True)
 class CorroborationResult:
-    available: bool                 # was a live check possible at all?
-    ok: bool                        # no contradiction found
+    available: bool                 # was a live answer obtained at all?
+    ok: bool                        # may identity be established from it?
     reason: str = ""                # coarse, log-safe
     object_exists: Optional[bool] = None
     tenant_ok: Optional[bool] = None
     directory_upn: Optional[str] = None
     account_enabled: Optional[bool] = None
     upn_drift: bool = False
+
+    def establishes_identity(self) -> bool:
+        """The single gate a recovery persona must pass.
+
+        Both halves are required and neither is redundant: `ok` alone would be
+        fail-open if some future code path forgot to set it on an outage, and
+        `available` alone says nothing about what the directory answered. A
+        caller that asks this question cannot accidentally proceed on an
+        unavailable result.
+        """
+        return self.available and self.ok
 
     def summary(self) -> dict[str, Any]:
         """Compact record for the session and for logs. No token, no secret."""
@@ -74,11 +94,16 @@ class GraphCorroborator:
 
 
 class NullGraphCorroborator(GraphCorroborator):
-    """Used when no read credentials are configured."""
+    """Used when no read credentials are configured.
+
+    It cannot corroborate anything, so it never permits an identity. Recovery
+    is refused at startup when this is the configured corroborator, rather than
+    left to fail one caller at a time.
+    """
 
     def corroborate(self, tenant_id: str, object_id: str,
                     expected_upn: str) -> CorroborationResult:
-        return CorroborationResult(available=False, ok=True, reason="not_configured")
+        return CorroborationResult(available=False, ok=False, reason="not_configured")
 
 
 class LiveGraphCorroborator(GraphCorroborator):
@@ -139,8 +164,10 @@ class LiveGraphCorroborator(GraphCorroborator):
                 timeout=TIMEOUT_SECONDS,
             )
         except Exception as exc:
+            # Network error, DNS failure, timeout, or a token endpoint that did
+            # not answer. No opinion was obtained, so no identity may be built.
             logger.warning("graph corroboration unavailable reason=%s", type(exc).__name__)
-            return CorroborationResult(available=False, ok=True, reason="graph_unavailable")
+            return CorroborationResult(available=False, ok=False, reason="graph_unavailable")
 
         if response.status_code == 404:
             # A contradiction, not an outage: the map points at an object the
@@ -150,8 +177,10 @@ class LiveGraphCorroborator(GraphCorroborator):
                 object_exists=False, tenant_ok=True,
             )
         if response.status_code != 200:
+            # 401/403/429/5xx: the directory did not answer the question. Not a
+            # contradiction, but not corroboration either.
             logger.warning("graph corroboration http=%s", response.status_code)
-            return CorroborationResult(available=False, ok=True, reason="graph_error")
+            return CorroborationResult(available=False, ok=False, reason="graph_error")
 
         body = response.json()
         directory_upn = str(body.get("userPrincipalName") or "").lower()
@@ -169,21 +198,40 @@ class LiveGraphCorroborator(GraphCorroborator):
         )
 
 
-def _read_secret(env_name: str, file_name: str) -> str:
+def _read_runtime_value(env_name: str, file_name: str) -> str:
+    """Environment first, then an owner-only runtime file. Never argv.
+
+    The same order the Duo loader uses. Every value the corroborator needs is
+    resolvable this way, so starting the gateway requires no exported
+    environment and no wrapper script: a launch that depends on a shell's
+    variables silently degrades to no corroboration, which - now that
+    corroboration is mandatory - silently disables recovery.
+    """
     value = os.getenv(env_name, "").strip()
     if value:
         return value
     path = RUNTIME / file_name
-    if path.exists() and not (path.stat().st_mode & 0o077):
-        return path.read_text().strip()
-    return ""
+    if not path.exists():
+        return ""
+    if path.stat().st_mode & 0o077:
+        # Refusing is right, but doing it silently turns a chmod slip into an
+        # unexplained "recovery DISABLED" at startup.
+        logger.warning("ignoring %s: mode %o is not owner-only (must be 0600)",
+                       path.name, path.stat().st_mode & 0o777)
+        return ""
+    return path.read_text().strip()
 
 
 def load_corroborator() -> GraphCorroborator:
     """Build a live corroborator when configured; otherwise the null one."""
-    tenant = os.getenv("RECOVERY_GRAPH_TENANT_ID", "").strip()
-    client = os.getenv("RECOVERY_GRAPH_CLIENT_ID", "").strip()
-    secret = _read_secret("RECOVERY_GRAPH_CLIENT_SECRET", ".recovery_graph_client_secret")
+    tenant = _read_runtime_value("RECOVERY_GRAPH_TENANT_ID", ".recovery_graph_tenant_id")
+    client = _read_runtime_value("RECOVERY_GRAPH_CLIENT_ID", ".recovery_graph_client_id")
+    secret = _read_runtime_value("RECOVERY_GRAPH_CLIENT_SECRET",
+                                 ".recovery_graph_client_secret")
     if not (tenant and client and secret):
+        missing = [n for n, v in (("tenant_id", tenant), ("client_id", client),
+                                  ("client_secret", secret)) if not v]
+        logger.warning("graph corroboration unconfigured: missing %s",
+                       ", ".join(missing))
         return NullGraphCorroborator()
     return LiveGraphCorroborator(tenant, client, secret)

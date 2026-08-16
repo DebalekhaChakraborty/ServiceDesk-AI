@@ -217,3 +217,49 @@ The GCP-only split fallback (Cloud STT + Vertex LLM + Cloud TTS) is **also
 blocked by the same scope limitation** — `GoogleSTTConfiguration` and
 `GoogleTTSConfiguration` authenticate the same way. Fixing scopes unblocks both
 paths, so there is no fallback worth applying first.
+
+## Developer external-recovery bootstrap
+
+`recovery_test_bootstrap.py` starts the **canonical external-recovery journey**
+from a shell, for development only.
+
+### Why it exists
+
+Dograh v1.45's native Test/Run button cannot carry trusted context. The live
+API is unambiguous:
+
+```
+POST /api/v1/workflow/{id}/runs   CreateWorkflowRunRequest = {mode, name}
+                                  ^ no initial_context field exists
+POST /api/v1/public/embed/init    InitEmbedRequest = {token, context_variables}
+                                  ^ the ONE supported injection point
+```
+
+So a console Test Call renders `{{initial_context.call_id}}` empty and the
+tool's required presets refuse it. Making the console work would mean patching
+Dograh core, which we do not do. This helper drives the same
+`/public/embed/init` the public `/recovery` page uses, with a bootstrap minted
+by the same trusted server-side code — no new trust surface.
+
+### Usage
+
+```bash
+VOICE_DOGRAH_RECOVERY_TEST_MODE=true \
+    python -m provisioning.recovery_test_bootstrap --workflow-id 1
+```
+
+### Containment
+
+- **Off by default.** Only the exact string `true` enables it; `1`, `yes`, `on`
+  and a development `NODE_ENV`/`ENVIRONMENT` all leave it off, so an unrelated
+  flag can never switch on an unauthenticated bootstrap minter.
+- **No identity, ever.** The bootstrap carries `call_id, purpose, aud, iat,
+  exp, ver` and nothing else — no UPN, oid, employee id or mobile. The employee
+  ID is spoken on the call and proven by Duo, exactly as for a real caller.
+- **Fresh random `call_id`** per invocation, **300s TTL**, same signing secret
+  and same verification path as `/recovery`.
+- **Host-only.** It is a CLI needing the 0600 signing secret and the 0600
+  Dograh API key; it is never reachable from a browser and takes no input from
+  one.
+- **No production fallback.** With the flag off it exits non-zero and a
+  context-less Dograh call still fails closed.

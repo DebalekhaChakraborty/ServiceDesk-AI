@@ -92,6 +92,15 @@ class TurnOutcome:
     forward: bool = False            # send the utterance to sd_chat instead
     state: Optional[RecoveryState] = None
     identity: Optional[dict] = None
+    # Text to send to sd_chat INSTEAD of the caller's current utterance. Set
+    # only when a request captured before authentication is being released, so
+    # the caller is not asked to repeat the problem they already described.
+    # None means "forward what they just said", which is the normal case.
+    forward_text: Optional[str] = None
+
+    def outbound_text(self, spoken: str) -> str:
+        """The text that actually goes to sd_chat for this turn."""
+        return self.forward_text if self.forward_text is not None else spoken
 
 
 class RecoveryManager:

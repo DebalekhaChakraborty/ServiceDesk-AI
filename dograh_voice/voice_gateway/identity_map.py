@@ -43,7 +43,8 @@ from .identifiers import (
 SCHEMA_VERSION = 1
 
 DB_ENV = "RECOVERY_IDENTITY_DB"
-DEFAULT_DB = Path(__file__).resolve().parents[1] / "runtime" / "recovery_identity.db"
+RUNTIME = Path(__file__).resolve().parents[1] / "runtime"
+DEFAULT_DB = RUNTIME / "recovery_identity.db"
 
 # Enrollment lifecycle. Only ACTIVE, together with recovery_enabled, permits a
 # recovery call to proceed.
@@ -141,15 +142,30 @@ def _now_iso() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
+def _default_calling_code() -> Optional[str]:
+    """Environment first, then a runtime file, matching every other setting.
+
+    Resolvable without an exported environment so one documented command starts
+    the gateway. It is deliberately NOT defaulted in code: a wrong country code
+    would silently make a caller's spoken mobile number match nobody, and
+    guessing one is exactly what normalize_mobile refuses to do.
+    """
+    value = os.getenv("RECOVERY_DEFAULT_CALLING_CODE", "").strip()
+    if value:
+        return value.lstrip("+") or None
+    path = RUNTIME / ".recovery_default_calling_code"
+    if path.exists():
+        return path.read_text().strip().lstrip("+") or None
+    return None
+
+
 class EmployeeIdentityMap:
     """File-backed map. One connection per operation, guarded by a lock."""
 
     def __init__(self, path: Optional[Path] = None,
                  default_calling_code: Optional[str] = None) -> None:
         self.path = Path(path or os.getenv(DB_ENV) or DEFAULT_DB)
-        self.default_calling_code = default_calling_code or os.getenv(
-            "RECOVERY_DEFAULT_CALLING_CODE", ""
-        ).strip() or None
+        self.default_calling_code = default_calling_code or _default_calling_code()
         self._lock = threading.Lock()
         self._migrate()
 
@@ -242,6 +258,13 @@ class EmployeeIdentityMap:
 
         Enrollment is not complete until Duo itself reports activation, so this
         deliberately leaves recovery_enabled at 0.
+
+        `activation_code` is TEMPORARY enrollment material and is the only
+        secret-like value this table ever holds. It is written here because the
+        status poll must present it back to Duo, and it is destroyed the moment
+        enrollment reaches a terminal state - see `activate_duo` and
+        `invalidate_duo_enrollment`. `duo_user_id`, by contrast, is the
+        permanent binding and outlives every enrollment attempt.
         """
         if not duo_user_id:
             raise IdentityMapError("duo_user_id is required")
@@ -258,7 +281,14 @@ class EmployeeIdentityMap:
             )
 
     def activate_duo(self, employee_id: str) -> None:
-        """Mark enrollment ACTIVE. Only ever called on a Duo "success" result."""
+        """Mark enrollment ACTIVE. Only ever called on a Duo "success" result.
+
+        The activation code is destroyed in the SAME statement that flips the
+        status, so there is no window in which an activated row still carries
+        live enrollment material. It has served its only purpose by this point:
+        Duo has confirmed the app was activated, and authentication from here
+        on is by push or passcode against `duo_user_id`.
+        """
         now = _now_iso()
         with self._lock, self._connect() as conn:
             conn.execute(
@@ -268,6 +298,31 @@ class EmployeeIdentityMap:
                           recovery_enabled = 1, updated_at = ?
                     WHERE employee_id = ? AND duo_user_id IS NOT NULL""",
                 (STATUS_ACTIVE, now, now, normalize_employee_id(employee_id)),
+            )
+
+    def invalidate_duo_enrollment(self, employee_id: str) -> None:
+        """Enrollment failed terminally: destroy the activation code.
+
+        Duo reported the activation code as invalid — spent, expired, or never
+        valid. It can never succeed now, so leaving it at rest would keep a dead
+        secret in the database for no reason at all; the next enrollment mints a
+        fresh one.
+
+        `duo_user_id` is deliberately NOT cleared. It is the permanent Duo
+        binding, and dropping it here would orphan the Duo-side user while the
+        row silently became a candidate for a brand-new binding. The status
+        returns to NONE and recovery_enabled to 0, so `recovery_ready()` is
+        false and a recovery call for this employee gets the same generic
+        sentence as an unknown one.
+        """
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """UPDATE employee_identity_map
+                      SET duo_activation_code = NULL,
+                          duo_enrollment_status = ?,
+                          recovery_enabled = 0, updated_at = ?
+                    WHERE employee_id = ?""",
+                (STATUS_NONE, _now_iso(), normalize_employee_id(employee_id)),
             )
 
     def set_recovery_enabled(self, employee_id: str, enabled: bool) -> None:

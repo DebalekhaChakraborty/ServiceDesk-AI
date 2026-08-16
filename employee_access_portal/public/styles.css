@@ -367,3 +367,100 @@ body.page--auth {
   .card--auth { padding: 34px 24px 28px; }
   .welcome__title { font-size: 23px; }
 }
+
+/* ---------- ServiceDesk voice launcher ----------
+
+   A persistent corner control, not a sign-in fallback. It occupies the same
+   bottom-right slot the Dograh widget will claim, and removes itself the
+   moment that widget loads so the two never stack.
+
+   Everything here is in this stylesheet rather than inline: the page's CSP is
+   `style-src 'self'` before the voice widget is configured, and keeping the
+   launcher CSS external means it does not depend on the looser policy. */
+
+.launcher {
+  position: fixed;
+  right: 24px;
+  bottom: 24px;
+  z-index: 40;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 10px;
+  max-width: min(320px, calc(100vw - 48px));
+}
+
+.launcher[hidden] { display: none; }
+
+.launcher__caption,
+.launcher__status {
+  margin: 0;
+  padding: 10px 14px;
+  font-size: 13px;
+  line-height: 1.45;
+  text-align: right;
+  color: var(--text-muted);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+}
+
+.launcher__caption-title {
+  display: block;
+  font-weight: 600;
+  color: var(--text);
+}
+
+/* Empty until the bootstrap has something to say; an empty bubble would be a
+   floating blank card. */
+.launcher__status:empty { display: none; }
+
+.launcher__status--error { color: var(--danger); }
+
+.launcher__form { margin: 0; }
+
+.launcher__button {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  padding: 13px 20px;
+  font-family: inherit;
+  font-size: 15px;
+  font-weight: 600;
+  color: #fff;
+  background: var(--accent);
+  border: none;
+  border-radius: 999px;
+  box-shadow: var(--shadow);
+  cursor: pointer;
+  transition: background .15s ease, transform .15s ease;
+}
+
+.launcher__button:hover:not(:disabled) {
+  background: var(--accent-hover);
+  transform: translateY(-1px);
+}
+
+.launcher__button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
+}
+
+.launcher__button:disabled { opacity: .65; cursor: default; }
+
+.launcher__icon { width: 20px; height: 20px; flex: none; }
+
+@media (prefers-reduced-motion: reduce) {
+  .launcher__button { transition: none; }
+  .launcher__button:hover:not(:disabled) { transform: none; }
+}
+
+/* On a narrow screen the label would crowd the viewport, so the control
+   reduces to the icon and the caption is dropped entirely. */
+@media (max-width: 520px) {
+  .launcher { right: 16px; bottom: 16px; }
+  .launcher__caption { display: none; }
+  .launcher__label { display: none; }
+  .launcher__button { padding: 15px; }
+}

@@ -5,6 +5,9 @@ from __future__ import annotations
 import ipaddress
 import os
 from dataclasses import dataclass
+from pathlib import Path
+
+RUNTIME = Path(__file__).resolve().parents[1] / "runtime"
 
 # The ServiceDesk ADK app name. Discovered from the running server's /list-apps.
 DEFAULT_APP_NAME = "sd_chat"
@@ -29,6 +32,27 @@ def _env_bool(name: str, default: bool = False) -> bool:
     if raw is None:
         return default
     return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _runtime_value(env_name: str, file_name: str, default: str) -> str:
+    """Environment, then an ignored runtime file, then the safe default.
+
+    The bind address needs this as much as the credentials do. Loopback is the
+    right DEFAULT, but it is the wrong value for this deployment: the Dograh and
+    portal containers reach the gateway over a Docker bridge, and a gateway that
+    silently comes up on 127.0.0.1 is invisible to both. Keeping the address in
+    the same ignored runtime directory as everything else means one documented
+    command starts a reachable gateway.
+    """
+    value = os.getenv(env_name, "").strip()
+    if value:
+        return value
+    path = RUNTIME / file_name
+    if path.exists():
+        found = path.read_text().strip()
+        if found:
+            return found
+    return default
 
 
 @dataclass(frozen=True)
@@ -83,8 +107,8 @@ def load_settings() -> Settings:
         # Default is loopback. For the Dograh container to reach the gateway this
         # is set to the VERIFIED docker bridge gateway address (see README).
         # app.py refuses to start on anything non-private.
-        host=os.getenv("VOICE_GATEWAY_HOST", "127.0.0.1"),
-        port=int(os.getenv("VOICE_GATEWAY_PORT", "8010")),
+        host=_runtime_value("VOICE_GATEWAY_HOST", ".voice_gateway_host", "127.0.0.1"),
+        port=int(_runtime_value("VOICE_GATEWAY_PORT", ".voice_gateway_port", "8010")),
         servicedesk_base_url=os.getenv(
             "SERVICEDESK_BASE_URL", "http://127.0.0.1:8000"
         ).rstrip("/"),

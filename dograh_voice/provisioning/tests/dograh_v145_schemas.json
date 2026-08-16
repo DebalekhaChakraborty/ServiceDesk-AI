@@ -1,0 +1,51 @@
+{
+  "_note": "Pinned excerpt of the LIVE Dograh v1.45.0 /api/v1/openapi.json. Captured to prove the native workflow-run endpoint cannot carry initial_context, which is why the developer bootstrap drives /public/embed/init instead.",
+  "components": {
+    "schemas": {
+      "CreateWorkflowRunRequest": {
+        "properties": {
+          "mode": {
+            "type": "string",
+            "title": "Mode"
+          },
+          "name": {
+            "type": "string",
+            "title": "Name"
+          }
+        },
+        "type": "object",
+        "required": [
+          "mode",
+          "name"
+        ],
+        "title": "CreateWorkflowRunRequest"
+      },
+      "InitEmbedRequest": {
+        "properties": {
+          "token": {
+            "type": "string",
+            "title": "Token"
+          },
+          "context_variables": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Context Variables"
+          }
+        },
+        "type": "object",
+        "required": [
+          "token"
+        ],
+        "title": "InitEmbedRequest",
+        "description": "Request model for initializing an embed session"
+      }
+    }
+  }
+}

@@ -170,3 +170,151 @@ test('a short signing secret is refused at boot', () => {
     /at least 32 characters/,
   );
 });
+
+/**
+ * The widget builds its script URL from the JSON that /voice/session and
+ * /recovery/start return. A field the widget reads but the route omits does not
+ * throw — it interpolates the string "undefined" into the URL and the voice
+ * channel dies with no server-side error at all. So the contract is asserted
+ * from the consumer's side: every `data.X` the bootstrap reads must be a key
+ * the route actually sends.
+ */
+function fieldsReadByWidget(source) {
+  const code = require('node:fs').readFileSync(
+    require('node:path').join(__dirname, '..', 'public', source), 'utf8');
+  return [...new Set([...code.matchAll(/\bdata\.(\w+)/g)].map((m) => m[1]))].sort();
+}
+
+test('authenticated /voice/session returns every field its widget reads', () => {
+  const routeSource = require('node:fs').readFileSync(
+    require('node:path').join(__dirname, '..', 'src', 'routes', 'voice.js'), 'utf8');
+  for (const field of fieldsReadByWidget('voice-widget.js')) {
+    assert.match(routeSource, new RegExp(`\\b${field}\\s*:`),
+      `/voice/session must return ${field}, which voice-widget.js reads`);
+  }
+});
+
+test('public /recovery/start returns every field its widget reads', () => {
+  const routeSource = require('node:fs').readFileSync(
+    require('node:path').join(__dirname, '..', 'src', 'routes', 'recovery.js'), 'utf8');
+  for (const field of fieldsReadByWidget('recovery-widget.js')) {
+    assert.match(routeSource, new RegExp(`\\b${field}\\s*:`),
+      `/recovery/start must return ${field}, which recovery-widget.js reads`);
+  }
+});
+
+/**
+ * ServiceDesk Voice on the SIGN-IN page.
+ *
+ * The caller often cannot sign in, so the sign-in page is where they are
+ * standing when they need this. These tests pin the two properties that make
+ * putting it on a public page safe: it is only rendered when voice is actually
+ * configured, and it ships no third-party script to a passive visitor.
+ */
+test('the landing page offers ServiceDesk voice when voice is configured', async () => {
+  const res = await request(appFor(VOICE_ENV)).get('/').expect(200);
+  assert.match(res.text, /Talk to ServiceDesk/);
+  assert.match(res.text, /recovery-widget\.js/);
+  assert.match(res.text, /Sign in with Microsoft/);      // primary path intact
+});
+
+test('the landing page hides ServiceDesk voice when voice is not configured', async () => {
+  const res = await request(appFor(BASE_ENV)).get('/').expect(200);
+  assert.doesNotMatch(res.text, /Talk to ServiceDesk/);
+  assert.doesNotMatch(res.text, /recovery-widget\.js/);
+  assert.match(res.text, /Sign in with Microsoft/);
+});
+
+/**
+ * The external entry is a Service Desk line, not a password-reset feature.
+ *
+ * Labelling it "recover my account" told every caller with a VPN or printer
+ * problem that they were in the wrong place, and told the ones who stayed that
+ * the only thing on offer was a password. The copy must name the Service Desk
+ * and must not narrow the offer to account recovery.
+ */
+test('the landing page does not present the voice line as account recovery only', async () => {
+  const res = await request(appFor(VOICE_ENV)).get('/').expect(200);
+  assert.doesNotMatch(res.text, /Recover my account/i);
+  assert.doesNotMatch(res.text, /password/i);
+  // ...and it still says the line works for someone who is locked out.
+  assert.match(res.text, /can't sign in/i);
+});
+
+/**
+ * The launcher lives OUTSIDE the sign-in card.
+ *
+ * Inside it, the voice entry read as one more way to sign in — a fallback
+ * credential flow — which is the framing 7.6 exists to remove. Position is the
+ * argument here, so it is asserted rather than left to a later tidy-up moving
+ * it back.
+ */
+test('the voice launcher is a corner control, not part of the sign-in card', async () => {
+  const res = await request(appFor(VOICE_ENV)).get('/').expect(200);
+
+  const cardEnd = res.text.indexOf('</main>');
+  const launcherAt = res.text.indexOf('id="voice-launcher"');
+  assert.ok(launcherAt > -1, 'the launcher must be rendered');
+  assert.ok(launcherAt > cardEnd,
+    'the launcher must sit outside the sign-in card, not inside it');
+
+  // Sign-in remains the card's single call to action.
+  const card = res.text.slice(0, cardEnd);
+  assert.match(card, /Sign in with Microsoft/);
+  assert.doesNotMatch(card, /ServiceDesk/);
+});
+
+test('the launcher keeps the markup contract recovery-widget.js depends on', () => {
+  // The bootstrap looks these up by id. A rename here fails silently in the
+  // browser — the button simply stops working — so it is pinned from the
+  // consumer's side, the same way the JSON field contract is above.
+  const view = require('node:fs').readFileSync(
+    require('node:path').join(__dirname, '..', 'src', 'views', 'landing.js'), 'utf8');
+  const bootstrap = require('node:fs').readFileSync(
+    require('node:path').join(__dirname, '..', 'public', 'recovery-widget.js'), 'utf8');
+
+  for (const id of [...bootstrap.matchAll(/getElementById\('([\w-]+)'\)/g)].map((m) => m[1])) {
+    assert.match(view, new RegExp(`id="${id}"`),
+      `landing.js must render #${id}, which recovery-widget.js looks up`);
+  }
+});
+
+test('the launcher styles ship in the same-origin stylesheet, not inline', async () => {
+  // `style-src` is 'self' until voice is configured, and the launcher must not
+  // depend on the looser policy that arrives with the widget.
+  const res = await request(appFor(VOICE_ENV)).get('/').expect(200);
+  assert.doesNotMatch(res.text, /<style/i);
+  assert.doesNotMatch(res.text, /\sstyle="/i);
+
+  const css = require('node:fs').readFileSync(
+    require('node:path').join(__dirname, '..', 'public', 'styles.css'), 'utf8');
+  assert.match(css, /\.launcher\b/);
+  assert.match(css, /position:\s*fixed/);
+});
+
+test('the sign-in page loads no third-party script until the button is pressed', async () => {
+  const res = await request(appFor(VOICE_ENV)).get('/').expect(200);
+  // Only the same-origin bootstrap is referenced; the Dograh widget is injected
+  // by that script on click, so a passive visitor fetches nothing from Dograh.
+  assert.doesNotMatch(res.text, /localhost:3010/);
+  assert.doesNotMatch(res.text, /dograh-widget\.js/);
+});
+
+test('the landing page asks for no identifier and leaks no secret', async () => {
+  const res = await request(appFor(VOICE_ENV)).get('/').expect(200);
+  // No input field: the endpoint accepts no identifier, so the page offers none.
+  assert.doesNotMatch(res.text, /<input[^>]+name=["'](employee|upn|email|user)/i);
+  for (const secret of [
+    VOICE_ENV.VOICE_IDENTITY_SIGNING_SECRET,
+    VOICE_ENV.DOGRAH_EMBED_TOKEN,
+    VOICE_ENV.ENTRA_PORTAL_CLIENT_SECRET,
+  ]) {
+    assert.equal(res.text.includes(secret), false);
+  }
+});
+
+test('the removed developer page is gone', async () => {
+  await request(appFor({ ...VOICE_ENV, VOICE_DOGRAH_RECOVERY_TEST_MODE: 'true' }))
+    .get('/dev/recovery-test')
+    .expect(404);
+});

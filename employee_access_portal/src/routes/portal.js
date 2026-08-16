@@ -19,7 +19,7 @@ function portalRoutes({ config, sessions }) {
     if (sessions.getSession(req)) {
       return res.redirect(302, '/workspace');
     }
-    return sendHtml(res, 200, landingPage());
+    return sendHtml(res, 200, landingPage({ voiceEnabled: Boolean(config?.voice?.enabled) }));
   });
 
   // Protected workspace.

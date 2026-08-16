@@ -46,8 +46,8 @@ function enrollPage({
     body += `<p class="voice__status voice__status--error">Recovery enrollment is not available.</p>`;
   } else if (confirmed) {
     body += `<p class="voice__status"><strong>Enrollment is ACTIVE.</strong> If you ever lose access to
-      your account, you can recover by voice: give your employee ID, then approve a Duo Push
-      or speak a passcode from Duo Mobile.</p>`;
+      your account, you can recover by voice: give your employee ID, then verify using an
+      available Duo verification method.</p>`;
   } else if (activationCode) {
     body += `
     <p class="verify__note">Open <strong>Duo Mobile</strong>, add an account, and scan this code.
@@ -87,29 +87,31 @@ function enrollPage({
 }
 
 /**
- * Public recovery entry. Reachable without a session by necessity: a disabled
- * employee cannot sign in.
+ * Public ServiceDesk Voice entry. Reachable without a session by necessity: an
+ * employee who is locked out cannot sign in to ask for help.
  *
- * Nothing identifying is typed here. The caller states an employee ID by voice,
- * which is what stops this page being probed to learn who is enrolled.
+ * Deliberately not framed as password reset. Whatever the caller needs — VPN, a
+ * printer, software, an incident, a locked account — they say it on the call.
+ * Nothing identifying is typed here, which is what stops this page being probed
+ * to learn who is enrolled; identity is proven by Duo, by voice.
  */
 function recoveryPage({ unavailable }) {
   const body = `<main class="shell">
   <section class="welcome">
-    <h1 class="welcome__title">Account Recovery</h1>
+    <h1 class="welcome__title">Talk to ServiceDesk</h1>
     ${unavailable
-      ? '<p class="voice__status voice__status--error">Account recovery is not available.</p>'
-      : `<p class="verify__note">Start a recovery call, then give your employee ID when asked.
-         You will verify with Duo - either by approving a push notification, or by speaking a
-         passcode from Duo Mobile.</p>
+      ? '<p class="voice__status voice__status--error">ServiceDesk voice is not available.</p>'
+      : `<p class="verify__note">Start a call and tell us what you need help with. Because you're
+         not signed in, we'll verify who you are with Duo before the Service Desk acts on your
+         account.</p>
     <form id="recovery-form">
-      <button class="button button--primary" type="submit" id="recovery-start">Start recovery call</button>
+      <button class="button button--primary" type="submit" id="recovery-start">Talk to ServiceDesk</button>
     </form>
     <p class="voice__status" id="voice-status" role="status" aria-live="polite"></p>
     <script src="/recovery-widget.js" defer></script>`}
   </section>
 </main>`;
-  return layout({ title: 'Account Recovery', body, bodyClass: 'page--app' });
+  return layout({ title: 'Talk to ServiceDesk', body, bodyClass: 'page--app' });
 }
 
 module.exports = { enrollPage, recoveryPage };
