@@ -1,0 +1,9 @@
+{
+  "corpus_display_name": "Service_Desk",
+  "gcs_prefix": "gs://cloud-ai-platform-e62fd391-e8ed-4b33-b3e3-af9f9cde9851/servicedesk-gcp-vdi-poc",
+  "note": "sha256 of each document as last synced into the corpus. Regenerate with: python scripts/sync_rag_corpus.py --apply",
+  "documents": {
+    "docs/gcp_virtual_desktop_login_demo_sop.md": "62382159ea72b29e822d508885e3e34d708b51440c2924570da4680c4cebd0c1",
+    "docs/gcp_virtual_desktop_performance_demo_sop.md": "de33e1f221dbe9fda134b5d492919261f187e18be6635e78485c279e772bf478"
+  }
+}
