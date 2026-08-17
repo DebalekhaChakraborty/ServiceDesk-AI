@@ -1,0 +1,39 @@
+# Restart Windows Update Service (wuauserv)
+
+**KB ID:** 1025-WUAUSERV-RESTART  
+**Title:** Restart Windows Update Service (wuauserv)  
+**Affected Service:** Windows Server / Workstation Update Agent  
+**Category:** Infrastructure → Operating System  
+**Last Updated:** 2025-11-09
+
+---
+
+## 🧠 Problem Description
+
+Windows Update can hang or become unresponsive, causing patching to stall or never start.
+
+### Common Symptoms
+- Windows Update stuck on “Checking for updates…”
+- Pending updates never install
+- Update scans do not trigger
+- Event logs reference **wuauserv**
+
+**Keywords:** `windows`, `update`, `wuauserv`, `patching`, `wuauclt`
+
+---
+
+## 🧩 Root Cause
+
+The **Windows Update Service (wuauserv)** is stopped, hung, or in a bad state (often after long patch cycles or cache issues).
+
+---
+
+## 🧰 Manual Resolution (Reference for Admins)
+
+1. Open **Command Prompt** as Administrator.  
+2. Stop the Windows Update Service:  
+   ```cmd
+   	net stop wuauserv
+3. Start the Windows Update Service:
+   ```cmd
+	net start wuauserv

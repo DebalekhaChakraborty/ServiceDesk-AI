@@ -90,6 +90,58 @@ def test_sync_script_declares_the_same_documents_as_the_manifest():
     )
 
 
+def test_recovered_articles_are_backed_up_and_unchanged():
+    """The four KB articles that had no source copy anywhere.
+
+    They were direct-uploaded to Vertex in 2025-2026: no GCS source, no repo
+    copy, no git history, and no content API to read them back. The corpus was
+    the only copy, so deleting an entry would have destroyed the article that
+    grounds password reset or privileged Windows remediation.
+    """
+    recovered = json.loads(MANIFEST_PATH.read_text(encoding="utf-8"))[
+        "recovered_not_synced"
+    ]
+
+    assert recovered, "no recovered articles are being backed up"
+    changed = []
+    for relative_path, digest in recovered.items():
+        path = REPO_ROOT / relative_path
+        assert path.is_file(), (
+            f"{relative_path} is the only backup of a corpus-only article and "
+            "it is missing from the repo."
+        )
+        if _sha256(path) != digest:
+            changed.append(relative_path)
+
+    assert not changed, (
+        "Recovered articles changed without the manifest being regenerated: "
+        f"{', '.join(sorted(changed))}. These are backups of corpus content — "
+        "if you meant to edit the served article, verify it first and promote "
+        "it into SYNCED_DOCS."
+    )
+
+
+def test_recovered_articles_are_never_auto_synced():
+    """The interlock: --apply must not push an unverified reconstruction.
+
+    --apply deletes a corpus entry before re-importing it. Syncing a
+    reconstruction that lost anything would destroy the authoritative copy and
+    replace it with the lossy one, with no way back.
+    """
+    source = SYNC_SCRIPT.read_text(encoding="utf-8")
+    manifest = json.loads(MANIFEST_PATH.read_text(encoding="utf-8"))
+
+    synced = set(manifest["documents"])
+    recovered = set(manifest["recovered_not_synced"])
+
+    assert not (synced & recovered), (
+        "a recovered, unverified article is listed as synced: "
+        f"{', '.join(sorted(synced & recovered))}"
+    )
+    # The script must also refuse at runtime, not merely by list hygiene.
+    assert "refusing to sync unverified reconstructions" in source
+
+
 @pytest.mark.skipif(
     not os.getenv("RAG_LIVE_CHECK"),
     reason="live corpus check; set RAG_LIVE_CHECK=1 with GCP credentials",

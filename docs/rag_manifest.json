@@ -1,9 +1,16 @@
 {
   "corpus_display_name": "Service_Desk",
   "gcs_prefix": "gs://cloud-ai-platform-e62fd391-e8ed-4b33-b3e3-af9f9cde9851/servicedesk-gcp-vdi-poc",
-  "note": "sha256 of each document as last synced into the corpus. Regenerate with: python scripts/sync_rag_corpus.py --apply",
+  "note": "documents: sha256 as last synced into the corpus. Regenerate with: python scripts/sync_rag_corpus.py --apply",
+  "recovered_note": "recovered_not_synced: articles reconstructed FROM the corpus because no source copy existed. Backed up and reviewable here, but never uploaded - --apply would delete the authoritative entry and replace it with an unverified reconstruction. Promote to SYNCED_DOCS only after human verification.",
   "documents": {
     "docs/gcp_virtual_desktop_login_demo_sop.md": "62382159ea72b29e822d508885e3e34d708b51440c2924570da4680c4cebd0c1",
     "docs/gcp_virtual_desktop_performance_demo_sop.md": "de33e1f221dbe9fda134b5d492919261f187e18be6635e78485c279e772bf478"
+  },
+  "recovered_not_synced": {
+    "docs/kb/AAD_PASSWORD_RESET.md": "f48e96eb3bfdd4a8ed930132f8dae43d7c4445ab3a09e170855aa7827cb47a0d",
+    "docs/kb/WINDOWS_SOFTWARE_INSTALLATION.txt": "4de8c6faa3333c4bdd2221b7b4adbaa02b3f19945496b1960336d930c6383945",
+    "docs/kb/WINDOWS_TIME_DESYNC_FIX.md": "11722f4d18ea92ecd0d97f78fb9bb07b55c05c5c85ff8dc08897c8b287f745c4",
+    "docs/kb/WINDOWS_UPDATE_SERVICE_FIX.txt": "9aa63dd77604e13a11b6d5cd4d25db05eea73f41f25a4531acaa535c3d817642"
   }
 }

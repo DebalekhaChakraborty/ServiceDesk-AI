@@ -49,14 +49,32 @@ SYNCED_DOCS: List[str] = [
     "docs/gcp_virtual_desktop_performance_demo_sop.md",
 ]
 
+# Articles recovered FROM the corpus rather than authored here. They were
+# direct-uploaded in 2025-2026 with no GCS source and no repository copy, so the
+# corpus was their only copy and Vertex exposes no content API to get them back —
+# these were reconstructed from retrieval.
+#
+# They are deliberately NOT in SYNCED_DOCS. --apply deletes an entry before
+# re-importing it, so syncing an unverified reconstruction would destroy the
+# authoritative copy and replace it with a possibly-lossy one. They are tracked
+# here purely so a backup exists and any change to them is reviewable. Promote a
+# file into SYNCED_DOCS only after a human has confirmed it matches the article
+# that should be served.
+RECOVERED_DOCS: List[str] = [
+    "docs/kb/AAD_PASSWORD_RESET.md",
+    "docs/kb/WINDOWS_SOFTWARE_INSTALLATION.txt",
+    "docs/kb/WINDOWS_TIME_DESYNC_FIX.md",
+    "docs/kb/WINDOWS_UPDATE_SERVICE_FIX.txt",
+]
+
 
 def sha256_of(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def local_digests() -> Dict[str, str]:
+def local_digests(paths: List[str]) -> Dict[str, str]:
     digests = {}
-    for rel in SYNCED_DOCS:
+    for rel in paths:
         path = REPO_ROOT / rel
         if not path.is_file():
             raise SystemExit(f"missing document: {rel}")
@@ -75,6 +93,17 @@ def load_manifest() -> Dict[str, str]:
     return documents if isinstance(documents, dict) else {}
 
 
+def load_recovered() -> Dict[str, str]:
+    if not MANIFEST_PATH.is_file():
+        return {}
+    try:
+        data = json.loads(MANIFEST_PATH.read_text(encoding="utf-8"))
+    except ValueError:
+        return {}
+    recovered = data.get("recovered_not_synced")
+    return recovered if isinstance(recovered, dict) else {}
+
+
 def write_manifest(digests: Dict[str, str]) -> None:
     MANIFEST_PATH.write_text(
         json.dumps(
@@ -82,10 +111,20 @@ def write_manifest(digests: Dict[str, str]) -> None:
                 "corpus_display_name": CORPUS_DISPLAY_NAME,
                 "gcs_prefix": GCS_PREFIX,
                 "note": (
-                    "sha256 of each document as last synced into the corpus. "
+                    "documents: sha256 as last synced into the corpus. "
                     "Regenerate with: python scripts/sync_rag_corpus.py --apply"
                 ),
+                "recovered_note": (
+                    "recovered_not_synced: articles reconstructed FROM the corpus "
+                    "because no source copy existed. Backed up and reviewable here, "
+                    "but never uploaded - --apply would delete the authoritative "
+                    "entry and replace it with an unverified reconstruction. "
+                    "Promote to SYNCED_DOCS only after human verification."
+                ),
                 "documents": dict(sorted(digests.items())),
+                "recovered_not_synced": dict(
+                    sorted(local_digests(RECOVERED_DOCS).items())
+                ),
             },
             indent=2,
         )
@@ -183,9 +222,16 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    digests = local_digests()
+    digests = local_digests(SYNCED_DOCS)
     if args.check:
         return report_drift(digests, load_manifest())
+
+    overlap = set(SYNCED_DOCS) & set(RECOVERED_DOCS)
+    if overlap:
+        raise SystemExit(
+            "refusing to sync unverified reconstructions: "
+            + ", ".join(sorted(overlap))
+        )
     return apply_sync(digests)
 
 

@@ -1,0 +1,66 @@
+# SOP: Software Installation on User Request (Windows)
+
+## Purpose
+
+This SOP defines the approved software applications that can be installed
+on user endpoints via the Intelligent Service Desk Agent using
+enterprise-approved silent installers (MSI / EXE).
+
+Only software listed here is permitted for automated installation.
+
+---
+
+## Preconditions
+
+* Target device must be:
+
+  * Windows OS
+  * Domain-joined / Entra-registered
+  * Reachable via WinRM
+* Requestor must have L1+ authorization
+* Software must be listed in the Approved Software Installation Catalog below
+
+---
+
+## Approved Software Installation Catalog
+
+| User Request (Examples) | Approved Software Name | Installer Type | Installer URL                                                                                                                                                                                                                                                                    | Silent Install Arguments | Verification Method                           |
+| ----------------------- | ---------------------- | -------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------ | --------------------------------------------- |
+| "install 7-zip"         | 7-Zip                  | MSI            | [https://www.7-zip.org/a/7z2301-x64.msi](https://www.7-zip.org/a/7z2301-x64.msi)                                                                                                                                                                                                 | /qn /norestart           | EXE: C:\Program Files\7-Zip\7zFM.exe          |
+| "install chrome"        | Google Chrome          | MSI            | [https://dl.google.com/tag/s/appguid%3D%7B8A69D345-D564-463C-AFF1-A69D9E530F96%7D/chrome/install/googlechromestandaloneenterprise64.msi](https://dl.google.com/tag/s/appguid%3D%7B8A69D345-D564-463C-AFF1-A69D9E530F96%7D/chrome/install/googlechromestandaloneenterprise64.msi) | /qn /norestart           | DisplayName: Google Chrome                    |
+| "install google chrome" | Google Chrome          | MSI            | [https://dl.google.com/tag/s/appguid%3D%7B8A69D345-D564-463C-AFF1-A69D9E530F96%7D/chrome/install/googlechromestandaloneenterprise64.msi](https://dl.google.com/tag/s/appguid%3D%7B8A69D345-D564-463C-AFF1-A69D9E530F96%7D/chrome/install/googlechromestandaloneenterprise64.msi) | /qn /norestart           | DisplayName: Google Chrome                    |
+| "install notepad++"     | Notepad++              | EXE            | [https://github.com/notepad-plus-plus/notepad-plus-plus/releases/latest/download/npp.x64.Installer.exe](https://github.com/notepad-plus-plus/notepad-plus-plus/releases/latest/download/npp.x64.Installer.exe)                                                                   | /S                       | EXE: C:\Program Files\Notepad++\notepad++.exe |
+
+> NOTE:
+>
+> * The agent must map the user request to an approved entry in this catalog.
+> * Installer URL, type, and silent arguments must be taken strictly from this SOP.
+> * If no matching entry exists, the request must be rejected and routed for manual approval.
+
+---
+
+## Execution Steps
+
+1. Identify the target device associated with the user
+2. Match the user request to an approved software entry in the catalog
+3. Validate preconditions using the checklist policy
+4. Download the approved installer (MSI / EXE)
+5. Execute silent installation using the defined arguments
+6. Verify installation using the defined verification method
+7. Confirm success to the user or raise an incident on failure
+
+---
+
+## Error Handling
+
+* If installer download fails → raise ServiceNow incident
+* If silent installation fails → attach logs and raise ServiceNow incident
+* If software is not listed in the catalog → deny request with explanation
+
+---
+
+## Audit & Compliance
+
+* All installation attempts are logged
+* SOP version, installer URL, and execution outcome must be recorded
+* Manual intervention events must be tracked via ServiceNow
