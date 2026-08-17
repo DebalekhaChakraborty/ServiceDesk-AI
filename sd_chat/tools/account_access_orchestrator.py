@@ -73,6 +73,31 @@ _SIGN_IN_INVESTIGATION_NEXT_STEP = {
     ),
 }
 
+# The SAME Graph ambiguity (enabled, lock state unknown) means something
+# different depending on when it is read. During an INITIAL diagnosis nothing
+# about the caller's problem is known yet, so asking which application/system
+# is the only way to get evidence. Read as a POST-REMEDIATION recheck, the
+# application/system and symptom were already established before the action
+# ran - re-asking for them would discard information the conversation already
+# has. This second next_step exists so that distinction is decided once, here,
+# deterministically, rather than left for the agent to infer from prose.
+_RETRY_ORIGINAL_REQUEST_NEXT_STEP = {
+    "kind": "retry_original_request",
+    "guidance": (
+        "The account is enabled and current lock state could not be "
+        "independently confirmed. The application/system and symptom are "
+        "already known from earlier in this conversation - do not ask which "
+        "application or system is affected. State that the action completed "
+        "and ask the caller to retry the original request against the "
+        "already-known system."
+    ),
+}
+
+# Contexts _diagnose_verified_target may run under. Not a security boundary -
+# it changes only which next_step accompanies an identical account snapshot.
+INITIAL_DIAGNOSIS_CONTEXT = "initial_diagnosis"
+POST_REMEDIATION_CONTEXT = "post_remediation_verification"
+
 
 def _norm_upn(value: Any) -> str:
     return str(value or "").strip().lower()
@@ -567,16 +592,29 @@ def _new_offer(
     return offer
 
 
-def _next_step(account: Dict[str, Any]) -> Optional[Dict[str, str]]:
-    """Return a deterministic non-remediation next step when no action is safe."""
-    if account.get("recommended_action") == "investigate_sign_in":
-        return dict(_SIGN_IN_INVESTIGATION_NEXT_STEP)
-    return None
+def _next_step(
+    account: Dict[str, Any],
+    *,
+    context: str,
+) -> Optional[Dict[str, str]]:
+    """Return a deterministic non-remediation next step when no action is safe.
+
+    `context` is the one thing that decides which next_step accompanies the
+    same "enabled, lock state unknown" snapshot - never the agent's own
+    reading of the conversation. See POST_REMEDIATION_CONTEXT above.
+    """
+    if account.get("recommended_action") != "investigate_sign_in":
+        return None
+    if context == POST_REMEDIATION_CONTEXT:
+        return dict(_RETRY_ORIGINAL_REQUEST_NEXT_STEP)
+    return dict(_SIGN_IN_INVESTIGATION_NEXT_STEP)
 
 
 def _diagnose_verified_target(
     target_upn: str,
     tool_context: ToolContext,
+    *,
+    context: str = INITIAL_DIAGNOSIS_CONTEXT,
 ) -> Dict[str, Any]:
     state = _state(tool_context)
     verification_result = _verify_identity(tool_context, target_upn)
@@ -596,7 +634,7 @@ def _diagnose_verified_target(
         verification,
         getattr(tool_context, "invocation_id", None),
     )
-    next_step = _next_step(status["account"])
+    next_step = _next_step(status["account"], context=context)
     return {
         "status": "ok",
         "account": status["account"],
@@ -611,6 +649,7 @@ def _diagnose_verified_target(
             else None
         ),
         "next_step": next_step,
+        "diagnosis_context": context,
     }
 
 
@@ -791,9 +830,14 @@ def _execute_exact_action(
         "sop": planned["sop"],
     }
     if recheck_after and action_id in {"ad.enable_account", "ad.unlock_account"}:
+        # POST_REMEDIATION_CONTEXT, not the default: this recheck follows a
+        # successful action, so an unresolved "investigate_sign_in" reading
+        # here must not produce the generic initial-diagnosis question - see
+        # _RETRY_ORIGINAL_REQUEST_NEXT_STEP.
         response["post_action_status"] = _diagnose_verified_target(
             target_upn,
             tool_context,
+            context=POST_REMEDIATION_CONTEXT,
         )
         if response["post_action_status"].get("status") != "ok":
             response["status"] = "error"

@@ -765,6 +765,257 @@ def test_successful_cleanup_reports_success_even_when_fresh_rtt_stays_elevated(
     assert result["cleanup"]["action"] == "System File Cleanup"
 
 
+# ===========================================================================
+# Reclaimed-space formatting: deterministic KB/MB/GB, never fabricated
+# ===========================================================================
+
+@pytest.mark.parametrize(
+    "num_bytes,expected",
+    [
+        (None, None),
+        (0, "0 bytes"),
+        (512, "512 bytes"),
+        (1024, "1.00 KB"),
+        (3624, "3.54 KB"),
+        (1024 * 1024, "1.00 MB"),
+        (1024 * 1024 * 1024, "1.00 GB"),
+        (3 * 1024 ** 3 + 200 * 1024 ** 2, "3.20 GB"),
+        (-2048, "-2.00 KB"),
+    ],
+)
+def test_format_bytes_picks_the_real_magnitude_never_a_fabricated_unit(
+    num_bytes, expected
+):
+    assert gcp_tool._format_bytes(num_bytes) == expected
+
+
+def test_cleanup_result_public_adds_display_string_only_when_bytes_present():
+    with_bytes = gcp_tool._cleanup_result_public(
+        {"status": "ok", "bytes_reclaimed": 3624}
+    )
+    assert with_bytes["bytes_reclaimed"] == 3624
+    assert with_bytes["bytes_reclaimed_display"] == "3.54 KB"
+
+    without_bytes = gcp_tool._cleanup_result_public({"status": "ok"})
+    assert "bytes_reclaimed" not in without_bytes
+    assert "bytes_reclaimed_display" not in without_bytes
+
+
+def test_successful_cleanup_response_includes_display_string_for_a_large_reclaim(
+    monkeypatch,
+):
+    """A genuinely large reclaim must show in GB, not stay pinned to KB."""
+    context = _offer_context()
+    monkeypatch.setenv("GCP_VDI_DEMO_SCENARIO", "delay_above_200")
+    _performance(context)
+    context.invocation_id = "confirm-turn"
+    monkeypatch.setattr(gcp_tool, "_check_list", Mock(return_value={"status": "ok", "details": {}}))
+    monkeypatch.setattr(
+        gcp_tool,
+        "execute_system_file_cleanup",
+        Mock(return_value={
+            "status": "ok", "backend": "demo",
+            "bytes_reclaimed": 3 * 1024 ** 3,  # 3 GB, genuinely large
+        }),
+    )
+
+    result = _cleanup(context)
+
+    assert result["cleanup"]["bytes_reclaimed_display"] == "3.00 GB"
+    # Not hardcoded: a different real value produces a different real string.
+    assert "KB" not in result["cleanup"]["bytes_reclaimed_display"]
+    # This field exists on the controller result either way; the chat
+    # message itself is a separate, instruction-driven decision - see
+    # test_agent_instruction_omits_reclaimed_size_from_the_chat_breakdown.
+
+
+def test_agent_instruction_omits_reclaimed_size_from_the_chat_breakdown():
+    """bytes_reclaimed_display is real, correct data on the controller result
+    (tested above) - but the completion chat message must not show it."""
+    instruction = " ".join(sd_chat.instruction.split())
+    assert (
+        "Do NOT include a reclaimed-space figure (bytes, KB, MB, or GB) in"
+        " this breakdown" in instruction
+    )
+    assert (
+        'Report only status and item counts per category (e.g. "158 items'
+        in instruction
+    )
+    # The on-request carve-out (matching the existing RTT-on-request pattern)
+    # still lets the model answer truthfully if asked directly.
+    assert (
+        "If the user separately asks how much space was freed, answer using"
+        " response.cleanup.bytes_reclaimed_display verbatim" in instruction
+    )
+
+
+# ===========================================================================
+# Refresh note: truthful, disk-only addendum - never a network claim
+# ===========================================================================
+
+def test_refresh_note_is_disk_scoped_and_never_mentions_network():
+    note = gcp_tool.GCP_VDI_CLEANUP_REFRESH_NOTE
+    lowered = note.lower()
+    for forbidden in ("network", "connectivity", "rtt", "latency", "connection"):
+        assert forbidden not in lowered, forbidden
+    assert "temporary system files" in lowered
+
+
+def test_successful_cleanup_response_includes_the_refresh_note(monkeypatch):
+    context = _offer_context()
+    monkeypatch.setenv("GCP_VDI_DEMO_SCENARIO", "delay_above_200")
+    _performance(context)
+    context.invocation_id = "confirm-turn"
+    monkeypatch.setattr(gcp_tool, "_check_list", Mock(return_value={"status": "ok", "details": {}}))
+    monkeypatch.setattr(
+        gcp_tool, "execute_system_file_cleanup",
+        Mock(return_value={"status": "ok", "backend": "demo"}),
+    )
+
+    result = _cleanup(context)
+
+    assert result["refresh_note"] == gcp_tool.GCP_VDI_CLEANUP_REFRESH_NOTE
+    # The pinned success message itself is untouched by the addendum.
+    assert result["message"] == gcp_tool.GCP_VDI_CLEANUP_SUCCESS_MESSAGE
+
+
+def test_agent_instruction_places_refresh_note_before_category_evidence_and_never_implies_network():
+    instruction = " ".join(sd_chat.instruction.split())
+    assert (
+        'also say exactly: "We\'ve refreshed your workstation\'s temporary system'
+        ' files."' in instruction
+    )
+    assert "never say or imply anything about network, connectivity, or rtt" in instruction.lower()
+
+
+# ===========================================================================
+# System snapshot: always shown, neutral, no verdict, no fabrication
+# ===========================================================================
+
+def test_snapshot_omits_unavailable_fields_rather_than_inventing_them():
+    post = {
+        "diagnosis": {
+            "metrics": {
+                "rdp_tcp_rtt_ms": {"status": "available", "value": 201.4},
+                "cpu": {"status": "unavailable", "value": None},
+            }
+        }
+    }
+    snapshot = gcp_tool._system_snapshot(post)
+    assert snapshot == {"rdp_tcp_rtt_ms": 201.0}
+
+
+def test_snapshot_formats_cpu_as_percent_and_uptime_as_hours_minutes():
+    post = {
+        "diagnosis": {
+            "metrics": {
+                "cpu": {"status": "available", "value": 0.1234},
+                "memory_percent_used": {"status": "available", "value": 58.4},
+                "disk_percent_used": {"status": "available", "value": 41.0},
+                "uptime_seconds": {"status": "available", "value": 11532},
+                "rdp_tcp_rtt_ms": {"status": "available", "value": 345.0},
+            }
+        }
+    }
+    snapshot = gcp_tool._system_snapshot(post)
+    assert snapshot == {
+        "cpu_percent": 12.3,
+        "memory_percent_used": 58.4,
+        "disk_percent_used": 41.0,
+        "uptime_display": "3h 12m",
+        "rdp_tcp_rtt_ms": 345.0,
+    }
+
+
+def test_snapshot_is_none_when_no_metrics_were_ever_collected():
+    assert gcp_tool._system_snapshot({"code": "GCP_VDI_POST_CLEANUP_EVIDENCE_UNAVAILABLE"}) is None
+    assert gcp_tool._system_snapshot({}) is None
+
+
+def test_successful_cleanup_response_carries_no_system_snapshot(monkeypatch):
+    """Deliberately NOT symmetric with the pre-cleanup offer: the completion
+    turn stays exactly the success message plus category evidence, nothing
+    measurement-shaped appended. post_cleanup_evidence_use (the full
+    verdict-bearing diagnosis) stays internal either way (still pinned
+    below)."""
+    context = _offer_context()
+    monkeypatch.setenv("GCP_VDI_DEMO_SCENARIO", "delay_above_200")
+    _performance(context)
+    context.invocation_id = "confirm-turn"
+    monkeypatch.setattr(gcp_tool, "_check_list", Mock(return_value={"status": "ok", "details": {}}))
+    monkeypatch.setattr(
+        gcp_tool, "execute_system_file_cleanup",
+        Mock(return_value={"status": "ok", "backend": "demo"}),
+    )
+
+    result = _cleanup(context)
+
+    assert "system_snapshot" not in result
+    assert result["post_cleanup_evidence_use"] == (
+        "internal_only_until_user_reports_persistence"
+    )
+
+
+def test_agent_instruction_forbids_a_snapshot_on_the_completion_turn():
+    instruction = " ".join(sd_chat.instruction.split())
+    assert (
+        "Do NOT add a system snapshot, metrics, or any measurement line to"
+        " this completion turn" in instruction
+    )
+    assert (
+        "unlike the initial diagnosis, this response ends with the close"
+        " sentence and nothing after it" in instruction
+    )
+
+
+# ===========================================================================
+# Pre-cleanup snapshot: the "before" reading on the initial offer only -
+# deliberately NOT repeated on the post-cleanup completion turn above.
+# ===========================================================================
+
+def test_initial_performance_diagnosis_carries_a_system_snapshot(monkeypatch):
+    monkeypatch.setenv("GCP_VDI_DEMO_SCENARIO", "delay_above_200")
+    result = _performance()
+
+    assert result["diagnosis"]["finding_code"] == "HIGH_SESSION_RTT"
+    assert result["cleanup_offer"] is not None
+    # Same shape/field names as the post-cleanup snapshot, same source value.
+    assert result["system_snapshot"]["rdp_tcp_rtt_ms"] == 201.0
+
+
+def test_snapshot_is_attached_even_when_no_cleanup_offer_exists(monkeypatch):
+    """A caller with no offer (e.g. RTT under threshold) still gets a
+    before-picture - system_snapshot is not conditioned on cleanup_offer."""
+    monkeypatch.setenv("GCP_VDI_DEMO_SCENARIO", "running_healthy")
+    result = _performance()
+
+    assert result["cleanup_offer"] is None
+    assert result["system_snapshot"] is not None
+    assert result["system_snapshot"]["cpu_percent"] == 24.0
+    assert result["system_snapshot"]["memory_percent_used"] == 48.0
+    assert result["system_snapshot"]["disk_percent_used"] == 37.0
+    assert result["system_snapshot"]["uptime_display"] == "1h 0m"
+
+
+def test_login_diagnosis_does_not_carry_a_system_snapshot():
+    """Scoped to performance: a login diagnosis has no RTT/CPU story to show."""
+    result = _login()
+    assert "system_snapshot" not in result
+
+
+def test_agent_instruction_shows_pre_cleanup_snapshot_regardless_of_offer():
+    instruction = " ".join(sd_chat.instruction.split())
+    assert (
+        "Every performance diagnosis response also carries system_snapshot"
+        in instruction
+    )
+    assert (
+        "present whether or not a cleanup_offer exists, so the caller has a"
+        ' "before" picture even when no remediation is offered' in instruction
+    )
+    assert "do not re-argue the threshold here" in instruction
+
+
 def test_cleanup_success_message_is_the_single_source_of_completion_wording():
     message = gcp_tool.GCP_VDI_CLEANUP_SUCCESS_MESSAGE
     assert message == (
