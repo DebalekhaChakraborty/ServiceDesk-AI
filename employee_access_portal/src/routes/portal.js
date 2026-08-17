@@ -7,7 +7,7 @@ const { workspacePage } = require('../views/workspace');
 /**
  * The employee-facing pages.
  */
-function portalRoutes({ sessions }) {
+function portalRoutes({ config, sessions }) {
   const router = express.Router();
 
   function sendHtml(res, status, html) {
@@ -19,7 +19,7 @@ function portalRoutes({ sessions }) {
     if (sessions.getSession(req)) {
       return res.redirect(302, '/workspace');
     }
-    return sendHtml(res, 200, landingPage());
+    return sendHtml(res, 200, landingPage({ voiceEnabled: Boolean(config?.voice?.enabled) }));
   });
 
   // Protected workspace.
@@ -36,7 +36,7 @@ function portalRoutes({ sessions }) {
     return sendHtml(
       res,
       200,
-      workspacePage({ session, csrfToken: session.csrf }),
+      workspacePage({ voiceEnabled: Boolean(config?.voice?.enabled), session, csrfToken: session.csrf }),
     );
   });
 

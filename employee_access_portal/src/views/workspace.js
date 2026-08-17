@@ -1,6 +1,7 @@
 'use strict';
 
 const { layout, escapeHtml } = require('./layout');
+const { authenticatedVoiceUi } = require('./voiceUi');
 
 const CHECK = `<svg class="status__icon" viewBox="0 0 20 20" aria-hidden="true" focusable="false">
 <circle cx="10" cy="10" r="9" fill="none" stroke="currentColor" stroke-width="1.5"/>
@@ -21,7 +22,7 @@ const TILES = [
  * issued. Nothing here is inferred, cached from a previous visit, or read from
  * local configuration: if the page renders, Entra authenticated this employee.
  */
-function workspacePage({ session, csrfToken }) {
+function workspacePage({ session, csrfToken, voiceEnabled = false }) {
   const tiles = TILES.map(
     (tile) => `      <article class="tile">
         <h3 class="tile__name">${escapeHtml(tile.name)}</h3>
@@ -64,6 +65,7 @@ ${tiles}
     </div>
   </section>
 
+
   <section class="verify">
     <form method="post" action="/auth/verify">
       <input type="hidden" name="csrf_token" value="${escapeHtml(csrfToken)}">
@@ -73,7 +75,7 @@ ${tiles}
       Re-checks your account directly with your organization's identity provider.
     </p>
   </section>
-</main>`;
+</main>${voiceEnabled ? authenticatedVoiceUi(csrfToken) : ''}`;
 
   return layout({ title: 'Enterprise Workspace', body, bodyClass: 'page--app' });
 }

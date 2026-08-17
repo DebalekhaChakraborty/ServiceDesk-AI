@@ -36,6 +36,28 @@ def _extract_persona_from_state(state: Dict[str, Any]) -> Optional[Dict[str, Any
     return None
 
 
+def _extract_interaction_context(state: Dict[str, Any]) -> Dict[str, Any]:
+    """Read the server-seeded interaction context, from the same places as persona.
+
+    Only ever read from session state, which is written by the trusted server at
+    session-creation time. There is no path by which a user message, a tool
+    argument or a model output reaches this.
+    """
+    for key in ("interaction_context", "user:interaction_context"):
+        value = state.get(key)
+        if isinstance(value, dict):
+            return value
+
+    session = state.get("session") or {}
+    if isinstance(session, dict):
+        session_state = session.get("state") or {}
+        if isinstance(session_state, dict):
+            value = session_state.get("interaction_context")
+            if isinstance(value, dict):
+                return value
+    return {}
+
+
 def _normalize_host(value: Any) -> Optional[str]:
     """
     Normalize host/device identifiers into a stable hostname token.
@@ -280,6 +302,52 @@ def ensure_identity_context_in_state(state: Dict[str, Any]) -> Dict[str, Any]:
     # 5) Store the normalized version in state for other tools / agent logic
     state["identity_context"] = identity
 
+    # -------------------------------------------------------------------------
+    # 5.1) Presentation-only interaction context
+    # -------------------------------------------------------------------------
+    # Seeded server-side when a session is created (today: the voice gateway,
+    # after Duo AND Graph have both passed). It answers exactly one question the
+    # model cannot otherwise know: has this person already been talking to us?
+    #
+    # A voice caller states their problem, is taken through identity
+    # verification, and only then does their ORIGINAL sentence arrive here as
+    # the first message of a brand-new ADK session. To this agent that looks
+    # like the start of a conversation, so it introduces itself - and the caller
+    # hears a second greeting from what is supposed to be one continuous Service
+    # Desk. The alternative fixes are worse: faking a prior exchange would put
+    # words in the user's mouth that were never said, and re-using one session
+    # across callers is not something an identity boundary can survive.
+    #
+    # This is PRESENTATION STATE AND NOTHING ELSE. It is surfaced here rather
+    # than in `identity` so it cannot be mistaken for part of the identity, and
+    # it is deliberately incapable of carrying authority: it establishes no
+    # identity, selects no account or target, grants no permission, and is not
+    # consulted by any policy or tool. Its effect is limited to whether the
+    # agent says hello, and to resolving a caller's own vague "this portal"
+    # wording back to the system they are actually calling about.
+    # identity_context_tool is still called first, every time.
+    #
+    # `entrypoint` / `current_application` are read-through the same way as the
+    # greeting fields: only a plain string survives, anything else becomes
+    # None, so a malformed or hostile value degrades to "no context" rather
+    # than reaching the model as free-form data.
+    interaction = _extract_interaction_context(state)
+    entrypoint = interaction.get("entrypoint")
+    current_application = interaction.get("current_application")
+    result_interaction = {
+        "channel": interaction.get("channel") or "chat",
+        # True only for a conversation that was already under way elsewhere.
+        "continuation": bool(interaction.get("continuation")),
+        "suppress_initial_greeting": bool(interaction.get("suppress_initial_greeting")),
+        "entrypoint": entrypoint if isinstance(entrypoint, str) and entrypoint else None,
+        "current_application": (
+            current_application
+            if isinstance(current_application, str) and current_application
+            else None
+        ),
+    }
+    state["interaction_context"] = result_interaction
+
     # DEBUG LOGGING: see what we really got from AD / portal
     try:
         print("[identity_context_tool] Raw persona from state:", persona)
@@ -293,6 +361,8 @@ def ensure_identity_context_in_state(state: Dict[str, Any]) -> Dict[str, Any]:
         "ok": True,
         "source": source,
         "identity": identity,
+        # Presentation only. Never merged into `identity`.
+        "interaction": result_interaction,
     }
 
 

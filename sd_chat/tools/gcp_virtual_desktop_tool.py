@@ -59,12 +59,48 @@ _DEFAULT_RESPONSE_GUIDANCE = "report_observations_only"
 # and then invites the user back. It deliberately claims no RTT change, no
 # backend resolution, and no measured improvement. The genuine fresh RTT is
 # still collected and preserved in post_cleanup_diagnosis for internal use.
+#
+# This is pinned as the single source of completion wording (see
+# test_cleanup_success_message_is_the_single_source_of_completion_wording) -
+# extend the completion turn by adding a NEW, separately-labelled field
+# (GCP_VDI_CLEANUP_REFRESH_NOTE) rather than editing this string, so the
+# success claim itself never silently drifts.
 GCP_VDI_CLEANUP_SUCCESS_MESSAGE = (
     "System File Cleanup completed successfully."
     " You should notice improved session responsiveness over the next few"
     " minutes. Please continue using the workstation and let me know if you"
     " still experience lag."
 )
+
+# A truthful, disk-scoped addendum: describes only what the worker actually
+# touched (temporary/system files). Deliberately says nothing about network,
+# RTT, or connectivity - System File Cleanup never touches any of those, and
+# the CLEANUP MENTION CONTRACT below exists specifically so this message never
+# implies otherwise.
+GCP_VDI_CLEANUP_REFRESH_NOTE = (
+    "We've refreshed your workstation's temporary system files."
+)
+
+
+def _format_bytes(num_bytes: Any) -> Optional[str]:
+    """Deterministic bytes -> KB/MB/GB string; never fabricates a unit.
+
+    Picks the largest unit the real magnitude actually reaches (so a small
+    reclaim still reads in KB and a large one correctly reads in GB) rather
+    than leaving the model to improvise rounding and unit choice per turn.
+    """
+    if num_bytes is None:
+        return None
+    try:
+        value = float(num_bytes)
+    except (TypeError, ValueError):
+        return None
+    sign = "-" if value < 0 else ""
+    value = abs(value)
+    for unit, divisor in (("GB", 1024 ** 3), ("MB", 1024 ** 2), ("KB", 1024)):
+        if value >= divisor:
+            return f"{sign}{value / divisor:.2f} {unit}"
+    return f"{sign}{int(value)} bytes"
 
 DEFAULT_LOOKBACK_MINUTES = 30
 DEFAULT_TELEMETRY_FRESHNESS_MINUTES = 10
@@ -1270,6 +1306,10 @@ def _cleanup_result_public(cleanup: Mapping[str, Any]) -> Dict[str, Any]:
         if field in cleanup
     }
     public["action"] = "System File Cleanup"
+    if "bytes_reclaimed" in public:
+        display = _format_bytes(public["bytes_reclaimed"])
+        if display is not None:
+            public["bytes_reclaimed_display"] = display
     return public
 
 
@@ -1594,6 +1634,11 @@ def _diagnose(
             result["diagnosis"]["response_guidance"] = (
                 "offer_cleanup" if offer else "escalate_if_issue_persists"
             )
+    if issue_type == "performance":
+        # The "before" picture. Same helper, same field shape as the
+        # post-cleanup response, so the two are directly comparable; see
+        # _system_snapshot.
+        result["system_snapshot"] = _system_snapshot(result)
     return result
 
 
@@ -1612,6 +1657,70 @@ def _fresh_performance_diagnosis(
             backend,
         )
     return _performance_diagnosis(backend, caller_upn, mapping, snapshot)
+
+
+def _snapshot_metric_value(
+    metrics: Mapping[str, Any], name: str
+) -> Optional[float]:
+    entry = metrics.get(name) if isinstance(metrics, Mapping) else None
+    if isinstance(entry, Mapping) and entry.get("status") == "available":
+        value = entry.get("value")
+        if isinstance(value, (int, float)):
+            return float(value)
+    return None
+
+
+def _format_uptime(seconds: Optional[float]) -> Optional[str]:
+    if seconds is None or seconds < 0:
+        return None
+    total_minutes = int(seconds // 60)
+    hours, minutes = divmod(total_minutes, 60)
+    return f"{hours}h {minutes}m"
+
+
+def _system_snapshot(
+    diagnosis_result: Mapping[str, Any],
+) -> Optional[Dict[str, Any]]:
+    """A plain-numbers system reading attached to the initial performance
+    diagnosis (_diagnose, "performance"), shown alongside the RTT verdict
+    already stated in prose ("...above the 200 ms threshold") as a
+    supplementary before-picture - not a second, separate verdict.
+
+    Deliberately carries no finding_code or threshold framing of its own -
+    those live in diagnosis.finding_code / diagnosis.message, unaffected by
+    this helper. Intentionally NOT attached to the post-cleanup completion
+    response: that message states no verdict at all, and the fresh evidence
+    it collects stays internal-only (post_cleanup_diagnosis /
+    post_cleanup_evidence_use) unless the user reports the problem persists.
+    """
+    diagnosis = (
+        diagnosis_result.get("diagnosis")
+        if isinstance(diagnosis_result, Mapping)
+        else None
+    )
+    metrics = diagnosis.get("metrics") if isinstance(diagnosis, Mapping) else None
+    if not isinstance(metrics, Mapping):
+        return None
+
+    cpu_fraction = _snapshot_metric_value(metrics, "cpu")
+    memory_percent = _snapshot_metric_value(metrics, "memory_percent_used")
+    disk_percent = _snapshot_metric_value(metrics, "disk_percent_used")
+    uptime_seconds = _snapshot_metric_value(metrics, "uptime_seconds")
+    rtt_ms = _snapshot_metric_value(metrics, "rdp_tcp_rtt_ms")
+
+    snapshot: Dict[str, Any] = {}
+    if cpu_fraction is not None:
+        snapshot["cpu_percent"] = round(cpu_fraction * 100, 1)
+    if memory_percent is not None:
+        snapshot["memory_percent_used"] = round(memory_percent, 1)
+    if disk_percent is not None:
+        snapshot["disk_percent_used"] = round(disk_percent, 1)
+    uptime_display = _format_uptime(uptime_seconds)
+    if uptime_display is not None:
+        snapshot["uptime_display"] = uptime_display
+    if rtt_ms is not None:
+        snapshot["rdp_tcp_rtt_ms"] = round(rtt_ms, 0)
+    return snapshot or None
 
 
 async def gcp_confirm_virtual_desktop_system_file_cleanup(
@@ -1743,6 +1852,7 @@ async def gcp_confirm_virtual_desktop_system_file_cleanup(
     # here claims the RTT changed or that the backend resolved anything; further
     # investigation happens only if the user later reports the problem persists.
     response["message"] = GCP_VDI_CLEANUP_SUCCESS_MESSAGE
+    response["refresh_note"] = GCP_VDI_CLEANUP_REFRESH_NOTE
     response["response_guidance"] = "report_cleanup_success_and_invite_followup"
     response["post_cleanup_evidence_use"] = (
         "internal_only_until_user_reports_persistence"

@@ -631,3 +631,133 @@ def test_password_reset_backend_requires_and_consumes_exact_policy_grant(monkeyp
     assert "CONFIG_MISSING" in first["reset"]["error"]
     assert second["reset"]["error"] == "ACCOUNT_ACCESS_AUTHORIZATION_REQUIRED"
     assert context.state[ACCOUNT_ACCESS_AUTHORIZATION_STATE_KEY] is None
+
+
+# ===========================================================================
+# Post-remediation next_step: the same "enabled, lock state unknown" Graph
+# snapshot must not turn a successful action's recheck into a fresh generic
+# sign-in-intake question, since the system/symptom that started the flow are
+# already known by the time this recheck runs.
+# ===========================================================================
+
+def _investigate_sign_in_snapshot(target_upn, locked_none=True):
+    return {
+        "target_upn": target_upn,
+        "enabled": True,
+        "locked": None if locked_none else False,
+        "lock_state_available": False,
+        "recommended_action": "investigate_sign_in",
+        "sign_in_investigation": {"status": "ok", "current_lock_state": "unknown"},
+    }
+
+
+def test_initial_diagnosis_still_asks_the_generic_sign_in_question(monkeypatch):
+    """Unchanged control: a FRESH diagnosis with no prior action still gets
+    the generic question - this is the one case where it is genuinely needed."""
+    _install_directory(monkeypatch, manager_upn=MANAGER_UPN)
+    context = _context()
+    status = Mock(
+        return_value={"status": "ok", "account": _investigate_sign_in_snapshot(CALLER_UPN)}
+    )
+    monkeypatch.setattr(ad_account_tool.ad_get_account_status, "func", status)
+
+    result = orchestrator.diagnose_account_access.func(CALLER_UPN, context)
+
+    assert result["next_step"] == {
+        "kind": "sign_in_intake",
+        "question": (
+            "Which application or system is affected, and what exact error is shown?"
+        ),
+    }
+    assert result["diagnosis_context"] == orchestrator.INITIAL_DIAGNOSIS_CONTEXT
+
+
+def test_post_remediation_recheck_asks_to_retry_instead_of_the_generic_question(
+    monkeypatch,
+):
+    """The bug: a successful enable's own post-action recheck used to return the
+    SAME generic sign_in_intake question as a fresh diagnosis. It must now
+    return the retry guidance instead, deterministically from the controller -
+    not from the agent inferring workflow phase from prose."""
+    _install_directory(monkeypatch, manager_upn=CALLER_UPN)
+    _install_planning(monkeypatch)
+    context = _context(invocation_id="diagnosis-turn")
+
+    # First call: initial diagnosis sees a DISABLED account (triggers the
+    # enable offer). Second call: the post-enable recheck sees it enabled with
+    # lock state unknown - the exact ambiguous snapshot that used to leak the
+    # generic question into a post-remediation turn.
+    snapshots = iter([
+        {
+            "target_upn": CALLER_UPN,
+            "enabled": False,
+            "locked": False,
+            "recommended_action": "enable",
+        },
+        _investigate_sign_in_snapshot(CALLER_UPN),
+    ])
+
+    def status(tool_context, target_upn):
+        account = next(snapshots)
+        # Mirrors the real ad_get_account_status side effect that
+        # confirm_account_access_offer depends on to find its diagnosis.
+        tool_context.state["account_access_diagnosis"] = dict(account)
+        return {"status": "ok", "account": account}
+
+    monkeypatch.setattr(ad_account_tool.ad_get_account_status, "func", status)
+    enable_backend = Mock(
+        return_value={
+            "status": "ok",
+            "enable": {
+                "status": "ok",
+                "target_upn": CALLER_UPN,
+                "was_enabled": False,
+                "is_enabled": True,
+                "message": f"Account {CALLER_UPN} was enabled successfully.",
+            },
+        }
+    )
+    monkeypatch.setattr(ad_account_tool.ad_enable_account, "func", enable_backend)
+
+    diagnosis = orchestrator.diagnose_account_access.func(CALLER_UPN, context)
+    assert diagnosis["offer"]["action_id"] == "ad.enable_account"
+    assert diagnosis["next_step"] is None  # "enable" is actionable, not ambiguous
+
+    context.invocation_id = "enable-confirmation-turn"
+    enabled = orchestrator.confirm_account_access_offer.func(context)
+
+    assert enabled["status"] == "ok"
+    assert enabled["action_id"] == "ad.enable_account"
+    post = enabled["post_action_status"]
+    assert post["account"]["recommended_action"] == "investigate_sign_in"
+    assert post["diagnosis_context"] == orchestrator.POST_REMEDIATION_CONTEXT
+    assert post["next_step"] == {
+        "kind": "retry_original_request",
+        "guidance": orchestrator._RETRY_ORIGINAL_REQUEST_NEXT_STEP["guidance"],
+    }
+    # The bug, stated as a negative: no sign_in_intake kind anywhere in a
+    # successful post-remediation response.
+    assert post["next_step"]["kind"] != "sign_in_intake"
+    assert enable_backend.call_count == 1, "unlock/enable must run exactly once"
+
+
+def test_post_remediation_context_is_isolated_to_the_recheck_call(monkeypatch):
+    """Same underlying account snapshot, two different callers of
+    _diagnose_verified_target, two different next_step kinds - proving the
+    distinction lives in the explicit `context` argument, not in any global or
+    inferred state."""
+    _install_directory(monkeypatch, manager_upn=MANAGER_UPN)
+    status = Mock(
+        return_value={"status": "ok", "account": _investigate_sign_in_snapshot(CALLER_UPN)}
+    )
+    monkeypatch.setattr(ad_account_tool.ad_get_account_status, "func", status)
+
+    initial = orchestrator._diagnose_verified_target(CALLER_UPN, _context())
+    post = orchestrator._diagnose_verified_target(
+        CALLER_UPN, _context(), context=orchestrator.POST_REMEDIATION_CONTEXT,
+    )
+
+    assert initial["next_step"]["kind"] == "sign_in_intake"
+    assert post["next_step"]["kind"] == "retry_original_request"
+    # Identical account data either way - only the accompanying guidance differs.
+    assert initial["account"] == post["account"]

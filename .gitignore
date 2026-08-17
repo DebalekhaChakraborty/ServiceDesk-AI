@@ -1,6 +1,15 @@
 # Local environment and credentials
 .env
 .env.*
+
+# Voice recovery runtime state. The identity map is a ready-made target list
+# (employee ids, UPNs, mobile numbers) and the Duo keys are credentials.
+dograh_voice/runtime/recovery_identity.db
+dograh_voice/runtime/recovery_identity.db-*
+dograh_voice/runtime/.duo_ikey
+dograh_voice/runtime/.duo_skey
+dograh_voice/runtime/.duo_host
+dograh_voice/runtime/.recovery_graph_client_secret
 credentials.json
 *.pem
 *.key

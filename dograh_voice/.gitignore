@@ -1,0 +1,48 @@
+# Dograh voice integration — runtime artifacts and secrets.
+# Written BEFORE any secret is generated, so nothing sensitive can ever be staged.
+
+# --- Secrets: never commit, never print ---
+.env
+.env.*
+!.env.example
+**/.env
+**/.env.*
+!**/.env.example
+*.secret
+*secrets*
+*credential*
+*.key
+*.pem
+*.crt
+*.p12
+*.pfx
+
+# --- Upstream Dograh checkout / runtime tree ---
+# Everything under runtime/ is ignored by default (upstream files are
+# reproducible from the pinned tag + SHA recorded in PROVENANCE.md).
+runtime/
+
+# ...except our own safe deployment artifacts, which SHOULD be tracked.
+# Negations must re-open the directory first, then whitelist each file.
+!runtime/
+runtime/*
+!runtime/docker-compose.override.yaml
+!runtime/PROVENANCE.md
+!runtime/.gitkeep
+
+# --- Container + volume data ---
+data/
+volumes/
+postgres_data/
+redis_data/
+minio-data/
+nginx-generated/
+coturn-generated/
+
+# --- Generated / transient ---
+*.log
+logs/
+recordings/
+transcripts/
+*.pid
+.DS_Store
