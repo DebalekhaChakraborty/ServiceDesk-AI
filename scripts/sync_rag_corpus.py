@@ -47,26 +47,32 @@ GCS_PREFIX = (
 SYNCED_DOCS: List[str] = [
     "docs/gcp_virtual_desktop_login_demo_sop.md",
     "docs/gcp_virtual_desktop_performance_demo_sop.md",
+    "docs/kb/AAD_PASSWORD_RESET.md",
+    "docs/kb/WINDOWS_SOFTWARE_INSTALLATION.txt",
+    "docs/kb/WINDOWS_TIME_DESYNC_FIX.md",
+    "docs/kb/WINDOWS_UPDATE_SERVICE_FIX.txt",
 ]
 
-# Articles recovered FROM the corpus rather than authored here. They were
-# direct-uploaded in 2025-2026 with no GCS source and no repository copy, so the
-# corpus was their only copy and Vertex exposes no content API to get them back —
-# these were reconstructed from retrieval.
+# Anything listed here is refused by --apply. Use it for an article recovered
+# from the corpus that a human has not yet checked: --apply deletes an entry
+# before re-importing it, so pushing an unverified reconstruction would destroy
+# the authoritative copy and replace it with a possibly lossy one, with no way
+# back. Empty is the normal steady state.
+UNVERIFIED_RECOVERED: List[str] = []
+
+# Provenance. These four were direct-uploaded to Vertex between 2025-11 and
+# 2026-01 with no GCS source object and no repository copy, so the corpus was
+# their only copy until they were read back out through retrieval. They are now
+# verified and synced above.
 #
-# They are deliberately NOT in SYNCED_DOCS. --apply deletes an entry before
-# re-importing it, so syncing an unverified reconstruction would destroy the
-# authoritative copy and replace it with a possibly-lossy one. They are tracked
-# here purely so a backup exists and any change to them is reviewable. Promote a
-# file into SYNCED_DOCS only after a human has confirmed it matches the article
-# that should be served.
-#
-# WINDOWS_UPDATE_SERVICE_FIX.txt is a special case: what the corpus holds is
-# truncated mid-procedure, so the repository copy has been completed by hand and
-# deliberately no longer matches what is served. Syncing it would be an
-# improvement, not a regression — but it still replaces a live KB article that
-# grounds a remediation action, so it stays here until a human approves it.
-RECOVERED_DOCS: List[str] = [
+# Recovery was NOT byte-faithful for the .md files: Vertex parses markdown and
+# stores the extracted text, so every heading marker and horizontal rule was
+# stripped and the end-of-document marker lost its preceding newline. The .txt
+# files passed through verbatim. Heading structure was restored before
+# promotion; the horizontal rules the .txt siblings carry were not re-invented,
+# being plausible but unproven. WINDOWS_UPDATE_SERVICE_FIX.txt was additionally
+# truncated mid-procedure in the corpus and its remainder was authored here.
+RECOVERED_FROM_CORPUS: List[str] = [
     "docs/kb/AAD_PASSWORD_RESET.md",
     "docs/kb/WINDOWS_SOFTWARE_INSTALLATION.txt",
     "docs/kb/WINDOWS_TIME_DESYNC_FIX.md",
@@ -99,17 +105,6 @@ def load_manifest() -> Dict[str, str]:
     return documents if isinstance(documents, dict) else {}
 
 
-def load_recovered() -> Dict[str, str]:
-    if not MANIFEST_PATH.is_file():
-        return {}
-    try:
-        data = json.loads(MANIFEST_PATH.read_text(encoding="utf-8"))
-    except ValueError:
-        return {}
-    recovered = data.get("recovered_not_synced")
-    return recovered if isinstance(recovered, dict) else {}
-
-
 def write_manifest(digests: Dict[str, str]) -> None:
     MANIFEST_PATH.write_text(
         json.dumps(
@@ -121,16 +116,13 @@ def write_manifest(digests: Dict[str, str]) -> None:
                     "Regenerate with: python scripts/sync_rag_corpus.py --apply"
                 ),
                 "recovered_note": (
-                    "recovered_not_synced: articles reconstructed FROM the corpus "
-                    "because no source copy existed. Backed up and reviewable here, "
-                    "but never uploaded - --apply would delete the authoritative "
-                    "entry and replace it with an unverified reconstruction. "
-                    "Promote to SYNCED_DOCS only after human verification."
+                    "recovered_from_corpus: articles that had no source copy "
+                    "anywhere and were read back out of the corpus through "
+                    "retrieval. Recorded for provenance; they are synced like "
+                    "any other document now that they have been verified."
                 ),
                 "documents": dict(sorted(digests.items())),
-                "recovered_not_synced": dict(
-                    sorted(local_digests(RECOVERED_DOCS).items())
-                ),
+                "recovered_from_corpus": sorted(RECOVERED_FROM_CORPUS),
             },
             indent=2,
         )
@@ -179,11 +171,7 @@ def apply_sync(digests: Dict[str, str]) -> int:
 
     vertexai.init(project=PROJECT_ID, location=LOCATION)
     corpus = next(
-        (
-            c
-            for c in rag.list_corpora()
-            if c.display_name == CORPUS_DISPLAY_NAME
-        ),
+        (c for c in rag.list_corpora() if c.display_name == CORPUS_DISPLAY_NAME),
         None,
     )
     if corpus is None:
@@ -232,11 +220,11 @@ def main() -> int:
     if args.check:
         return report_drift(digests, load_manifest())
 
-    overlap = set(SYNCED_DOCS) & set(RECOVERED_DOCS)
-    if overlap:
+    blocked = set(SYNCED_DOCS) & set(UNVERIFIED_RECOVERED)
+    if blocked:
         raise SystemExit(
             "refusing to sync unverified reconstructions: "
-            + ", ".join(sorted(overlap))
+            + ", ".join(sorted(blocked))
         )
     return apply_sync(digests)
 

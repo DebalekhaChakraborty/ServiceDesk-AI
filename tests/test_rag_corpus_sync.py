@@ -90,56 +90,44 @@ def test_sync_script_declares_the_same_documents_as_the_manifest():
     )
 
 
-def test_recovered_articles_are_backed_up_and_unchanged():
-    """The four KB articles that had no source copy anywhere.
+def test_every_use_case_has_a_source_document():
+    """No article may exist only inside the corpus.
 
-    They were direct-uploaded to Vertex in 2025-2026: no GCS source, no repo
-    copy, no git history, and no content API to read them back. The corpus was
-    the only copy, so deleting an entry would have destroyed the article that
-    grounds password reset or privileged Windows remediation.
+    Four KB articles were direct-uploaded in 2025-2026 with no GCS source and no
+    repo copy. Vertex exposes no content API, so the corpus was their only copy
+    and one delete_file call would have destroyed the article grounding password
+    reset or privileged Windows remediation. They are recovered and synced now;
+    this test stops the situation recurring.
     """
-    recovered = json.loads(MANIFEST_PATH.read_text(encoding="utf-8"))[
-        "recovered_not_synced"
-    ]
+    manifest = json.loads(MANIFEST_PATH.read_text(encoding="utf-8"))
+    recovered = set(manifest["recovered_from_corpus"])
+    synced = set(manifest["documents"])
 
-    assert recovered, "no recovered articles are being backed up"
-    changed = []
-    for relative_path, digest in recovered.items():
-        path = REPO_ROOT / relative_path
-        assert path.is_file(), (
-            f"{relative_path} is the only backup of a corpus-only article and "
-            "it is missing from the repo."
-        )
-        if _sha256(path) != digest:
-            changed.append(relative_path)
-
-    assert not changed, (
-        "Recovered articles changed without the manifest being regenerated: "
-        f"{', '.join(sorted(changed))}. These are backups of corpus content — "
-        "if you meant to edit the served article, verify it first and promote "
-        "it into SYNCED_DOCS."
+    assert recovered, "no recovered-article provenance is recorded"
+    assert recovered <= synced, (
+        "recovered articles missing from the synced set: "
+        f"{', '.join(sorted(recovered - synced))}"
     )
+    for relative_path in recovered:
+        assert (REPO_ROOT / relative_path).is_file(), (
+            f"{relative_path} was recovered from the corpus and is the only "
+            "copy outside it; it must stay in the repo."
+        )
 
 
-def test_recovered_articles_are_never_auto_synced():
-    """The interlock: --apply must not push an unverified reconstruction.
+def test_unverified_reconstructions_are_refused_by_apply():
+    """The interlock stays wired even though nothing is currently blocked.
 
-    --apply deletes a corpus entry before re-importing it. Syncing a
-    reconstruction that lost anything would destroy the authoritative copy and
-    replace it with the lossy one, with no way back.
+    --apply deletes a corpus entry before re-importing it, so pushing an
+    unverified reconstruction would destroy the authoritative copy and replace
+    it with a lossy one. UNVERIFIED_RECOVERED is empty in the steady state; the
+    guard must survive that so the next recovery is protected.
     """
     source = SYNC_SCRIPT.read_text(encoding="utf-8")
-    manifest = json.loads(MANIFEST_PATH.read_text(encoding="utf-8"))
 
-    synced = set(manifest["documents"])
-    recovered = set(manifest["recovered_not_synced"])
-
-    assert not (synced & recovered), (
-        "a recovered, unverified article is listed as synced: "
-        f"{', '.join(sorted(synced & recovered))}"
-    )
-    # The script must also refuse at runtime, not merely by list hygiene.
+    assert "UNVERIFIED_RECOVERED" in source
     assert "refusing to sync unverified reconstructions" in source
+    assert "set(SYNCED_DOCS) & set(UNVERIFIED_RECOVERED)" in source
 
 
 @pytest.mark.skipif(
