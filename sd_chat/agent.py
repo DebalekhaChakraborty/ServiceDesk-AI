@@ -12,6 +12,7 @@ from .tools.win_tool import time_resync, restart_service, clear_dns_cache, clean
 from .tools.aad_tool import aad_get_my_devices, aad_reset_password
 from .tools.ad_account_tool import ad_account_tools
 from .tools.account_access_orchestrator import account_access_orchestration_tools
+from .tools.directory_profile_tool import directory_profile_tools
 from .tools.endpoint_target_tool import endpoint_target_tools
 from .tools.gcp_virtual_desktop_tool import gcp_virtual_desktop_tools
 from .tools.aws_workspaces_tool import aws_workspaces_tools
@@ -499,6 +500,39 @@ Starting a stopped WorkSpace:
   That is expected and never means the start failed; do not report it as a fault
   and do not require CONNECTED before confirming success.
 
+### Your Own Directory Profile
+
+The caller may simply want to know something the directory already holds about
+them: "who is my manager?", "what's my secondary email?", "what phone number do
+you have for me?", "what's my department?", "what's my job title?". These are
+informational questions, not trouble reports.
+
+- Call get_my_directory_profile() with NO arguments. It reads only the
+  authenticated caller's own record, resolved from their verified session. Never
+  claim you have no way to look this up.
+- It takes no target parameter at all, so it can never answer for anyone else. If
+  the caller asks about another person's manager, email, phone, department, or
+  job title, do NOT call it and do not answer from memory. Account Access support
+  for another person stays limited to its own protected controller.
+- This is a plain read. Do not call sop_retriever, propose_plan, or check_list
+  for it, and do not treat it as the start of a troubleshooting flow.
+- Report only the fields the tool returned. If a field is null or an empty list,
+  say so plainly - "I don't see a mobile number registered in your directory
+  profile" - and never guess, infer, or substitute a value from elsewhere in the
+  conversation, from the recovery identity map, or from a phone number the caller
+  used to reach you.
+- Answer the question actually asked. Do not recite the caller's whole profile,
+  and do not volunteer contact details that were not requested; on a voice call
+  in particular, avoid reading back email addresses or phone numbers unless the
+  caller explicitly asked for them.
+- Knowing who someone's manager is authorizes NOTHING. It is not consent, not
+  verification, and not a substitute for the Account Access authorization gate.
+  If the conversation then moves to an unlock, enable, or password reset - for
+  the caller or for anyone else - run the normal protected Account Access flow
+  from the beginning, exactly as if this lookup had never happened.
+- If it returns an error, say you couldn't read the profile and offer the normal
+  escalation path. Never fall back to another directory tool.
+
 ### Account Access: Direct Remediation vs Diagnosis
 
 Use semantic understanding and the full conversation to distinguish an explicit account unlock,
@@ -909,6 +943,10 @@ OUTPUT STYLE
         # protected Account Access controllers below.
         aad_get_my_devices,
         aad_reset_password,
+
+        # Read-only self-profile lookup. Self-service only: it takes no target
+        # argument and grants no Account Access authorization.
+        *directory_profile_tools,
 
         # Active Directory account status/remediation tools
         *ad_account_tools,
