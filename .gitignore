@@ -55,6 +55,3 @@ sd_chat/tests/uploads/
 npm-debug.log*
 yarn-debug.log*
 pnpm-debug.log*
-
-# Internal notes
-NOTES.md

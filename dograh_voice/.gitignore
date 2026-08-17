@@ -19,7 +19,7 @@
 
 # --- Upstream Dograh checkout / runtime tree ---
 # Everything under runtime/ is ignored by default (upstream files are
-# reproducible from the pinned tag + SHA recorded in PROVENANCE.md).
+# reproducible from the pinned tag + SHA recorded in ../README.md).
 runtime/
 
 # ...except our own safe deployment artifacts, which SHOULD be tracked.
@@ -27,7 +27,6 @@ runtime/
 !runtime/
 runtime/*
 !runtime/docker-compose.override.yaml
-!runtime/PROVENANCE.md
 !runtime/.gitkeep
 
 # --- Container + volume data ---
