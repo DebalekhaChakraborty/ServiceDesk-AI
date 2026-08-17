@@ -17,6 +17,8 @@ credentials.json
 *.jsonl
 .local/
 gcp_vdi_user_map.json
+workspaces_user_map.json
+*workspaces_user_map.local.json
 sd_chat/.adk/
 
 # Python
@@ -53,3 +55,6 @@ sd_chat/tests/uploads/
 npm-debug.log*
 yarn-debug.log*
 pnpm-debug.log*
+
+# Internal notes
+NOTES.md

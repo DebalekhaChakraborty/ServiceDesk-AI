@@ -1,0 +1,15 @@
+{
+  "id": "aws.workspaces.start",
+  "title": "Start the stopped AWS WorkSpace already identified by the read-only diagnosis",
+  "description": "Start the caller's own stopped Amazon WorkSpace after a read-only diagnosis has already proven assignment, a STOPPED state, and an on-demand running mode. The WorkspaceId, Region, DirectoryId and WorkSpaces username come only from the trusted server-side offer and private mapping; they are never supplied by the model or the caller. This is the only AWS mutation available and it never stops, reboots, rebuilds, restores, terminates, or modifies a WorkSpace.",
+  "inputs": [],
+  "outputs": ["workspace_state", "verified_available", "message"],
+  "preconditions": ["caller_is_self_or_manager"],
+  "effects": [
+    "start the caller's own stopped Amazon WorkSpace exactly once through a confirmed, action-bound offer",
+    "verify the resulting WorkSpace state read-only until AWS reports AVAILABLE before reporting success"
+  ],
+  "tool": "aws_workspaces_tool",
+  "action": "confirm_workspace_start",
+  "args_template": {}
+}

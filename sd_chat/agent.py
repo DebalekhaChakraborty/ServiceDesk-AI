@@ -14,6 +14,7 @@ from .tools.ad_account_tool import ad_account_tools
 from .tools.account_access_orchestrator import account_access_orchestration_tools
 from .tools.endpoint_target_tool import endpoint_target_tools
 from .tools.gcp_virtual_desktop_tool import gcp_virtual_desktop_tools
+from .tools.aws_workspaces_tool import aws_workspaces_tools
 from .tools.policy_tool import check_list
 from .planner.reasoning_composer import propose_plan
 from .tools.sop_retriever import sop_retriever
@@ -392,6 +393,111 @@ SAFETY GATE (MANDATORY)
 - Never auto-remediate if plan.can_execute_fully == false or plan.low_confidence == true.
   • In that case, explain what the plan would do and ask the user whether to continue,
     or fall back to SOP guidance and/or ticket creation.
+
+========================
+AWS WORKSPACES
+========================
+AWS WorkSpaces is a named-system domain inside this existing orchestrator. Use
+semantic understanding of the full conversation; do not route with literal
+keyword matching.
+
+Routing and ownership:
+- When the user identifies AWS WorkSpaces, AWS WorkSpaces owns the initial
+  diagnosis. This named-system path has precedence over generic AD Account Access.
+- Semantically distinguish a WorkSpaces LOGIN/access/authentication complaint from
+  a WorkSpaces PERFORMANCE complaint such as latency, freezing, lag, black screen,
+  disconnects, or degraded session response.
+- A WorkSpaces login diagnosis is not password-reset intent. A WorkSpaces
+  performance diagnosis is not Windows-remediation intent.
+- For "I can't access my account" without AWS WorkSpaces context, keep using the
+  existing Account Access flow. Do not invoke AWS diagnosis.
+- A named AWS WorkSpace is never the shared_virtual_workstation target class. Do
+  not call bind_endpoint_target_scope or any GCP virtual desktop controller for it,
+  and never route a WorkSpaces symptom into the GCP path.
+
+Planning and tool selection:
+- Diagnose before suggesting any change. Retrieve the relevant WorkSpaces SOP with
+  sop_retriever and pass its executable diagnostic step to propose_plan.
+- For login, require one fully mapped, non-low-confidence action with action_id
+  aws.workspaces.diagnose_login, then call aws_diagnose_workspace_login.
+- For performance, require one fully mapped, non-low-confidence action with
+  action_id aws.workspaces.diagnose_performance, then call
+  aws_diagnose_workspace_performance.
+- If the plan has missing inputs, unmapped steps, an unexpected action, cannot
+  execute fully, or is low confidence, stop and clarify. Never substitute an AD,
+  password-reset, or Windows action.
+- These diagnostics are read-only. They internally enforce the self-service
+  identity boundary and use the existing protected Account Access controller only
+  for the KB's domain-account enabled/locked prerequisites. Do not separately call
+  ad_get_account_status, duplicate enabled/locked reasoning, or replace the AWS
+  diagnosis with Account Access.
+
+Identity and registration safety:
+- Use identity_context.upn as target_upn. Current scope is self service; never
+  accept or construct another person's UPN for a WorkSpaces query.
+- Never assume Entra UPN equals WorkSpaces UserName and never strip the UPN domain.
+  The diagnostic tool requires an explicit configured mapping.
+- For a reported WorkSpaces error, semantically supply exactly one
+  reported_error_category: not_authorized, authentication_failure, other, or
+  unspecified. Do not infer that Authentication Failure means a wrong password.
+- Client registration inspection is optional and applies only to a Windows client
+  endpoint returned by aad_get_my_devices and authorized by existing host policy.
+  The AWS WorkSpace computer_name is the remote cloud desktop, not the local
+  WorkSpaces client endpoint; never pass it to WinRM or trust it as an allowed host.
+- Never expose, quote, log, persist, or place a WorkSpaces registration code in a
+  response or ticket. Report only valid, mismatch, or not verifiable.
+- Directory-level RADIUS/MFA configuration does not prove individual Okta,
+  Symantec VIP, or other MFA enrollment. Preserve not_verifiable when no source can
+  establish a check, including the customer's inactivity-disable policy.
+
+Remediation separation:
+- Within an active WorkSpaces troubleshooting context, never automatically call or
+  recommend aad_reset_password. A follow-up such as "reset it" must be clarified as
+  WorkSpaces-specific recovery versus an enterprise AD password reset independent
+  of the WorkSpaces issue; it must not silently escape into an Account Access reset.
+- Never automatically route WorkSpaces Authentication Failure to Windows support.
+- WorkSpaces performance diagnosis never runs cleanup. Existing
+  cleanup_temp_files is not KB0019144 System File Cleanup. The current diagnostic
+  returns system_file_cleanup.status == not_automatable and may offer KB guidance
+  or the existing ServiceNow fallback, but must not claim cleanup was performed or
+  invoke WinRM cleanup.
+- Starting a stopped WorkSpace is the ONLY AWS mutation available, and only
+  through the governed offer/confirmation flow described below. There is no stop,
+  reboot, rebuild, restore, terminate, or property-modification capability; never
+  offer, imply, or promise one.
+
+Starting a stopped WorkSpace:
+- aws_diagnose_workspace_login returns start_offer. It is created by the
+  controller from live AWS evidence only - an assigned WorkSpace whose real state
+  is STOPPED and whose running mode supports an on-demand start. It is never
+  created because the caller asked to start something.
+- START OFFER MENTION CONTRACT. Offer to start the WorkSpace ONLY when
+  start_offer is present and non-null.
+  * If start_offer is present, report that AWS shows the WorkSpace stopped and
+    ask exactly: "Your AWS WorkSpace is currently stopped. I can start it for
+    you. Would you like me to do that?" Do NOT start it in that same turn.
+  * If start_offer is null or absent, do not mention starting the WorkSpace at
+    all - not to offer it, and not to explain that it is unavailable.
+- A clear later confirmation such as "yes", "please do", "go ahead", or "start
+  it" is valid only for the current start offer. Call
+  aws_confirm_workspace_start() with NO arguments. Never pass or reconstruct a
+  WorkspaceId, Region, DirectoryId, WorkSpaces username, bundle, or state - the
+  controller re-reads every one of them from the trusted offer and private
+  mapping. A response that supplies any of those values is INVALID.
+- That controller refreshes the caller identity and mapping, re-reads the live
+  WorkSpace, requires the same WorkspaceId and a still-STOPPED state, checks
+  policy, consumes the confirmation exactly once, and calls StartWorkspaces
+  exactly once. If it reports status error, the WorkSpace was not started or
+  could not be verified: say so plainly and offer the existing ServiceNow path.
+  Never retry the start, never call it again "to be sure", and never restate a
+  failure as success.
+- Only when the controller returns status ok with verified_available == true has
+  AWS confirmed the WorkSpace is AVAILABLE. Then reply exactly: "Your AWS
+  WorkSpace is available now. Please try connecting again." Never announce
+  availability from the accepted start request alone.
+- connection.state may remain DISCONNECTED until the employee actually connects.
+  That is expected and never means the start failed; do not report it as a fault
+  and do not require CONNECTED before confirming success.
 
 ### Account Access: Direct Remediation vs Diagnosis
 
@@ -815,6 +921,10 @@ OUTPUT STYLE
 
         # Read-only, self-service GCP Windows virtual desktop diagnosis
         *gcp_virtual_desktop_tools,
+
+        # Self-service Amazon WorkSpaces diagnosis plus the single governed
+        # start remediation. No other AWS mutation is exposed.
+        *aws_workspaces_tools,
 
         # Gmail email tool
         gmail_send_email,

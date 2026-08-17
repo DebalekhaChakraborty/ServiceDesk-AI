@@ -1,0 +1,17 @@
+{
+  "id": "aws.workspaces.diagnose_login",
+  "title": "Validate AWS WorkSpaces assignment, connection and registration prerequisites",
+  "description": "Validate AWS WorkSpaces assignment, connection and registration prerequisites through a read-only diagnosis of the authenticated caller. It also inspects WorkSpace state, directory-level MFA metadata, customer inactivity-policy limitations, and the existing protected domain-account status capability.",
+  "inputs": ["target_upn"],
+  "outputs": ["diagnosis.finding_code", "diagnosis.checks", "diagnosis.message"],
+  "preconditions": [],
+  "effects": [
+    "inspect Amazon WorkSpaces assignment, availability, connection, registration, MFA, inactivity, and domain-account login prerequisites for ${target_upn}",
+    "diagnose WorkSpaces Not Authorized, Unauthorized User, and Authentication Failure without changing AWS, resetting a password, or running Windows remediation"
+  ],
+  "tool": "aws_workspaces_tool",
+  "action": "diagnose_workspace_login",
+  "args_template": {
+    "target_upn": "${target_upn}"
+  }
+}

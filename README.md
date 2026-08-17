@@ -220,3 +220,83 @@ For a rehearsal that needs an elevated branch, use `GCP_VDI_MODE=demo` and
 demo-only 243-ms RDP TCP RTT. For a genuine lab measurement, an operator
 may run `scripts/gcp_vdi_demo_fault.ps1` through their existing secure guest
 session; it is bounded to 60–120 seconds and is never exposed to chat.
+
+## Amazon WorkSpaces
+
+AWS WorkSpaces is a named-system domain alongside the GCP virtual desktop PoC. It
+owns its own login and performance diagnosis and never routes into the GCP
+`shared_virtual_workstation` path or into generic Account Access.
+
+### Modes and identity mapping
+
+`AWS_WORKSPACES_MODE` selects the backend and defaults to `off`:
+
+| Mode | Behavior |
+| --- | --- |
+| `off` | No AWS call is made. Safe default. |
+| `demo` | Reads `AWS_WORKSPACES_DEMO_FIXTURE_PATH`. Read-only; never starts a WorkSpace. |
+| `aws` | Real read-only AWS calls plus the single governed start remediation. |
+
+The authenticated Entra UPN is resolved through an explicit private mapping at
+`AWS_WORKSPACES_USER_MAP_PATH`:
+
+```json
+{ "user@example.com": { "region": "...", "directory_id": "d-...", "workspace_username": "..." } }
+```
+
+An Entra UPN is never assumed to equal the WorkSpaces `UserName`, and its domain
+is never stripped to guess one. Without a mapping entry the diagnosis stops with
+`AWS_WORKSPACES_USER_NOT_MAPPED`. The real mapping is ignored by git and is never
+committed. Install the optional runtime dependency with
+`pip install -r requirements-aws-workspaces.txt`; boto3 uses its standard
+credential provider chain and no key material is read from the repository.
+
+### Required IAM
+
+Read-only diagnosis needs `workspaces:DescribeWorkspaces`,
+`workspaces:DescribeWorkspacesConnectionStatus`,
+`workspaces:DescribeWorkspaceDirectories`, `ds:DescribeDirectories`, and
+`cloudwatch:GetMetricData`. The governed start adds exactly one write permission,
+`workspaces:StartWorkspaces`. No stop, reboot, rebuild, restore, terminate, or
+property-modification permission is required or used.
+
+### Diagnostic behavior and limitations
+
+Login diagnosis inspects assignment, WorkSpace state, connection status, optional
+client registration, directory-level MFA metadata, and the existing protected
+domain-account prerequisites. Registration is reported only as `pass`, `fail`, or
+`not_verifiable`; the WorkSpaces registration code is never returned, logged, or
+persisted. Directory-level RADIUS configuration never implies individual MFA
+enrollment, and an `Authentication Failure` never implies a wrong password or
+triggers an automatic password reset.
+
+Performance diagnosis reports CloudWatch observations and applies exactly one
+KB-derived rule: `InSessionLatency` strictly greater than 200 ms. Exactly 200 ms
+is not a breach. `system_file_cleanup.status` stays `not_automatable`; generic
+`cleanup_temp_files` is not the KB0019144 System File Cleanup.
+
+### Governed WorkSpace start
+
+Starting a stopped WorkSpace is the only AWS mutation in this phase. The
+read-only login diagnosis creates a ten-minute, caller- and WorkSpace-bound
+`aws.workspaces.start` offer only when live AWS evidence shows an assigned
+WorkSpace that is genuinely `STOPPED` with an `AUTO_STOP` or `MANUAL` running
+mode. An `ALWAYS_ON` WorkSpace is not eligible and its running mode is never
+modified to make it eligible. The offer is never created from what the caller
+asked for.
+
+Confirmation must arrive in a later turn. `aws_confirm_workspace_start()` takes
+no arguments at all, so the model can never supply a `WorkspaceId`, Region,
+`DirectoryId`, or WorkSpaces username — every one of those is re-read from the
+trusted offer and the private mapping. The controller re-verifies the caller, the
+mapping, the same `WorkspaceId`, a still-`STOPPED` state, and the running mode,
+runs `check_list` once in an isolated policy context, consumes the confirmation
+exactly once, and calls `StartWorkspaces` exactly once.
+
+Success is never claimed from an accepted request. The controller then polls
+`DescribeWorkspaces` read-only, treating `STARTING` as an expected intermediate
+state, and reports success only when AWS itself reports `AVAILABLE`. Connection
+state may remain `DISCONNECTED` until the employee actually connects and is never
+required for success. A rejected request, a failure state, or a timeout is
+reported as an error with the existing ServiceNow path, never as success, and the
+write is never retried.

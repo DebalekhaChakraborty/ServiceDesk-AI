@@ -1,0 +1,7 @@
+{
+  "user@example.com": {
+    "region": "us-east-1",
+    "directory_id": "d-1234567890",
+    "workspace_username": "example.directory.user"
+  }
+}
