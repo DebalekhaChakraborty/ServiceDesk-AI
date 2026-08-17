@@ -1,6 +1,7 @@
 'use strict';
 
 const { layout } = require('./layout');
+const { publicVoiceUi } = require('./voiceUi');
 
 // Official four-square Microsoft mark, inlined so the page makes no external
 // request (the Content-Security-Policy forbids one).
@@ -13,6 +14,9 @@ const MICROSOFT_MARK = `<svg class="ms-mark" viewBox="0 0 23 23" aria-hidden="tr
 
 /**
  * ServiceDesk Voice AI, offered on the SIGN-IN page.
+ *
+ * The launcher and in-call panel themselves live in ./voiceUi so the workspace
+ * renders the identical thing; only the placement argument is made here.
  *
  * This is the right place for it: an employee who cannot sign in is looking at
  * this page when they discover it, and sending them elsewhere assumes they know
@@ -33,49 +37,6 @@ const MICROSOFT_MARK = `<svg class="ms-mark" viewBox="0 0 23 23" aria-hidden="tr
  * unauthenticated sign-in page continues to ship zero third-party JavaScript to
  * everyone who merely visits it.
  */
-// Headset outline, inlined for the same reason as the Microsoft mark: the CSP
-// forbids an external request, and this page must ship no third-party asset.
-const HEADSET_MARK = `<svg class="launcher__icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
-<path d="M4 13a8 8 0 0 1 16 0" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
-<rect x="2" y="13" width="4.5" height="7" rx="2.25" fill="currentColor"/>
-<rect x="17.5" y="13" width="4.5" height="7" rx="2.25" fill="currentColor"/>
-<path d="M20 20v.5a2.5 2.5 0 0 1-2.5 2.5H13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
-</svg>`;
-
-/**
- * The launcher is deliberately OUTSIDE the sign-in card.
- *
- * Inside it, the voice entry read as one of the ways to sign in — a fallback
- * credential flow — which is exactly the framing 7.6 removes. It is not a
- * sign-in method and it is not account recovery; it is the Service Desk,
- * reachable whatever the caller needs. A persistent corner launcher says that,
- * and leaves `Sign in with Microsoft` as the card's single call to action.
- *
- * It also sits where the Dograh widget will appear, so pressing it hands the
- * corner over rather than stacking two controls on top of each other.
- *
- * The markup contract with `recovery-widget.js` is unchanged: `#recovery-form`,
- * `#recovery-start`, `#voice-status`. The Dograh script is still appended only
- * on click, so a passive visitor fetches nothing third-party.
- */
-function voiceLauncher() {
-  return `
-  <div class="launcher" id="voice-launcher">
-    <p class="launcher__caption" id="voice-caption">
-      <span class="launcher__caption-title">Need help?</span>
-      Available even if you can't sign in.
-    </p>
-    <p class="launcher__status" id="voice-status" role="status" aria-live="polite"></p>
-    <form id="recovery-form" class="launcher__form">
-      <button class="launcher__button" type="submit" id="recovery-start">
-        ${HEADSET_MARK}
-        <span class="launcher__label">Talk to ServiceDesk</span>
-      </button>
-    </form>
-  </div>
-  <script src="/recovery-widget.js" defer></script>`;
-}
-
 function landingPage({ voiceEnabled = false } = {}) {
   const body = `<main class="shell shell--centered">
   <section class="card card--auth" aria-labelledby="portal-title">
@@ -94,7 +55,7 @@ function landingPage({ voiceEnabled = false } = {}) {
 
     <p class="fineprint">Authorized users only</p>
   </section>
-</main>${voiceEnabled ? voiceLauncher() : ''}`;
+</main>${voiceEnabled ? publicVoiceUi() : ''}`;
 
   return layout({ title: 'Enterprise Workspace', body, bodyClass: 'page--auth' });
 }

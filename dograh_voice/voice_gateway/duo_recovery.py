@@ -52,6 +52,11 @@ from enum import Enum
 from typing import Any, Optional
 
 from .conversation import classify_opening
+from .dialogue import (
+    DialogueAct,
+    SemanticDialogueInterpreter,
+    interpret,
+)
 from .graph_corroboration import (
     CorroborationResult,
     GraphCorroborator,
@@ -61,7 +66,6 @@ from .identifiers import (
     IdentifierError,
     SpokenIdentifier,
     extract_identifier,
-    parse_factor_choice,
 )
 from .identity_map import AmbiguousIdentifier, EmployeeIdentityMap, EmployeeRecord
 from .mfa_provider import (
@@ -156,75 +160,91 @@ GENERIC_LOOKUP_FAILURE = (
     "I could not verify those details. Please say your employee ID, "
     "one digit at a time."
 )
+# --- verification dialogue -------------------------------------------------
+#
+# Spoken by a Service Desk, not dictated by a form. The old wording told the
+# caller which token to utter — `Say "push"` — which made the security parser's
+# vocabulary the caller's problem and produced the defect this phase fixes:
+# "okay, sure" did nothing. Nothing below names a word the caller must say.
+
+# BOTH factors advertised: a real choice, so a real question.
 FACTOR_PROMPT = (
-    "How would you like to verify your identity? I can send a Duo Push "
-    "notification, or you can speak the six-digit passcode from Duo Mobile."
+    "I can verify it's you with a Duo notification to your phone, or you can "
+    "read me the six-digit code from Duo Mobile. Which would you prefer?"
 )
 FACTOR_PROMPT_PASSCODE_ONLY = (
-    "To verify your identity, please open Duo Mobile and speak the "
-    "six-digit passcode."
+    "To verify it's you, please open Duo Mobile and read me the six-digit code."
 )
-# Push-capable device that does NOT advertise mobile_otp. The passcode is not
-# mentioned at all: naming a factor the device cannot perform invites the
-# caller to read a code nothing can generate.
+# Push-capable device that does NOT advertise mobile_otp. With one factor there
+# is no choice to offer, so this asks for CONSENT rather than a selection —
+# "how would you like to verify?" is a false question when only one answer
+# exists. The passcode is not mentioned at all: naming a factor the device
+# cannot perform invites the caller to read a code nothing can generate.
 FACTOR_PROMPT_PUSH_ONLY = (
-    "To verify your identity, I can send a Duo Push notification to your "
-    "device. Say \"push\" when you are ready."
+    "I can send a Duo notification to your phone to verify it's you. "
+    "Would you like me to send it now?"
 )
 FACTOR_RETRY = (
-    "Sorry, I did not catch that. Say \"push\" to receive a Duo Push "
-    "notification, or \"passcode\" to speak a code from Duo Mobile."
+    "Sorry, I didn't catch that. Would you like the Duo notification on your "
+    "phone, or would you rather read me the code?"
 )
 FACTOR_RETRY_PUSH_ONLY = (
-    "Sorry, I did not catch that. Say \"push\" to receive a Duo Push "
-    "notification in Duo Mobile."
+    "Sorry, I didn't catch that. Shall I send that Duo notification to your phone?"
+)
+# The caller said no, or asked to wait. This is a conversation, not a failure:
+# no attempt is charged and the offer stays open.
+FACTOR_DEFERRED = "No problem. Just let me know when you're ready."
+FACTOR_DEFERRED_PASSCODE_ONLY = (
+    "No problem. Whenever you're ready, open Duo Mobile and read me the six-digit code."
+)
+# "I approved it" before anything was sent. A claim about a push that does not
+# exist, so it is answered plainly rather than treated as evidence.
+PUSH_NOT_SENT_YET = (
+    "Nothing has been sent yet. Shall I send the Duo notification now?"
 )
 # Spoken when a caller asks for a passcode on a device that cannot produce one.
 # A misunderstanding, not a failed authentication - it costs no attempt budget.
 PASSCODE_NOT_AVAILABLE = (
-    "Your device is not set up to generate passcodes. I can send a Duo Push "
-    "notification instead. Say \"push\" when you are ready."
+    "That device isn't set up to generate codes, but I can send a Duo "
+    "notification to your phone instead. Shall I send it?"
 )
 PUSH_SENT_MESSAGE = (
-    "I've sent a verification request to your Duo Mobile app. "
-    "Please approve it."
+    "I've sent it. Approve the notification in Duo and I'll carry on."
 )
 PUSH_WAITING_MESSAGE = (
-    "I'm still waiting for the request to be approved in Duo Mobile. "
-    "Let me know once you've approved it."
+    "I'm still waiting on that approval. Let me know once you've approved it."
 )
 PUSH_TIMEOUT_MESSAGE = (
-    "I did not receive an approval in time. "
-    "Would you like me to send another push, or would you prefer to speak a passcode?"
+    "That request timed out before it was approved. I can send another, or you "
+    "can read me the code from Duo Mobile."
 )
 PUSH_TIMEOUT_MESSAGE_PUSH_ONLY = (
-    "I did not receive an approval in time. "
-    "Would you like me to send another push?"
+    "That request timed out before it was approved. Shall I send another?"
 )
 PASSCODE_PROMPT = (
-    "Please open Duo Mobile and speak the six-digit passcode."
+    "Please open Duo Mobile and read me the six-digit code."
 )
 PASSCODE_RETRY = (
-    "I did not catch six digits. Please say the six-digit passcode again, "
-    "one digit at a time."
+    "I didn't catch six digits. Could you read the code again, one digit at a time?"
 )
 GENERIC_AUTH_FAILURE = (
-    "That verification did not succeed. Please open Duo Mobile and "
-    "speak the current six-digit passcode."
+    "That didn't verify. Please open Duo Mobile and read me the current "
+    "six-digit code."
 )
 LOCKED_MESSAGE = (
-    "Too many attempts. For your security this recovery session is closed. "
-    "Please contact the Service Desk by another channel."
+    "That's too many attempts, so I've closed this call for your security. "
+    "Please contact the Service Desk another way."
 )
-VERIFIED_MESSAGE = (
-    "Thank you. I've verified your identity. How can I help you today?"
-)
-# Said when the caller already told us what they need. It promises to look, not
-# to have looked: the sd_chat reply is appended to this sentence by the gateway,
-# so nothing here may pre-empt what that reply turns out to say.
-VERIFIED_CONTINUING = (
-    "Thank you, your identity is verified. Let me pick up where we left off."
-)
+# Only reachable when the caller never stated a problem, which an external
+# caller cannot do — see the AWAITING_REQUEST door. Kept so _verified does not
+# depend on a pending request existing.
+VERIFIED_MESSAGE = "Thanks, you're verified. How can I help?"
+# The normal ending. Deliberately ONE short clause: the gateway appends the real
+# sd_chat answer directly after it, so anything longer becomes a preamble the
+# caller sits through, and anything that asks a question becomes the second
+# greeting this phase exists to remove. It also claims no diagnosis — sd_chat
+# has only just been handed the request.
+VERIFIED_CONTINUING = "Thanks, you're verified."
 PROVIDER_UNAVAILABLE = (
     "I can't verify your identity right now. "
     "Please contact the Service Desk by another channel."
@@ -299,10 +319,14 @@ class DuoRecoveryManager:
         provider: RecoveryMfaProvider,
         corroborator: Optional[GraphCorroborator] = None,
         sleep=time.sleep,
+        semantic: Optional[SemanticDialogueInterpreter] = None,
     ) -> None:
         self._map = identity_map
         self._provider = provider
         self._corroborator = corroborator or NullGraphCorroborator()
+        # Optional, and never authoritative. It can only ever propose one of the
+        # acts this module already asked about; see dialogue.py.
+        self._semantic = semantic
         self._sessions: dict[str, DuoRecoverySession] = {}
         self._lock = threading.Lock()
         self._sleep = sleep
@@ -374,7 +398,7 @@ class DuoRecoveryManager:
                 if session.state is DuoRecoveryState.AWAITING_FACTOR_CHOICE:
                     return self._handle_factor_choice(session, utterance, moment)
                 if session.state is DuoRecoveryState.PUSH_PENDING:
-                    return self._handle_push_poll(session, moment)
+                    return self._handle_push_poll(session, utterance, moment)
                 if session.state is DuoRecoveryState.AWAITING_PASSCODE:
                     return self._handle_passcode(session, utterance, moment)
             except MfaProviderError as exc:
@@ -549,14 +573,52 @@ class DuoRecoveryManager:
         return TurnOutcome(speak=PROVIDER_UNAVAILABLE)
 
     # -- step 2: factor choice --------------------------------------------
+    # Everything the caller could sensibly mean at a factor prompt. PASSCODE is
+    # offered to the INTERPRETER even on a push-only device, deliberately: the
+    # dialogue layer's job is to report what was meant, and the state machine's
+    # job is to decide that it cannot be done. Dropping it here instead would
+    # turn "I'll read the code" into "sorry, I didn't catch that" and lose the
+    # chance to explain why.
+    _FACTOR_ACTS = (
+        DialogueAct.AFFIRM, DialogueAct.DECLINE, DialogueAct.WAIT,
+        DialogueAct.DONE, DialogueAct.PUSH, DialogueAct.PASSCODE,
+    )
+
     def _handle_factor_choice(self, session: DuoRecoverySession, utterance: str,
                               moment: float) -> TurnOutcome:
-        choice = parse_factor_choice(utterance)
-        if choice is None:
+        """Read the reply as a dialogue act, then decide what is legal here.
+
+        The two halves are kept apart on purpose. `interpret` may be
+        model-assisted and returns one of six words; everything below is
+        deterministic and is the only thing that can start a push. An act is a
+        statement about the CALLER, never about their identity — the strongest
+        one available, AFFIRM, means "send the notification", which is a request
+        to be authenticated rather than a claim of having been.
+        """
+        act = interpret(utterance, self._FACTOR_ACTS, self._semantic)
+        has_push = bool(session.push_device_id)
+
+        if act is DialogueAct.UNCLEAR:
+            # Never charged: not understanding a caller is our failure, not an
+            # authentication attempt by them.
             return TurnOutcome(speak=FACTOR_RETRY if session.passcode_capable
                                else FACTOR_RETRY_PUSH_ONLY)
 
-        if choice == "passcode":
+        if act in (DialogueAct.DECLINE, DialogueAct.WAIT):
+            # A conversation, not a refusal to authenticate. The offer stays
+            # open, the state does not move, and no budget is spent.
+            logger.info("duo recovery call=%s factor_deferred=%s",
+                        session.call_id[:8], act.value)
+            return TurnOutcome(speak=FACTOR_DEFERRED if has_push
+                               else FACTOR_DEFERRED_PASSCODE_ONLY)
+
+        if act is DialogueAct.DONE:
+            # "I approved it" — but nothing has been sent. A claim about a push
+            # that does not exist is answered, never believed.
+            return TurnOutcome(speak=PUSH_NOT_SENT_YET if has_push
+                               else FACTOR_PROMPT_PASSCODE_ONLY)
+
+        if act is DialogueAct.PASSCODE:
             if not session.passcode_capable:
                 # Asking for a factor the device cannot perform is a
                 # misunderstanding, not a failed authentication: the state does
@@ -567,7 +629,15 @@ class DuoRecoveryManager:
             session.state = DuoRecoveryState.AWAITING_PASSCODE
             return TurnOutcome(speak=PASSCODE_PROMPT)
 
-        if not session.push_device_id:
+        if act is DialogueAct.AFFIRM and session.passcode_capable and has_push:
+            # Two factors were offered, so "yes" has not chosen one. Guessing
+            # would send a push to someone who meant to read a code.
+            return TurnOutcome(speak=FACTOR_RETRY)
+
+        # AFFIRM on a single-factor offer, or an explicit PUSH. Consent, not
+        # proof: what follows is a real Duo transaction that must still be
+        # approved on the enrolled device.
+        if not has_push:
             if session.passcode_capable:
                 session.state = DuoRecoveryState.AWAITING_PASSCODE
                 return TurnOutcome(speak=FACTOR_PROMPT_PASSCODE_ONLY)
@@ -588,8 +658,27 @@ class DuoRecoveryManager:
         return outcome
 
     # -- step 3a: push -----------------------------------------------------
-    def _handle_push_poll(self, session: DuoRecoverySession,
+    #
+    # What the caller says while a push is outstanding is CONVERSATION about a
+    # transaction that already exists. "I approved it", "done", "still nothing"
+    # and "yes" are all answered the same way: by asking Duo. The utterance
+    # chooses the wording and nothing else — there is no branch anywhere below
+    # in which words become an approval, because the only thing that returns
+    # RESULT_ALLOW is the provider.
+    _PENDING_ACTS = (
+        DialogueAct.DONE, DialogueAct.AFFIRM, DialogueAct.WAIT,
+        DialogueAct.DECLINE, DialogueAct.PUSH,
+    )
+
+    def _handle_push_poll(self, session: DuoRecoverySession, utterance: str,
                           moment: float) -> TurnOutcome:
+        act = interpret(utterance, self._PENDING_ACTS, self._semantic)
+        if act is not DialogueAct.UNCLEAR:
+            logger.info("duo recovery call=%s push_pending_act=%s",
+                        session.call_id[:8], act.value)
+        # Every act, and UNCLEAR too, leads to the same bounded poll. A caller
+        # claiming to have approved it is not evidence, so it earns no shortcut;
+        # it is simply a good moment to check.
         return self._poll_push(session, moment, first_turn=False)
 
     def _poll_push(self, session: DuoRecoverySession, moment: float,
@@ -766,9 +855,11 @@ class DuoRecoveryManager:
             "display_name": record.display_name or record.upn,
             "duo_user_id": record.duo_user_id,
             "auth_method": method,
-            "identity_source": "duo_recovery",
+            "channel": "external_voice",
+            "identity_source": "duo_external_voice",
+            # A RESTRICTION, retained server-side and in the persona. See
+            # duo_persona for why this one is not renamed away.
             "recovery_scope": "self_account_recovery",
-            "purpose": "account_recovery",
             "graph_corroboration": corroboration.summary(),
         }
         session.state = DuoRecoveryState.VERIFIED
@@ -797,14 +888,71 @@ class DuoRecoveryManager:
         return TurnOutcome(speak=VERIFIED_MESSAGE, identity=session.verified_identity)
 
 
+def voice_interaction_context(continuation: bool) -> dict:
+    """Presentation state for a voice-created sd_chat session.
+
+    `continuation` is True when the caller already stated their problem out loud
+    before verifying, so the request arriving at sd_chat is not the opening of a
+    conversation — it is the middle of one. Without this, sd_chat correctly sees
+    a brand-new session with a first user message and introduces itself, and the
+    caller hears a second greeting from what should be one continuous line.
+
+    `entrypoint` / `current_application` name where this call was launched from.
+    Today that is always the Employee Access Portal landing page — it is the
+    only surface that serves the voice launcher — so the value is a fixed
+    constant here, not a general entrypoint registry; a second launch surface
+    would need its own explicit value, not a guess. sd_chat's prompt uses this
+    solely to resolve a caller's own "employee portal" / "this portal" wording
+    without asking them to name the system again.
+
+    THIS GRANTS NOTHING. It establishes no identity, names no account, selects
+    no target, carries no permission, and is read by exactly two things: the
+    agent's decision about whether to say hello, and its resolution of a vague
+    "portal" reference. It is built here, server-side, from a boolean the state
+    machine already knows plus one fixed constant, and is never influenced by
+    the caller, the browser, or the model.
+    """
+    return {
+        "channel": "external_voice",
+        "continuation": bool(continuation),
+        "suppress_initial_greeting": bool(continuation),
+        "entrypoint": "employee_access_portal",
+        "current_application": "employee_access_portal",
+    }
+
+
 def duo_persona(identity: dict) -> dict:
-    """Persona for a Duo-recovered caller, in the existing sd_chat contract.
+    """Persona for a Duo-verified external caller, in the sd_chat contract.
 
     Field names match what identity_context_tool already consumes, so this
     reuses the trusted identity contract rather than inventing a second one.
-    The provenance markers let downstream policy see that this identity came
-    from a recovery factor rather than a full Entra sign-in, and that its scope
-    is the caller's own account only.
+
+    HOW THE CALLER WAS AUTHENTICATED IS NOT WHY THEY CALLED.
+
+    This persona used to say `identity_source: duo_recovery` and
+    `purpose: account_recovery`. Duo is the factor that proved who is holding
+    the phone; it says nothing about whether they want a password, a VPN fix or
+    a printer. Telling downstream components the caller's *purpose* was account
+    recovery was simply false for most calls, and it is the kind of falsehood
+    that eventually shapes a persona or a sentence. So:
+
+        channel         = external_voice   - where they reached us
+        auth_method     = duo_push         - how possession was proven
+        identity_source = duo_external_voice
+
+    `purpose` is gone from the persona entirely; it had no consumer. The
+    BOOTSTRAP token keeps `purpose=account_recovery` because that names the
+    protocol the token belongs to, not the caller's intent.
+
+    `recovery_scope` STAYS. It is the one marker here that RESTRICTS rather than
+    describes - "this identity is good for the caller's own account and nothing
+    else" - and removing a restriction because its wording is unfashionable is
+    how metadata renaming quietly widens authorization. It has no consumer
+    today; it is defence in depth for the day it does.
+
+    None of these reach the model: identity_context_tool returns a fixed field
+    list that excludes every one of them, and the sd_chat instruction has no
+    state placeholders. That is asserted, not assumed.
 
     `userPrincipalName` stays the LOCAL alias even when Graph reports a
     different one: the object id is canonical and is carried in `id`, and
@@ -815,9 +963,10 @@ def duo_persona(identity: dict) -> dict:
         "userPrincipalName": identity["upn"],
         "mail": identity["upn"],
         "displayName": identity.get("display_name") or identity["upn"],
-        "identity_source": "duo_recovery",
+        "channel": "external_voice",
+        "identity_source": "duo_external_voice",
         "recovery_scope": "self_account_recovery",
-        "auth_method": identity.get("auth_method", "duo_recovery"),
+        "auth_method": identity.get("auth_method", "duo_push"),
     }
     if identity.get("entra_object_id"):
         persona["id"] = identity["entra_object_id"]

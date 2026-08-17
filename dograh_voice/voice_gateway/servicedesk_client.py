@@ -144,7 +144,8 @@ class ServiceDeskClient:
         return resp.status_code == 200
 
     async def create_session(
-        self, adk_session_id: str, persona: Optional[dict] = None
+        self, adk_session_id: str, persona: Optional[dict] = None,
+        interaction: Optional[dict] = None,
     ) -> None:
         """Create the session, optionally seeding a VERIFIED persona.
 
@@ -153,12 +154,23 @@ class ServiceDeskClient:
         is passed ONLY after a portal-signed identity token has been verified;
         it is never built from anything the browser or the LLM supplied.
 
+        `interaction` is PRESENTATION STATE and carries no authority — see
+        duo_recovery.voice_interaction_context. It rides the same trusted
+        server-side write as the persona for exactly one reason: both must be in
+        state before the first user turn, because the agent is instructed to
+        read them on that turn. It is a separate argument, and lands under a
+        separate state key, so it can never be mistaken for identity.
+
         The ADK create endpoint treats the request body AS the session state
         (verified against the running server: posting {"state": {...}} nests a
         literal "state" key and identity_context_tool then finds no persona).
         """
         client = await self._get_client()
-        body = {"persona": persona} if persona else {}
+        body: dict = {}
+        if persona:
+            body["persona"] = persona
+        if interaction:
+            body["interaction_context"] = interaction
         try:
             resp = await client.post(self._session_url(adk_session_id), json=body)
         except httpx.TimeoutException as exc:

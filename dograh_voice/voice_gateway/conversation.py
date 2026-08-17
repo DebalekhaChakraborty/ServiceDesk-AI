@@ -49,58 +49,75 @@ from .identifiers import (
     extract_identifier,
 )
 
-# Words that carry no ServiceDesk meaning on their own. A caller whose whole
-# utterance reduces to these has not stated a problem.
+# CLOSED-CLASS FUNCTION WORDS ONLY.
 #
-# Deliberately conservative: every word that could plausibly BE the request
-# ("password", "account", "locked", "printer", "help", "reset", "vpn") is
-# absent, because a false "that was only small talk" leaves a real caller
-# looping on the welcome prompt. A false "that was a request" merely sends them
-# to identity verification a turn early, which is harmless.
-_FILLER = {
-    "a", "an", "the", "and", "or", "so", "to", "of", "for", "with", "from",
-    "is", "are", "was", "be", "been", "am", "im", "i", "me", "my", "mine",
-    "you", "your", "yours", "we", "us", "our", "it", "its", "this", "that",
-    "these", "those", "here", "there", "just", "well", "actually", "really",
-    "very", "quite", "now", "then", "please", "sure", "sorry", "excuse",
-    "um", "uh", "er", "erm", "hmm", "mm", "like", "know", "mean", "say",
-    "said", "tell", "telling", "give", "giving", "got", "get", "have", "has",
-    "had", "do", "does", "did", "don", "doesn", "didn", "can", "cant",
-    "could", "would", "should", "will", "shall", "may", "might", "must",
-    "on", "in", "at", "by", "as", "if", "but", "one", "again", "wanted",
-    "want", "need", "needed", "calling", "call", "called", "speaking",
-    "number", "digits", "digit", "dot", "plus", "sir", "maam", "madam",
+# This list is finished, and that is the point. It holds English's grammatical
+# glue — determiners, pronouns, copulas, prepositions, auxiliaries — a set that
+# linguists call closed because it does not accept new members. It cannot grow
+# when the company buys a new VPN product or renames the printer fleet.
+#
+# An earlier version of this file also carried content words ("want", "need",
+# "calling", "tell", "give", "number") to make particular sentences come out
+# right. That was the beginning of a second NLP subsystem inside the gateway,
+# and every one of those words was a judgement about meaning that belongs to
+# sd_chat. They are gone. If a word carries information about the caller's
+# problem, it is not glue, and it stays in the residual where it makes the
+# utterance a request.
+_FUNCTION_WORDS = {
+    # determiners and quantifiers
+    "a", "an", "the", "this", "that", "these", "those", "some", "any", "my",
+    "your", "our", "its", "their", "his", "her",
+    # pronouns
+    "i", "me", "we", "us", "you", "it", "they", "them", "he", "she", "who",
+    # copulas and auxiliaries
+    "is", "am", "are", "was", "were", "be", "been", "being", "do", "does",
+    "did", "have", "has", "had", "will", "would", "shall", "should", "can",
+    "could", "may", "might", "must",
+    # prepositions and conjunctions
+    "of", "to", "for", "with", "from", "in", "on", "at", "by", "as", "and",
+    "or", "but", "if", "so", "then", "there", "here",
+    # discourse particles
+    "please", "just", "well", "um", "uh", "er", "erm", "hmm", "like", "okay",
+    "ok", "sorry", "actually",
+    # glue used when SPEAKING an identifier aloud
+    "dot", "plus",
 }
-# Contractions are split by the tokenizer ("can't" -> "can", "t"), and a single
-# letter is never a ServiceDesk request.
-_FILLER |= {chr(c) for c in range(ord("a"), ord("z") + 1)}
-_FILLER |= {"re", "ve", "ll", "nt", "isn", "arent", "wasn", "won", "wouldn",
-            "couldn", "shouldn", "haven", "hasn", "hadn"}
+# Contractions split on the apostrophe ("can't" -> "can", "t"); a bare letter
+# is never a ServiceDesk problem.
+_FUNCTION_WORDS |= {chr(c) for c in range(ord("a"), ord("z") + 1)}
+_FUNCTION_WORDS |= {"re", "ve", "ll", "nt", "don", "doesn", "didn", "isn",
+                    "aren", "wasn", "won", "couldn", "shouldn", "wouldn",
+                    "haven", "hasn", "hadn", "can", "cant"}
 
-# Openers that deserve a natural answer rather than a Duo Push.
+# Openers that deserve an answer rather than an authentication attempt. Also
+# closed, and for the same reason: this is the phatic vocabulary of English, not
+# a taxonomy of what people want.
+# Deliberately overlaps _FUNCTION_WORDS: "okay" is both grammatical filler
+# mid-sentence and a complete phatic turn on its own, and it needs to be in both
+# sets to be dropped from a residual AND to make a bare "okay" small talk rather
+# than noise.
 _GREETING = {
-    "hello", "hallo", "helo", "hi", "hiya", "hey", "heya", "yo", "greetings",
-    "good", "morning", "afternoon", "evening", "day", "welcome",
-    "hear", "hearing", "listening", "listen", "read", "receiving",
-    "anyone", "anybody", "someone", "somebody", "operator", "agent", "human",
-    "yes", "yeah", "yep", "yup", "ok", "okay", "alright", "right",
-    "thanks", "thank", "cheers", "bye", "goodbye", "hold",
+    "hello", "hallo", "hi", "hiya", "hey", "heya", "yo", "greetings",
+    "morning", "afternoon", "evening", "good", "welcome",
+    "hear", "hearing", "listening", "there", "anyone", "anybody", "someone",
+    "yes", "yeah", "yep", "yup", "thanks", "thank", "cheers", "hello?",
+    "okay", "ok", "alright", "sure", "right",
 }
 
-# Identifier machinery: cue words that merely LABEL an identifier, never a
-# problem. Imported from identifiers.py so the two modules cannot drift.
+# Cue words that merely LABEL an identifier, never a problem. Imported from
+# identifiers.py so the two modules cannot drift.
 _IDENTIFIER_CUES = _EMPLOYEE_CUES | _MOBILE_CUES | _UPN_CUES | _NAME_CUES
 
 # Words that qualify WHICH identifier ("my *work* email", "my *registered*
 # mobile"). Dropped only when an identifier was actually found, because outside
 # that role they carry real meaning — "it doesn't work" is a problem statement,
-# and adding "work" to the unconditional set would silently swallow it.
+# and dropping "work" unconditionally would silently swallow it.
 _IDENTIFIER_MODIFIERS = {
     "work", "working", "corporate", "company", "office", "business",
-    "personal", "registered", "primary", "official", "main",
+    "personal", "registered", "primary", "official", "main", "number",
 }
 
-_NON_REQUEST_WORDS = _FILLER | _GREETING | _IDENTIFIER_CUES
+_NON_REQUEST_WORDS = _FUNCTION_WORDS | _GREETING | _IDENTIFIER_CUES
 
 _UPN_PART_RE = re.compile(r"[^a-z0-9]+")
 

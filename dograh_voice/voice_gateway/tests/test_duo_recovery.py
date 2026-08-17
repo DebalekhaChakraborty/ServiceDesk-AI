@@ -873,7 +873,7 @@ def test_24_passcode_never_reaches_servicedesk(manager, provider):
     assert "I cannot sign in to my account" in sent
 
     persona = fake.created_state[auth_session_id(call_id)]["persona"]
-    assert persona["identity_source"] == "duo_recovery"
+    assert persona["identity_source"] == "duo_external_voice"
     assert persona["recovery_scope"] == "self_account_recovery"
     assert persona["userPrincipalName"] == ALICE_UPN
 
@@ -1039,7 +1039,7 @@ def test_30_totp_provider_is_not_active_by_default(monkeypatch, tmp_path):
 def test_31_recovery_identity_is_scoped_to_the_caller_only(manager):
     outcome = verify_by_passcode(manager)
     persona = duo_persona(outcome.identity)
-    assert persona["identity_source"] == "duo_recovery"
+    assert persona["identity_source"] == "duo_external_voice"
     assert persona["recovery_scope"] == "self_account_recovery"
     assert persona["userPrincipalName"] == ALICE_UPN
     assert persona["id"] == ALICE_OID

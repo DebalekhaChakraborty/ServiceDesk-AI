@@ -40,8 +40,9 @@ from .models import (
     VoiceTurnRequest,
     VoiceTurnResponse,
 )
-from .duo_recovery import DuoRecoveryManager
+from .duo_recovery import DuoRecoveryManager, voice_interaction_context
 from .duo_provider import DuoRecoveryProvider, load_duo_config
+from .dialogue_semantic import load_semantic_interpreter
 from .graph_corroboration import NullGraphCorroborator, load_corroborator
 from .identifiers import IdentifierError, normalize_upn
 from .identity_map import STATUS_ACTIVE, EmployeeIdentityMap
@@ -144,11 +145,17 @@ def _build_recovery(settings: Settings):
         )
         return None
 
+    # Optional and OFF by default. It can only ever propose one of the dialogue
+    # acts the state machine already asked about, and every failure mode of it
+    # collapses to "ask the caller again" — see dialogue_semantic.
+    semantic = load_semantic_interpreter()
+
     logger.info(
-        "recovery provider=duo ENABLED config=%s corroboration=%s",
-        config.redacted(), type(corroborator).__name__,
+        "recovery provider=duo ENABLED config=%s corroboration=%s dialogue=%s",
+        config.redacted(), type(corroborator).__name__, type(semantic).__name__,
     )
-    return DuoRecoveryManager(identity_map, provider, corroborator)
+    return DuoRecoveryManager(identity_map, provider, corroborator,
+                              semantic=semantic)
 
 
 def create_app(
@@ -498,6 +505,8 @@ def create_app(
         # ServiceDesk reply, so one turn can both confirm verification and
         # answer the original question.
         speak_prefix: str | None = None
+        # Presentation state seeded into the ADK session. Never identity.
+        interaction: dict | None = None
 
         # --- RECOVERY INTERCEPT ------------------------------------------
         # An external call is handled entirely here until identity is proven.
@@ -537,6 +546,10 @@ def create_app(
             # branch past Duo AND Graph. Neither is caller-supplied.
             forward_text = outcome.forward_text
             speak_prefix = outcome.speak
+            # Presentation only. True exactly when a request stated BEFORE
+            # verification is being released, which is the case in which
+            # sd_chat would otherwise greet a caller mid-conversation.
+            interaction = voice_interaction_context(forward_text is not None)
             logger.info(
                 "turn call=%s recovery_state=%s forwarded=true auth_method=%s "
                 "carried_request=%s",
@@ -637,7 +650,8 @@ def create_app(
                 # existing identity_context_tool - which the agent is instructed
                 # to call first - sees it. Nothing here bypasses that tool or
                 # hard-codes a persona response.
-                await sd.create_session(sd_session, persona=persona)
+                await sd.create_session(sd_session, persona=persona,
+                                        interaction=interaction)
             registry.mark_known(sd_session)
 
         try:

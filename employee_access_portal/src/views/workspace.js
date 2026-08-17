@@ -1,6 +1,7 @@
 'use strict';
 
 const { layout, escapeHtml } = require('./layout');
+const { authenticatedVoiceUi } = require('./voiceUi');
 
 const CHECK = `<svg class="status__icon" viewBox="0 0 20 20" aria-hidden="true" focusable="false">
 <circle cx="10" cy="10" r="9" fill="none" stroke="currentColor" stroke-width="1.5"/>
@@ -64,18 +65,7 @@ ${tiles}
     </div>
   </section>
 
-${voiceEnabled ? `  <section class="voice" aria-labelledby="voice-title">
-    <h2 class="section__title" id="voice-title">Talk to the Service Desk</h2>
-    <button class="button button--primary" type="button" id="voice-start"
-            data-csrf="${escapeHtml(csrfToken)}">Start voice call</button>
-    <p class="voice__status" id="voice-status" role="status" aria-live="polite"></p>
-    <p class="verify__note">
-      Your identity is confirmed by this signed-in session. Nothing you type or
-      say sets who you are.
-    </p>
-  </section>
-  <script src="/voice-widget.js" defer></script>
-` : ''}
+
   <section class="verify">
     <form method="post" action="/auth/verify">
       <input type="hidden" name="csrf_token" value="${escapeHtml(csrfToken)}">
@@ -85,7 +75,7 @@ ${voiceEnabled ? `  <section class="voice" aria-labelledby="voice-title">
       Re-checks your account directly with your organization's identity provider.
     </p>
   </section>
-</main>`;
+</main>${voiceEnabled ? authenticatedVoiceUi(csrfToken) : ''}`;
 
   return layout({ title: 'Enterprise Workspace', body, bodyClass: 'page--app' });
 }

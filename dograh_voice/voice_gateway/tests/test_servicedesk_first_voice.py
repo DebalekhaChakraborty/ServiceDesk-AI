@@ -612,7 +612,7 @@ def test_19_c_a_verified_identity_accompanies_the_session(manager, provider):  #
     persona = fake.created_state[auth_session_id("call-19c")]["persona"]
     assert persona["userPrincipalName"] == ALICE_UPN
     assert persona["id"] == ALICE_OID
-    assert persona["identity_source"] == "duo_recovery"
+    assert persona["identity_source"] == "duo_external_voice"
     assert persona["recovery_scope"] == "self_account_recovery"
     assert persona["auth_method"] == "duo_push"
     # Nobody else's identity is anywhere near it.

@@ -121,7 +121,7 @@ test('unrelated hardening headers survive the voice change', async () => {
 });
 
 test('the voice bootstrap ships no secret and no identity claim', async () => {
-  const response = await request(appFor(VOICE_ENV)).get('/voice-widget.js').expect(200);
+  const response = await request(appFor(VOICE_ENV)).get('/voice-call.js').expect(200);
   const body = response.text;
   assert.equal(body.includes(VOICE_ENV.VOICE_IDENTITY_SIGNING_SECRET), false);
   assert.equal(body.includes(VOICE_ENV.PORTAL_SESSION_SECRET), false);
@@ -185,21 +185,33 @@ function fieldsReadByWidget(source) {
   return [...new Set([...code.matchAll(/\bdata\.(\w+)/g)].map((m) => m[1]))].sort();
 }
 
-test('authenticated /voice/session returns every field its widget reads', () => {
-  const routeSource = require('node:fs').readFileSync(
-    require('node:path').join(__dirname, '..', 'src', 'routes', 'voice.js'), 'utf8');
-  for (const field of fieldsReadByWidget('voice-widget.js')) {
-    assert.match(routeSource, new RegExp(`\\b${field}\\s*:`),
-      `/voice/session must return ${field}, which voice-widget.js reads`);
+/**
+ * One bootstrap now serves both doors, so BOTH routes must satisfy the same
+ * field contract. That is stricter than before, and deliberately: a field one
+ * route forgets is a voice channel that dies silently on that page only.
+ */
+test('both voice routes return every field the shared bootstrap reads', () => {
+  const fields = fieldsReadByWidget('voice-call.js');
+  assert.ok(fields.length >= 4, 'expected the bootstrap to read several fields');
+
+  for (const [route, file] of [
+    ['/voice/session', 'voice.js'],
+    ['/recovery/start', 'recovery.js'],
+  ]) {
+    const routeSource = require('node:fs').readFileSync(
+      require('node:path').join(__dirname, '..', 'src', 'routes', file), 'utf8');
+    for (const field of fields) {
+      assert.match(routeSource, new RegExp(`\\b${field}\\s*:`),
+        `${route} must return ${field}, which voice-call.js reads`);
+    }
   }
 });
 
-test('public /recovery/start returns every field its widget reads', () => {
-  const routeSource = require('node:fs').readFileSync(
-    require('node:path').join(__dirname, '..', 'src', 'routes', 'recovery.js'), 'utf8');
-  for (const field of fieldsReadByWidget('recovery-widget.js')) {
-    assert.match(routeSource, new RegExp(`\\b${field}\\s*:`),
-      `/recovery/start must return ${field}, which recovery-widget.js reads`);
+test('the superseded per-page bootstraps are gone', async () => {
+  // Two copies of a floating call panel drift; one of them keeps a control the
+  // other removed, or ends a call the other only hides.
+  for (const stale of ['/voice-widget.js', '/recovery-widget.js']) {
+    await request(appFor(VOICE_ENV)).get(stale).expect(404);
   }
 });
 
@@ -214,14 +226,14 @@ test('public /recovery/start returns every field its widget reads', () => {
 test('the landing page offers ServiceDesk voice when voice is configured', async () => {
   const res = await request(appFor(VOICE_ENV)).get('/').expect(200);
   assert.match(res.text, /Talk to ServiceDesk/);
-  assert.match(res.text, /recovery-widget\.js/);
+  assert.match(res.text, /voice-call\.js/);
   assert.match(res.text, /Sign in with Microsoft/);      // primary path intact
 });
 
 test('the landing page hides ServiceDesk voice when voice is not configured', async () => {
   const res = await request(appFor(BASE_ENV)).get('/').expect(200);
   assert.doesNotMatch(res.text, /Talk to ServiceDesk/);
-  assert.doesNotMatch(res.text, /recovery-widget\.js/);
+  assert.doesNotMatch(res.text, /voice-call\.js/);
   assert.match(res.text, /Sign in with Microsoft/);
 });
 
@@ -238,7 +250,7 @@ test('the landing page does not present the voice line as account recovery only'
   assert.doesNotMatch(res.text, /Recover my account/i);
   assert.doesNotMatch(res.text, /password/i);
   // ...and it still says the line works for someone who is locked out.
-  assert.match(res.text, /can't sign in/i);
+  assert.match(res.text, /can(?:\u2019|'|&#39;)t sign in/i);
 });
 
 /**
@@ -264,18 +276,33 @@ test('the voice launcher is a corner control, not part of the sign-in card', asy
   assert.doesNotMatch(card, /ServiceDesk/);
 });
 
-test('the launcher keeps the markup contract recovery-widget.js depends on', () => {
+test('both pages keep the markup contract voice-call.js depends on', () => {
   // The bootstrap looks these up by id. A rename here fails silently in the
   // browser — the button simply stops working — so it is pinned from the
-  // consumer's side, the same way the JSON field contract is above.
+  // consumer's side, the same way the JSON field contract is above. Both pages
+  // render the shared view, so checking the shared view covers both.
   const view = require('node:fs').readFileSync(
-    require('node:path').join(__dirname, '..', 'src', 'views', 'landing.js'), 'utf8');
+    require('node:path').join(__dirname, '..', 'src', 'views', 'voiceUi.js'), 'utf8');
   const bootstrap = require('node:fs').readFileSync(
-    require('node:path').join(__dirname, '..', 'public', 'recovery-widget.js'), 'utf8');
+    require('node:path').join(__dirname, '..', 'public', 'voice-call.js'), 'utf8');
 
-  for (const id of [...bootstrap.matchAll(/getElementById\('([\w-]+)'\)/g)].map((m) => m[1])) {
+  // Ids the bootstrap CREATES rather than reads. `dograh-widget` is the script
+  // element it injects, and looking it up is the guard against injecting a
+  // second one — the page must not render it.
+  const created = new Set(['dograh-widget']);
+
+  const read = [...bootstrap.matchAll(/getElementById\('([\w-]+)'\)/g)]
+    .map((m) => m[1])
+    .filter((id) => !created.has(id));
+
+  assert.ok(read.length >= 5, 'expected the bootstrap to read several ids');
+  for (const id of read) {
     assert.match(view, new RegExp(`id="${id}"`),
       `landing.js must render #${id}, which recovery-widget.js looks up`);
+  }
+  for (const id of created) {
+    assert.doesNotMatch(view, new RegExp(`id="${id}"`),
+      `${id} is injected by the bootstrap; the page must not also render it`);
   }
 });
 
