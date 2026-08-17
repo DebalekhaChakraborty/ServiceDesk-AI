@@ -60,6 +60,12 @@ SYNCED_DOCS: List[str] = [
 # here purely so a backup exists and any change to them is reviewable. Promote a
 # file into SYNCED_DOCS only after a human has confirmed it matches the article
 # that should be served.
+#
+# WINDOWS_UPDATE_SERVICE_FIX.txt is a special case: what the corpus holds is
+# truncated mid-procedure, so the repository copy has been completed by hand and
+# deliberately no longer matches what is served. Syncing it would be an
+# improvement, not a regression — but it still replaces a live KB article that
+# grounds a remediation action, so it stays here until a human approves it.
 RECOVERED_DOCS: List[str] = [
     "docs/kb/AAD_PASSWORD_RESET.md",
     "docs/kb/WINDOWS_SOFTWARE_INSTALLATION.txt",

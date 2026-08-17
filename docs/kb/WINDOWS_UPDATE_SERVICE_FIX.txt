@@ -33,7 +33,70 @@ The **Windows Update Service (wuauserv)** is stopped, hung, or in a bad state (o
 1. Open **Command Prompt** as Administrator.  
 2. Stop the Windows Update Service:  
    ```cmd
-   	net stop wuauserv
-3. Start the Windows Update Service:
+   net stop wuauserv
+   ```
+3. Start the Windows Update Service:  
    ```cmd
-	net start wuauserv
+   net start wuauserv
+   ```
+4. Confirm the service is running:  
+   ```cmd
+   sc query wuauserv
+   ```
+   Expect `STATE : 4  RUNNING`.
+5. Trigger a fresh update detection:  
+   ```cmd
+   wuauclt /detectnow
+   ```
+   On Windows 10/11 and Server 2016+, use:  
+   ```cmd
+   UsoClient StartScan
+   ```
+
+If the scan still does not progress, the update cache is likely corrupt. This is
+a **manual** escalation step and is deliberately not automated:
+
+```cmd
+net stop wuauserv
+ren %windir%\SoftwareDistribution SoftwareDistribution.old
+net start wuauserv
+```
+
+Windows rebuilds `SoftwareDistribution` on the next scan. If the problem
+persists after a cache rebuild, escalate to **L2-Windows** rather than repeating
+the restart.
+
+---
+
+## 🤖 Automation Notes (System Context)
+
+- The agent maps this request to the approved action `win.restart_wuauserv`.
+- `target_host` comes only from its trusted target-class source. The agent must
+  never ask the user to type a hostname or IP, and must never infer one from the
+  conversation.
+- Preconditions are checked once via the policy layer before execution:
+  `host_is_authorized`, `endpoint_reachable`, `endpoint_is_windows`.
+- Execution is a single remote `Restart-Service -Name wuauserv -Force` over
+  WinRM — not a separate `net stop` followed by `net start`. The manual steps
+  above are the admin equivalent, not the commands the automation issues.
+- The action returns `exec.status` and `exec.message`. Its only declared effect
+  is `windows_update_service_restarted(<target_host>)`.
+- Automation restarts the service **only**. It does not rename or delete
+  `SoftwareDistribution`, does not install or approve updates, and does not
+  reboot the host.
+- On failure the agent offers the existing ServiceNow incident path with the
+  captured error output. It does not retry the restart in a loop.
+
+---
+
+## 🪄 Validation Checklist
+
+Step,Expected Result
+`sc query wuauserv`,`STATE : 4  RUNNING`
+`Restart-Service -Name wuauserv -Force`,Completes without error
+`wuauclt /detectnow` / `UsoClient StartScan`,Update scan is triggered
+Windows Update,Progresses past “Checking for updates…”
+Automation result,`exec.status` reports success
+ServiceNow Ticket,Updated only when remediation failed
+
+**End of Document**
